@@ -1,0 +1,16 @@
+# air — Go hot-reload configuration
+root = "."
+tmp_dir = "/tmp/air"
+
+[build]
+  cmd = "go build -o /tmp/air/main ./cmd/gateway"
+  bin = "/tmp/air/main"
+  include_ext = ["go"]
+  exclude_dir = ["vendor"]
+  delay = 500
+
+[log]
+  level = "info"
+
+[misc]
+  clean_on_exit = true
