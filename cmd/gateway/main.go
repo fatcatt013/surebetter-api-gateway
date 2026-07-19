@@ -80,6 +80,12 @@ type ArbOpportunity struct {
 	League     string            `json:"league"`
 	MarketName string            `json:"market_name"`
 	StartTime  int64             `json:"start_time"`
+	// PlayerName is the normalized player surname for player-scoped markets
+	// (GAME_HANDICAP, PLAYER_*); empty for all others. It is part of the arb's
+	// identity — the arb-engine keys its composite storage on it — so it MUST be in
+	// oppStateKey too, or two distinct player arbs on the same event/market/line
+	// collide in client state and only one is ever shown.
+	PlayerName string `json:"player_name"`
 	// Removed=true is an explicit removal signal from the arb-engine (the arb no
 	// longer holds). The gateway drops it from client state immediately instead of
 	// waiting out the eviction TTL. Omitted (false) for normal opportunities.
@@ -92,9 +98,14 @@ type arbEntry struct {
 	lastSeen time.Time
 }
 
-// oppStateKey returns the composite state key: {event_id}:{market_type}:{line:.2f}
-// Matches the composite key used by the arb-engine for grouping.
+// oppStateKey returns the composite state key, mirroring the arb-engine's storage
+// key exactly: {event_id}:{market_type}:{player_name}:{line:.2f} for player-scoped
+// markets, {event_id}:{market_type}:{line:.2f} otherwise. Including player_name is
+// required so two distinct player arbs on the same event/market/line don't collide.
 func oppStateKey(opp ArbOpportunity) string {
+	if opp.PlayerName != "" {
+		return fmt.Sprintf("%s:%s:%s:%.2f", opp.EventID, opp.MarketType, opp.PlayerName, opp.Line)
+	}
 	return fmt.Sprintf("%s:%s:%.2f", opp.EventID, opp.MarketType, opp.Line)
 }
 

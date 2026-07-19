@@ -316,6 +316,45 @@ func TestHub_RemoveOpportunity_AbsentKeyIsNoOp(t *testing.T) {
 	}
 }
 
+func TestOppStateKey_PlayerNameDisambiguates(t *testing.T) {
+	base := ArbOpportunity{EventID: "tennis-live:abc123", MarketType: "GAME_HANDICAP", Line: 1.5}
+	a := base
+	a.PlayerName = "duckworth"
+	b := base
+	b.PlayerName = "dedura-palomero"
+
+	if oppStateKey(a) == oppStateKey(b) {
+		t.Fatalf("distinct players must yield distinct keys; both = %q", oppStateKey(a))
+	}
+	if want := "tennis-live:abc123:GAME_HANDICAP:duckworth:1.50"; oppStateKey(a) != want {
+		t.Errorf("key = %q, want %q", oppStateKey(a), want)
+	}
+	// A playerless market keeps the 3-part key (backward compatible).
+	none := base
+	if want := "tennis-live:abc123:GAME_HANDICAP:1.50"; oppStateKey(none) != want {
+		t.Errorf("playerless key = %q, want %q", oppStateKey(none), want)
+	}
+}
+
+func TestHub_ApplyOpportunity_PlayerArbsDoNotCollide(t *testing.T) {
+	hub := NewHub(Config{SnapshotCacheMs: 500})
+	base := ArbOpportunity{EventID: "tennis-live:abc123", MarketType: "GAME_HANDICAP", Line: 1.5, ProfitPct: 2.0}
+	a := base
+	a.PlayerName = "duckworth"
+	b := base
+	b.PlayerName = "dedura-palomero"
+
+	hub.ApplyOpportunity(a)
+	hub.ApplyOpportunity(b)
+
+	hub.stateMu.RLock()
+	n := len(hub.state)
+	hub.stateMu.RUnlock()
+	if n != 2 {
+		t.Fatalf("two distinct player arbs must both be stored, got %d entries", n)
+	}
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func stateKeys(m map[string]arbEntry) []string {
