@@ -161,7 +161,7 @@ func TestHub_EvictStale_ExpiredEntryRemovedAndRemoveOpReturned(t *testing.T) {
 	hub.state[key] = e
 	hub.stateMu.Unlock()
 
-	ops := hub.evictStale(120 * time.Second)
+	ops := hub.evictStale(120*time.Second, 120*time.Second)
 
 	if len(ops) != 1 {
 		t.Fatalf("want 1 remove op, got %d", len(ops))
@@ -187,7 +187,7 @@ func TestHub_EvictStale_FreshEntryNotEvicted(t *testing.T) {
 	json.Unmarshal([]byte(fullOppJSON), &opp)
 	hub.ApplyOpportunity(opp)
 
-	ops := hub.evictStale(120 * time.Second)
+	ops := hub.evictStale(120*time.Second, 120*time.Second)
 
 	if len(ops) != 0 {
 		t.Fatalf("fresh entry must not be evicted, got %d ops", len(ops))
@@ -222,13 +222,97 @@ func TestHub_EvictStale_InvalidatesSnapshotCache(t *testing.T) {
 	hub.state[key] = e
 	hub.stateMu.Unlock()
 
-	hub.evictStale(120 * time.Second)
+	hub.evictStale(120*time.Second, 120*time.Second)
 
 	hub.stateMu.RLock()
 	cacheNil := hub.snapshotCache == nil
 	hub.stateMu.RUnlock()
 	if !cacheNil {
 		t.Error("evictStale must set snapshotCache to nil after removing entries")
+	}
+}
+
+func TestHub_EvictStale_LiveUsesShorterTTLThanPrematch(t *testing.T) {
+	hub := NewHub(Config{SnapshotCacheMs: 500})
+
+	// A prematch arb and a live arb, both last seen 20s ago.
+	var pre ArbOpportunity
+	json.Unmarshal([]byte(fullOppJSON), &pre) // sport "football", prematch
+	hub.ApplyOpportunity(pre)
+
+	var live ArbOpportunity
+	json.Unmarshal([]byte(fullOppJSON), &live)
+	live.Sport = "tennis-live"
+	live.EventID = "tennis-live:aaaabbbbcccc"
+	hub.ApplyOpportunity(live)
+
+	backdate := func(key string) {
+		hub.stateMu.Lock()
+		e := hub.state[key]
+		e.lastSeen = time.Now().Add(-20 * time.Second)
+		hub.state[key] = e
+		hub.stateMu.Unlock()
+	}
+	preKey := oppStateKey(pre)
+	liveKey := oppStateKey(live)
+	backdate(preKey)
+	backdate(liveKey)
+
+	// prematchTTL 120s (keeps the 20s-old prematch), liveTTL 8s (evicts the live one).
+	ops := hub.evictStale(120*time.Second, 8*time.Second)
+
+	if len(ops) != 1 {
+		t.Fatalf("want exactly 1 remove op (the live arb), got %d", len(ops))
+	}
+	if ops[0].Path != "/arb/"+liveKey {
+		t.Errorf("evicted path = %q, want %q", ops[0].Path, "/arb/"+liveKey)
+	}
+	hub.stateMu.RLock()
+	_, liveStill := hub.state[liveKey]
+	_, preStill := hub.state[preKey]
+	hub.stateMu.RUnlock()
+	if liveStill {
+		t.Error("live arb older than liveTTL must be evicted")
+	}
+	if !preStill {
+		t.Error("prematch arb younger than prematchTTL must be retained")
+	}
+}
+
+func TestHub_RemoveOpportunity_DropsPresentKeyAndReturnsRemoveOp(t *testing.T) {
+	hub := NewHub(Config{SnapshotCacheMs: 500})
+	var opp ArbOpportunity
+	json.Unmarshal([]byte(fullOppJSON), &opp)
+	hub.ApplyOpportunity(opp)
+	_ = hub.Snapshot() // warm cache
+
+	op, ok := hub.RemoveOpportunity(opp)
+	if !ok {
+		t.Fatal("RemoveOpportunity must report ok=true for a present key")
+	}
+	if op.Op != "remove" || op.Path != "/arb/"+oppStateKey(opp) {
+		t.Errorf("unexpected remove op: %+v", op)
+	}
+	hub.stateMu.RLock()
+	_, still := hub.state[oppStateKey(opp)]
+	cacheNil := hub.snapshotCache == nil
+	hub.stateMu.RUnlock()
+	if still {
+		t.Error("removed key must be deleted from state")
+	}
+	if !cacheNil {
+		t.Error("RemoveOpportunity must invalidate the snapshot cache")
+	}
+}
+
+func TestHub_RemoveOpportunity_AbsentKeyIsNoOp(t *testing.T) {
+	hub := NewHub(Config{SnapshotCacheMs: 500})
+	var opp ArbOpportunity
+	json.Unmarshal([]byte(fullOppJSON), &opp)
+
+	_, ok := hub.RemoveOpportunity(opp) // never applied
+	if ok {
+		t.Error("RemoveOpportunity on an absent key must report ok=false (no broadcast)")
 	}
 }
 

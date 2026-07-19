@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -32,7 +33,8 @@ type Config struct {
 	SnapshotCacheMs   int64
 	BroadcastBatchMs  int64
 	JWTSecret         string
-	EvictionTTLS      int  // EVICTION_TTL_S: seconds until an unseen entry is evicted
+	EvictionTTLS      int  // EVICTION_TTL_S: seconds until an unseen PREMATCH entry is evicted
+	EvictionLiveTTLS  int  // EVICTION_LIVE_TTL_S: shorter TTL for "-live" arbs (fast removal)
 	EvictionIntervalS int  // EVICTION_INTERVAL_S: sweep cadence in seconds
 }
 
@@ -46,7 +48,8 @@ func configFromEnv() Config {
 		BroadcastBatchMs:  int64(getenvInt("BROADCAST_BATCH_MS", 50)),
 		JWTSecret:         getenv("JWT_SECRET", ""),
 		EvictionTTLS:      getenvInt("EVICTION_TTL_S", 120),
-		EvictionIntervalS: getenvInt("EVICTION_INTERVAL_S", 10),
+		EvictionLiveTTLS:  getenvInt("EVICTION_LIVE_TTL_S", 8),
+		EvictionIntervalS: getenvInt("EVICTION_INTERVAL_S", 3),
 	}
 }
 
@@ -77,6 +80,10 @@ type ArbOpportunity struct {
 	League     string            `json:"league"`
 	MarketName string            `json:"market_name"`
 	StartTime  int64             `json:"start_time"`
+	// Removed=true is an explicit removal signal from the arb-engine (the arb no
+	// longer holds). The gateway drops it from client state immediately instead of
+	// waiting out the eviction TTL. Omitted (false) for normal opportunities.
+	Removed bool `json:"removed"`
 }
 
 // arbEntry wraps ArbOpportunity with a lastSeen timestamp for eviction tracking.
@@ -153,13 +160,40 @@ func (h *Hub) ApplyOpportunity(opp ArbOpportunity) PatchOp {
 	}
 }
 
-// evictStale removes Hub state entries not updated within ttl and returns
-// one "remove" PatchOp per evicted key. Invalidates snapshotCache if any
-// entries were removed. Safe to call from multiple goroutines.
-func (h *Hub) evictStale(ttl time.Duration) []PatchOp {
+// RemoveOpportunity deletes opp's key from state (if present) and returns the
+// "remove" PatchOp to broadcast. Driven by an explicit removal from the arb-engine
+// (opp.Removed=true) so a vanished/no-longer-valid arb disappears immediately rather
+// than after the eviction TTL. Returns ok=false (and a zero PatchOp) if the key was
+// not in state, so the bridge can skip broadcasting a no-op remove.
+func (h *Hub) RemoveOpportunity(opp ArbOpportunity) (PatchOp, bool) {
+	key := oppStateKey(opp)
+	h.stateMu.Lock()
+	_, present := h.state[key]
+	if present {
+		delete(h.state, key)
+		h.snapshotCache = nil
+	}
+	h.stateMu.Unlock()
+	if !present {
+		return PatchOp{}, false
+	}
+	return PatchOp{Op: "remove", Path: fmt.Sprintf("/arb/%s", key)}, true
+}
+
+// evictStale removes Hub state entries not updated within their TTL and returns
+// one "remove" PatchOp per evicted key. Live arbs ("-live" sport) use the shorter
+// liveTTL so a vanished live arb disappears fast; prematch uses prematchTTL. The
+// arb-engine re-publishes a still-valid live arb on the fetcher heartbeat cadence
+// (~3s), so liveTTL only fires once an arb genuinely stops being detected.
+// Invalidates snapshotCache if any entries were removed. Safe to call concurrently.
+func (h *Hub) evictStale(prematchTTL, liveTTL time.Duration) []PatchOp {
 	var ops []PatchOp
 	h.stateMu.Lock()
 	for key, entry := range h.state {
+		ttl := prematchTTL
+		if strings.HasSuffix(entry.opp.Sport, "-live") {
+			ttl = liveTTL
+		}
 		if time.Since(entry.lastSeen) > ttl {
 			delete(h.state, key)
 			ops = append(ops, PatchOp{Op: "remove", Path: fmt.Sprintf("/arb/%s", key)})
@@ -268,7 +302,15 @@ func runNATSBridge(ctx context.Context, nc *nats.Conn, hub *Hub) {
 				continue
 			}
 
-			pending = append(pending, hub.ApplyOpportunity(opp))
+			if opp.Removed {
+				// Explicit removal from the arb-engine — drop it now (skip the no-op
+				// case where we never had this key).
+				if op, ok := hub.RemoveOpportunity(opp); ok {
+					pending = append(pending, op)
+				}
+			} else {
+				pending = append(pending, hub.ApplyOpportunity(opp))
+			}
 
 		case <-ticker.C:
 			if len(pending) > 0 {
@@ -284,13 +326,17 @@ func runNATSBridge(ctx context.Context, nc *nats.Conn, hub *Hub) {
 
 // ── Stale eviction sweep ──────────────────────────────────────────────────────
 func runEvictionSweep(ctx context.Context, hub *Hub) {
-	ttl := time.Duration(hub.cfg.EvictionTTLS) * time.Second
+	prematchTTL := time.Duration(hub.cfg.EvictionTTLS) * time.Second
+	liveTTL := time.Duration(hub.cfg.EvictionLiveTTLS) * time.Second
 	interval := time.Duration(hub.cfg.EvictionIntervalS) * time.Second
 	if interval <= 0 {
-		interval = 10 * time.Second
+		interval = 3 * time.Second
 	}
-	if ttl <= 0 {
-		ttl = 120 * time.Second
+	if prematchTTL <= 0 {
+		prematchTTL = 120 * time.Second
+	}
+	if liveTTL <= 0 {
+		liveTTL = 8 * time.Second
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -298,7 +344,7 @@ func runEvictionSweep(ctx context.Context, hub *Hub) {
 	for {
 		select {
 		case <-ticker.C:
-			ops := hub.evictStale(ttl)
+			ops := hub.evictStale(prematchTTL, liveTTL)
 			if len(ops) > 0 {
 				hub.BroadcastPatch(ops)
 				log.Info().Int("evicted", len(ops)).Msg("Stale arb entries evicted")
