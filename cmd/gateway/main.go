@@ -33,9 +33,9 @@ type Config struct {
 	SnapshotCacheMs   int64
 	BroadcastBatchMs  int64
 	JWTSecret         string
-	EvictionTTLS      int  // EVICTION_TTL_S: seconds until an unseen PREMATCH entry is evicted
-	EvictionLiveTTLS  int  // EVICTION_LIVE_TTL_S: shorter TTL for "-live" arbs (fast removal)
-	EvictionIntervalS int  // EVICTION_INTERVAL_S: sweep cadence in seconds
+	EvictionTTLS      int // EVICTION_TTL_S: seconds until an unseen PREMATCH entry is evicted
+	EvictionLiveTTLS  int // EVICTION_LIVE_TTL_S: shorter TTL for "-live" arbs (fast removal)
+	EvictionIntervalS int // EVICTION_INTERVAL_S: sweep cadence in seconds
 }
 
 func configFromEnv() Config {
@@ -55,13 +55,13 @@ func configFromEnv() Config {
 
 // ── Message types sent to Angular clients ────────────────────────────────────
 type WSMessage struct {
-	Type string          `json:"type"`            // "snapshot" | "patch" | "ping"
+	Type string          `json:"type"` // "snapshot" | "patch" | "ping"
 	Data json.RawMessage `json:"data,omitempty"`
-	Ops  []PatchOp       `json:"ops,omitempty"`   // RFC 6902 JSON Patch
+	Ops  []PatchOp       `json:"ops,omitempty"` // RFC 6902 JSON Patch
 }
 
 type PatchOp struct {
-	Op    string      `json:"op"`    // "replace" | "add" | "remove"
+	Op    string      `json:"op"` // "replace" | "add" | "remove"
 	Path  string      `json:"path"`
 	Value interface{} `json:"value,omitempty"`
 }
@@ -75,11 +75,17 @@ type ArbOpportunity struct {
 	ProfitPct  float64           `json:"profit_pct"`
 	Stakes     []StakeAllocation `json:"stakes"`
 	DetectedAt int64             `json:"detected_at"`
-	NameHome   string            `json:"name_home"`
-	NameAway   string            `json:"name_away"`
-	League     string            `json:"league"`
-	MarketName string            `json:"market_name"`
-	StartTime  int64             `json:"start_time"`
+	// FirstDetectedAt is the ms epoch of this arb's FIRST detection, preserved across
+	// re-emits (the frontend's live "age"). LastChangedAt is the last time its profit%/
+	// odds changed while it stayed an arb (== FirstDetectedAt until the first change).
+	// Both are engine-owned; the gateway relays them verbatim.
+	FirstDetectedAt int64  `json:"first_detected_at"`
+	LastChangedAt   int64  `json:"last_changed_at"`
+	NameHome        string `json:"name_home"`
+	NameAway        string `json:"name_away"`
+	League          string `json:"league"`
+	MarketName      string `json:"market_name"`
+	StartTime       int64  `json:"start_time"`
 	// PlayerName is the normalized player surname for player-scoped markets
 	// (GAME_HANDICAP, PLAYER_*); empty for all others. It is part of the arb's
 	// identity — the arb-engine keys its composite storage on it — so it MUST be in
@@ -116,21 +122,25 @@ type StakeAllocation struct {
 	DecimalOdds float64 `json:"decimal_odds"`
 	StakePct    float64 `json:"stake_pct"`
 	MatchURL    string  `json:"match_url"`
+	// OddsUpdatedAt is the ms epoch when this leg's odds were last refreshed (advances on
+	// every update, incl. the ~3s heartbeat, even when the value is unchanged). Relayed
+	// verbatim so the frontend can show a per-odd "last updated" stamp.
+	OddsUpdatedAt int64 `json:"odds_updated_at"`
 }
 
 // ── Hub — manages all WebSocket client connections ───────────────────────────
 type Hub struct {
-	mu          sync.RWMutex
-	clients     map[*Client]struct{}
-	state       map[string]arbEntry // current arb state
-	stateMu     sync.RWMutex
+	mu      sync.RWMutex
+	clients map[*Client]struct{}
+	state   map[string]arbEntry // current arb state
+	stateMu sync.RWMutex
 
-	snapshotCache     []byte
-	snapshotCachedAt  int64
+	snapshotCache    []byte
+	snapshotCachedAt int64
 
-	cfg         Config
-	connCount   atomic.Int64
-	msgSent     atomic.Int64
+	cfg       Config
+	connCount atomic.Int64
+	msgSent   atomic.Int64
 }
 
 func NewHub(cfg Config) *Hub {
