@@ -3,7 +3,7 @@ root = "."
 tmp_dir = "/tmp/air"
 
 [build]
-  cmd = "go build -o /tmp/air/main ./cmd/gateway"
+  cmd = "go build -buildvcs=false -o /tmp/air/main ./cmd/gateway"
   bin = "/tmp/air/main"
   include_ext = ["go"]
   exclude_dir = ["vendor"]
