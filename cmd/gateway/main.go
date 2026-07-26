@@ -122,6 +122,9 @@ type StakeAllocation struct {
 	DecimalOdds float64 `json:"decimal_odds"`
 	StakePct    float64 `json:"stake_pct"`
 	MatchURL    string  `json:"match_url"`
+	// MarketName is the winning bookmaker's own raw market label for this leg. Relayed
+	// verbatim; without it the field would be dropped on unmarshal→re-marshal to clients.
+	MarketName string `json:"market_name"`
 	// OddsUpdatedAt is the ms epoch when this leg's odds were last refreshed (advances on
 	// every update, incl. the ~3s heartbeat, even when the value is unchanged). Relayed
 	// verbatim so the frontend can show a per-odd "last updated" stamp.

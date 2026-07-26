@@ -5,3 +5,6 @@ dist/
 target/
 *.log
 .playwright-browsers/
+
+# compiled binary (build artifact, never commit)
+/gateway
