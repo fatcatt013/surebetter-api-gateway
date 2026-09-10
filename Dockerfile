@@ -33,7 +33,9 @@ FROM golang:1.25-alpine AS development
 
 RUN apk add --no-cache git ca-certificates tzdata curl
 
-RUN go install github.com/air-verse/air@latest
+# Pinned: air v1.67.2+ requires go >= 1.26 and this image is go 1.25 with
+# GOTOOLCHAIN=local, so @latest breaks the build. Bump together with the base image.
+RUN go install github.com/air-verse/air@v1.67.1
 
 WORKDIR /app
 
