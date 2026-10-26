@@ -12,7 +12,8 @@ All application code lives in a **single file**: `cmd/gateway/main.go` (no inter
 
 Key types in that file:
 - `Config` — env vars loaded at startup
-- `Hub` — central state: client map + odds state + snapshot cache
+- `StateHub[T]` — central state of one channel: client map + item state + snapshot cache, parameterized by a `hubSpec` (key func, sport func, removed func, patch path prefix). `Hub` = `StateHub[ArbOpportunity]` (`/ws`, `arb.opportunities`, `/arb/`); `ValueHub` = `StateHub[ValueBet]` (`/ws/value`, `value.opportunities`, `/value/`)
+- `ValueBet` — decodes only `id`/`sport`/`removed`; marshals the engine's original JSON verbatim
 - `Client` — single WebSocket connection with a send channel
 - `ArbOpportunity` / `StakeAllocation` — mirrors the Rust arb-engine structs
 - `WSMessage` / `PatchOp` — WebSocket protocol types (RFC 6902 JSON Patch)
@@ -29,7 +30,7 @@ task logs-service SERVICE=api-gateway
 Direct Go commands (for local dev without Docker):
 ```bash
 go build ./cmd/gateway
-go test ./...          # no tests currently exist
+go test ./...
 ```
 
 Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild triggers on any `.go` save, ~3s reload.
@@ -40,6 +41,8 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 |-------|---------|
 | `GET /ws` | WebSocket upgrade — streams arb deltas to clients |
 | `GET /api/arb/snapshot` | REST fallback — returns full current state as JSON |
+| `GET /ws/value` | WebSocket upgrade — streams value-bet deltas (independent hub; same protocol, path prefix `/value/{id}`) |
+| `GET /api/value/snapshot` | Full current value-bet state as JSON (`{id: ValueBet}`) |
 | `GET /health` | `{"status":"ok","service":"api-gateway","version":"dev"}` |
 | `GET /metrics` | Prometheus counters: `gateway_ws_clients_connected`, `gateway_messages_sent_total` |
 
@@ -64,7 +67,8 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 | `JWT_SECRET` | `""` | Not implemented yet — WebSocket accepts all connections |
 | `LOG_LEVEL` | `info` | zerolog levels: debug/info/warn/error |
 | `EVICTION_TTL_S` | `120` | Seconds since last update before an entry is evicted |
-| `EVICTION_INTERVAL_S` | `10` | Eviction sweep cadence in seconds |
+| `EVICTION_INTERVAL_S` | `3` | Eviction sweep cadence in seconds (shared by both hubs) |
+| `VALUE_EVICTION_TTL_S` | `120` | Seconds before an unseen value bet is evicted (prematch-only, no live variant) |
 
 ## Concurrency
 

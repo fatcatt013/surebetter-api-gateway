@@ -36,6 +36,7 @@ type Config struct {
 	EvictionTTLS      int // EVICTION_TTL_S: seconds until an unseen PREMATCH entry is evicted
 	EvictionLiveTTLS  int // EVICTION_LIVE_TTL_S: shorter TTL for "-live" arbs (fast removal)
 	EvictionIntervalS int // EVICTION_INTERVAL_S: sweep cadence in seconds
+	ValueEvictionTTLS int // VALUE_EVICTION_TTL_S: seconds until an unseen value bet is evicted
 }
 
 func configFromEnv() Config {
@@ -50,6 +51,7 @@ func configFromEnv() Config {
 		EvictionTTLS:      getenvInt("EVICTION_TTL_S", 120),
 		EvictionLiveTTLS:  getenvInt("EVICTION_LIVE_TTL_S", 8),
 		EvictionIntervalS: getenvInt("EVICTION_INTERVAL_S", 3),
+		ValueEvictionTTLS: getenvInt("VALUE_EVICTION_TTL_S", 120),
 	}
 }
 
@@ -98,12 +100,6 @@ type ArbOpportunity struct {
 	Removed bool `json:"removed"`
 }
 
-// arbEntry wraps ArbOpportunity with a lastSeen timestamp for eviction tracking.
-type arbEntry struct {
-	opp      ArbOpportunity
-	lastSeen time.Time
-}
-
 // oppStateKey returns the composite state key, mirroring the arb-engine's storage
 // key exactly: {event_id}:{market_type}:{player_name}:{line:.2f} for player-scoped
 // markets, {event_id}:{market_type}:{line:.2f} otherwise. Including player_name is
@@ -131,11 +127,90 @@ type StakeAllocation struct {
 	OddsUpdatedAt int64 `json:"odds_updated_at"`
 }
 
+// ── ValueBet (mirrors the arb-engine's value.rs ValueBet) ──────────────────
+// The gateway only needs three fields to route a value bet (id = state key,
+// sport = eviction class, removed = explicit removal), so it decodes just those
+// and relays the engine's original JSON verbatim. Unlike ArbOpportunity there is
+// no struct mirror to keep in sync: a field the engine adds reaches the frontend
+// without a gateway change.
+type ValueBet struct {
+	ID      string `json:"id"`
+	Sport   string `json:"sport"`
+	Removed bool   `json:"removed"`
+	raw     json.RawMessage
+}
+
+// UnmarshalJSON decodes the routing fields and keeps the full original payload.
+func (v *ValueBet) UnmarshalJSON(b []byte) error {
+	type routing ValueBet // no methods → no recursion
+	var r routing
+	if err := json.Unmarshal(b, &r); err != nil {
+		return err
+	}
+	*v = ValueBet(r)
+	v.raw = append(json.RawMessage(nil), b...)
+	return nil
+}
+
+// MarshalJSON relays the engine's payload verbatim (falls back to the routing
+// fields for a ValueBet built in code rather than decoded).
+func (v ValueBet) MarshalJSON() ([]byte, error) {
+	if len(v.raw) > 0 {
+		return v.raw, nil
+	}
+	type routing ValueBet
+	return json.Marshal(routing(v))
+}
+
 // ── Hub — manages all WebSocket client connections ───────────────────────────
-type Hub struct {
+
+// hubSpec describes one independent channel served by a StateHub: how an item is
+// keyed, which sport class it belongs to (eviction TTL), whether it is an explicit
+// removal, and the JSON Patch path prefix its ops use. The arb channel (/ws) and
+// the value-bet channel (/ws/value) are two StateHubs with different specs.
+type hubSpec[T any] struct {
+	name    string // "arb" | "value" — used in log lines
+	prefix  string // patch path prefix incl. slashes, e.g. "/arb/"
+	key     func(T) string
+	sport   func(T) string
+	removed func(T) bool
+}
+
+var arbSpec = hubSpec[ArbOpportunity]{
+	name:    "arb",
+	prefix:  "/arb/",
+	key:     oppStateKey,
+	sport:   func(o ArbOpportunity) string { return o.Sport },
+	removed: func(o ArbOpportunity) bool { return o.Removed },
+}
+
+// valueSpec keys value bets on the engine-assigned id verbatim. The id may
+// contain ':' '|' '.' — none need JSON-Pointer escaping, and the engine never
+// emits '/' (contract), so the id is used as-is like the arb composite key.
+var valueSpec = hubSpec[ValueBet]{
+	name:    "value",
+	prefix:  "/value/",
+	key:     func(v ValueBet) string { return v.ID },
+	sport:   func(v ValueBet) string { return v.Sport },
+	removed: func(v ValueBet) bool { return v.Removed },
+}
+
+// hubEntry wraps an item with a lastSeen timestamp for eviction tracking.
+type hubEntry[T any] struct {
+	opp      T
+	lastSeen time.Time
+}
+
+// arbEntry wraps ArbOpportunity with a lastSeen timestamp for eviction tracking.
+type arbEntry = hubEntry[ArbOpportunity]
+
+// StateHub holds the client set, item state and snapshot cache of one channel.
+type StateHub[T any] struct {
+	spec hubSpec[T]
+
 	mu      sync.RWMutex
 	clients map[*Client]struct{}
-	state   map[string]arbEntry // current arb state
+	state   map[string]hubEntry[T] // current state
 	stateMu sync.RWMutex
 
 	snapshotCache    []byte
@@ -146,40 +221,51 @@ type Hub struct {
 	msgSent   atomic.Int64
 }
 
-func NewHub(cfg Config) *Hub {
-	return &Hub{
+// Hub is the arbitrage channel (/ws, arb.opportunities).
+type Hub = StateHub[ArbOpportunity]
+
+// ValueHub is the value-bet channel (/ws/value, value.opportunities).
+type ValueHub = StateHub[ValueBet]
+
+func newStateHub[T any](cfg Config, spec hubSpec[T]) *StateHub[T] {
+	return &StateHub[T]{
+		spec:    spec,
 		clients: make(map[*Client]struct{}),
-		state:   make(map[string]arbEntry),
+		state:   make(map[string]hubEntry[T]),
 		cfg:     cfg,
 	}
 }
 
-func (h *Hub) Register(c *Client) {
+func NewHub(cfg Config) *Hub { return newStateHub(cfg, arbSpec) }
+
+func NewValueHub(cfg Config) *ValueHub { return newStateHub(cfg, valueSpec) }
+
+func (h *StateHub[T]) Register(c *Client) {
 	h.mu.Lock()
 	h.clients[c] = struct{}{}
 	h.mu.Unlock()
 	h.connCount.Add(1)
 }
 
-func (h *Hub) Unregister(c *Client) {
+func (h *StateHub[T]) Unregister(c *Client) {
 	h.mu.Lock()
 	delete(h.clients, c)
 	h.mu.Unlock()
 	h.connCount.Add(-1)
 }
 
-func (h *Hub) ClientCount() int64 { return h.connCount.Load() }
+func (h *StateHub[T]) ClientCount() int64 { return h.connCount.Load() }
 
 // ApplyOpportunity stores opp under its composite key and returns the patch op to broadcast.
-func (h *Hub) ApplyOpportunity(opp ArbOpportunity) PatchOp {
-	key := oppStateKey(opp)
+func (h *StateHub[T]) ApplyOpportunity(opp T) PatchOp {
+	key := h.spec.key(opp)
 	h.stateMu.Lock()
-	h.state[key] = arbEntry{opp: opp, lastSeen: time.Now()}
+	h.state[key] = hubEntry[T]{opp: opp, lastSeen: time.Now()}
 	h.snapshotCache = nil
 	h.stateMu.Unlock()
 	return PatchOp{
 		Op:    "replace",
-		Path:  fmt.Sprintf("/arb/%s", key),
+		Path:  h.spec.prefix + key,
 		Value: opp,
 	}
 }
@@ -189,8 +275,8 @@ func (h *Hub) ApplyOpportunity(opp ArbOpportunity) PatchOp {
 // (opp.Removed=true) so a vanished/no-longer-valid arb disappears immediately rather
 // than after the eviction TTL. Returns ok=false (and a zero PatchOp) if the key was
 // not in state, so the bridge can skip broadcasting a no-op remove.
-func (h *Hub) RemoveOpportunity(opp ArbOpportunity) (PatchOp, bool) {
-	key := oppStateKey(opp)
+func (h *StateHub[T]) RemoveOpportunity(opp T) (PatchOp, bool) {
+	key := h.spec.key(opp)
 	h.stateMu.Lock()
 	_, present := h.state[key]
 	if present {
@@ -201,7 +287,7 @@ func (h *Hub) RemoveOpportunity(opp ArbOpportunity) (PatchOp, bool) {
 	if !present {
 		return PatchOp{}, false
 	}
-	return PatchOp{Op: "remove", Path: fmt.Sprintf("/arb/%s", key)}, true
+	return PatchOp{Op: "remove", Path: h.spec.prefix + key}, true
 }
 
 // evictStale removes Hub state entries not updated within their TTL and returns
@@ -210,17 +296,17 @@ func (h *Hub) RemoveOpportunity(opp ArbOpportunity) (PatchOp, bool) {
 // arb-engine re-publishes a still-valid live arb on the fetcher heartbeat cadence
 // (~3s), so liveTTL only fires once an arb genuinely stops being detected.
 // Invalidates snapshotCache if any entries were removed. Safe to call concurrently.
-func (h *Hub) evictStale(prematchTTL, liveTTL time.Duration) []PatchOp {
+func (h *StateHub[T]) evictStale(prematchTTL, liveTTL time.Duration) []PatchOp {
 	var ops []PatchOp
 	h.stateMu.Lock()
 	for key, entry := range h.state {
 		ttl := prematchTTL
-		if strings.HasSuffix(entry.opp.Sport, "-live") {
+		if strings.HasSuffix(h.spec.sport(entry.opp), "-live") {
 			ttl = liveTTL
 		}
 		if time.Since(entry.lastSeen) > ttl {
 			delete(h.state, key)
-			ops = append(ops, PatchOp{Op: "remove", Path: fmt.Sprintf("/arb/%s", key)})
+			ops = append(ops, PatchOp{Op: "remove", Path: h.spec.prefix + key})
 		}
 	}
 	if len(ops) > 0 {
@@ -231,7 +317,7 @@ func (h *Hub) evictStale(prematchTTL, liveTTL time.Duration) []PatchOp {
 }
 
 // BroadcastPatch sends a JSON Patch delta to all connected clients
-func (h *Hub) BroadcastPatch(ops []PatchOp) {
+func (h *StateHub[T]) BroadcastPatch(ops []PatchOp) {
 	if len(ops) == 0 {
 		return
 	}
@@ -250,13 +336,13 @@ func (h *Hub) BroadcastPatch(ops []PatchOp) {
 			h.msgSent.Add(1)
 		default:
 			// Client send buffer full — they'll get the next update
-			log.Warn().Msg("Client send buffer full, skipping delta")
+			log.Warn().Str("hub", h.spec.name).Msg("Client send buffer full, skipping delta")
 		}
 	}
 }
 
-// Snapshot returns all current arb opportunities as JSON (cached for SnapshotCacheMs)
-func (h *Hub) Snapshot() []byte {
+// Snapshot returns all current items as a flat {key: item} JSON object (cached for SnapshotCacheMs)
+func (h *StateHub[T]) Snapshot() []byte {
 	// Write lock required: cache miss path writes snapshotCache and snapshotCachedAt.
 	h.stateMu.Lock()
 	defer h.stateMu.Unlock()
@@ -264,7 +350,7 @@ func (h *Hub) Snapshot() []byte {
 	if h.snapshotCache != nil && now-h.snapshotCachedAt < h.cfg.SnapshotCacheMs {
 		return h.snapshotCache
 	}
-	plain := make(map[string]ArbOpportunity, len(h.state))
+	plain := make(map[string]T, len(h.state))
 	for k, e := range h.state {
 		plain[k] = e.opp
 	}
@@ -278,7 +364,6 @@ func (h *Hub) Snapshot() []byte {
 type Client struct {
 	conn *websocket.Conn
 	send chan []byte
-	hub  *Hub
 }
 
 func (c *Client) writePump(ctx context.Context) {
@@ -307,26 +392,42 @@ func (c *Client) writePump(ctx context.Context) {
 }
 
 // ── NATS → Hub bridge ─────────────────────────────────────────────────────────
+// runNATSBridge subscribes the arb hub to arb.opportunities.
 func runNATSBridge(ctx context.Context, nc *nats.Conn, hub *Hub) {
+	runHubBridge(ctx, nc, hub, "arb.opportunities")
+}
+
+// runValueBridge subscribes the value hub to value.opportunities.
+func runValueBridge(ctx context.Context, nc *nats.Conn, hub *ValueHub) {
+	runHubBridge(ctx, nc, hub, "value.opportunities")
+}
+
+func runHubBridge[T any](ctx context.Context, nc *nats.Conn, hub *StateHub[T], subject string) {
 	// Batch deltas within BroadcastBatchMs window
 	pending := make([]PatchOp, 0, 32)
 	ticker := time.NewTicker(time.Duration(hub.cfg.BroadcastBatchMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	msgCh := make(chan *nats.Msg, 256)
-	sub, _ := nc.ChanSubscribe("arb.opportunities", msgCh)
+	sub, _ := nc.ChanSubscribe(subject, msgCh)
 	defer sub.Unsubscribe()
 
 	for {
 		select {
 		case msg := <-msgCh:
-			var opp ArbOpportunity
+			var opp T
 			if err := json.Unmarshal(msg.Data, &opp); err != nil {
-				log.Error().Err(err).Msg("Failed to parse arb opportunity")
+				log.Error().Err(err).Msgf("Failed to parse %s opportunity", hub.spec.name)
+				continue
+			}
+			if hub.spec.key(opp) == "" {
+				// Malformed message (no identity) — a patch path of just the prefix
+				// would address the whole collection on the client.
+				log.Error().Str("subject", subject).Msg("Dropping message with empty state key")
 				continue
 			}
 
-			if opp.Removed {
+			if hub.spec.removed(opp) {
 				// Explicit removal from the arb-engine — drop it now (skip the no-op
 				// case where we never had this key).
 				if op, ok := hub.RemoveOpportunity(opp); ok {
@@ -350,8 +451,22 @@ func runNATSBridge(ctx context.Context, nc *nats.Conn, hub *Hub) {
 
 // ── Stale eviction sweep ──────────────────────────────────────────────────────
 func runEvictionSweep(ctx context.Context, hub *Hub) {
-	prematchTTL := time.Duration(hub.cfg.EvictionTTLS) * time.Second
-	liveTTL := time.Duration(hub.cfg.EvictionLiveTTLS) * time.Second
+	runHubEvictionSweep(ctx, hub,
+		time.Duration(hub.cfg.EvictionTTLS)*time.Second,
+		time.Duration(hub.cfg.EvictionLiveTTLS)*time.Second)
+}
+
+// runValueEvictionSweep evicts value bets unseen for VALUE_EVICTION_TTL_S. Value
+// bets are prematch-only, so the same TTL is passed for the live class.
+func runValueEvictionSweep(ctx context.Context, hub *ValueHub) {
+	ttl := time.Duration(hub.cfg.ValueEvictionTTLS) * time.Second
+	if ttl <= 0 {
+		ttl = 120 * time.Second
+	}
+	runHubEvictionSweep(ctx, hub, ttl, ttl)
+}
+
+func runHubEvictionSweep[T any](ctx context.Context, hub *StateHub[T], prematchTTL, liveTTL time.Duration) {
 	interval := time.Duration(hub.cfg.EvictionIntervalS) * time.Second
 	if interval <= 0 {
 		interval = 3 * time.Second
@@ -371,7 +486,7 @@ func runEvictionSweep(ctx context.Context, hub *Hub) {
 			ops := hub.evictStale(prematchTTL, liveTTL)
 			if len(ops) > 0 {
 				hub.BroadcastPatch(ops)
-				log.Info().Int("evicted", len(ops)).Msg("Stale arb entries evicted")
+				log.Info().Int("evicted", len(ops)).Msgf("Stale %s entries evicted", hub.spec.name)
 			}
 		case <-ctx.Done():
 			return
@@ -380,7 +495,7 @@ func runEvictionSweep(ctx context.Context, hub *Hub) {
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
-func wsHandler(hub *Hub) http.HandlerFunc {
+func wsHandler[T any](hub *StateHub[T]) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if hub.ClientCount() >= int64(hub.cfg.MaxClients) {
 			http.Error(w, "max clients reached", http.StatusServiceUnavailable)
@@ -395,7 +510,7 @@ func wsHandler(hub *Hub) http.HandlerFunc {
 			return
 		}
 
-		client := &Client{conn: conn, send: make(chan []byte, 64), hub: hub}
+		client := &Client{conn: conn, send: make(chan []byte, 64)}
 		hub.Register(client)
 		defer hub.Unregister(client)
 
@@ -413,7 +528,7 @@ func wsHandler(hub *Hub) http.HandlerFunc {
 	}
 }
 
-func snapshotHandler(hub *Hub) http.HandlerFunc {
+func snapshotHandler[T any](hub *StateHub[T]) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(hub.Snapshot())
@@ -425,14 +540,31 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, `{"status":"ok","service":"api-gateway","version":"%s"}`, version)
 }
 
-func metricsHandler(hub *Hub) http.HandlerFunc {
+func metricsHandler(hub *Hub, valueHub *ValueHub) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprintf(w,
 			"gateway_ws_clients_connected %d\ngateway_messages_sent_total %d\n",
 			hub.ClientCount(), hub.msgSent.Load(),
 		)
+		fmt.Fprintf(w,
+			"gateway_value_ws_clients_connected %d\ngateway_value_messages_sent_total %d\n",
+			valueHub.ClientCount(), valueHub.msgSent.Load(),
+		)
 	}
+}
+
+// newMux wires the HTTP routes. Patterns without a trailing slash match exactly,
+// so "/ws" does not swallow "/ws/value".
+func newMux(hub *Hub, valueHub *ValueHub) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", wsHandler(hub))
+	mux.HandleFunc("/ws/value", wsHandler(valueHub))
+	mux.HandleFunc("/api/arb/snapshot", snapshotHandler(hub))
+	mux.HandleFunc("/api/value/snapshot", snapshotHandler(valueHub))
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/metrics", metricsHandler(hub, valueHub))
+	return mux
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -456,6 +588,7 @@ func main() {
 
 	cfg := configFromEnv()
 	hub := NewHub(cfg)
+	valueHub := NewValueHub(cfg)
 
 	// Connect NATS
 	nc, err := nats.Connect(cfg.NatsURL,
@@ -485,16 +618,13 @@ func main() {
 	// Start stale eviction sweep
 	go runEvictionSweep(ctx, hub)
 
-	// HTTP routes
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", wsHandler(hub))
-	mux.HandleFunc("/api/arb/snapshot", snapshotHandler(hub))
-	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc("/metrics", metricsHandler(hub))
+	// Value-bet channel: independent hub, subject, WS endpoint and snapshot
+	go runValueBridge(ctx, nc, valueHub)
+	go runValueEvictionSweep(ctx, valueHub)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
-		Handler:      mux,
+		Handler:      newMux(hub, valueHub),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 0, // no timeout for WS connections
 	}
