@@ -12,8 +12,8 @@ All application code lives in a **single file**: `cmd/gateway/main.go` (no inter
 
 Key types in that file:
 - `Config` — env vars loaded at startup
-- `StateHub[T]` — central state of one channel: client map + item state + snapshot cache, parameterized by a `hubSpec` (key func, sport func, removed func, patch path prefix). `Hub` = `StateHub[ArbOpportunity]` (`/ws`, `arb.opportunities`, `/arb/`); `ValueHub` = `StateHub[ValueBet]` (`/ws/value`, `value.opportunities`, `/value/`)
-- `ValueBet` — decodes only `id`/`sport`/`removed`; marshals the engine's original JSON verbatim
+- `StateHub[T]` — central state of one channel: client map + item state + snapshot cache, parameterized by a `hubSpec` (key func, isLive func — eviction class, removed func, patch path prefix). `Hub` = `StateHub[ArbOpportunity]` (`/ws`, `arb.opportunities`, `/arb/`); `ValueHub` = `StateHub[ValueBet]` (`/ws/value`, `value.opportunities`, `/value/`)
+- `ValueBet` — decodes only `id`/`event_id`/`sport`/`is_live`/`removed`; marshals the engine's original JSON verbatim. `isLive()` = `is_live`, fallback: `event_id` sport segment ends in `-live` (`sport` is bare for value bets)
 - `Client` — single WebSocket connection with a send channel
 - `ArbOpportunity` / `StakeAllocation` — mirrors the Rust arb-engine structs
 - `WSMessage` / `PatchOp` — WebSocket protocol types (RFC 6902 JSON Patch)
@@ -68,7 +68,8 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 | `LOG_LEVEL` | `info` | zerolog levels: debug/info/warn/error |
 | `EVICTION_TTL_S` | `120` | Seconds since last update before an entry is evicted |
 | `EVICTION_INTERVAL_S` | `3` | Eviction sweep cadence in seconds (shared by both hubs) |
-| `VALUE_EVICTION_TTL_S` | `120` | Seconds before an unseen value bet is evicted (prematch-only, no live variant) |
+| `VALUE_EVICTION_TTL_S` | `120` | Seconds before an unseen **prematch** value bet is evicted |
+| `VALUE_LIVE_EVICTION_TTL_S` | `15` | Seconds before an unseen **live** value bet (`is_live`, fallback `event_id` sport `-live`) is evicted |
 
 ## Concurrency
 

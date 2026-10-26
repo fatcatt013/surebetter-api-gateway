@@ -168,6 +168,71 @@ func TestValueHub_EvictStale(t *testing.T) {
 	}
 }
 
+func TestValueBet_IsLive(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want bool
+	}{
+		{"is_live flag", `{"id":"a","event_id":"football:x","sport":"football","is_live":true}`, true},
+		{"event_id fallback", `{"id":"a","event_id":"football-live:x","sport":"football"}`, true},
+		{"prematch", `{"id":"a","event_id":"football:x","sport":"football","is_live":false}`, false},
+		{"v1 payload", fullValueJSON, false},
+		{"-live only in the event part", `{"id":"a","event_id":"football:team-live","sport":"football"}`, false},
+	}
+	for _, c := range cases {
+		if got := mustValueBet(t, c.json).isLive(); got != c.want {
+			t.Errorf("%s: isLive = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// Live value bets use VALUE_LIVE_EVICTION_TTL_S, prematch VALUE_EVICTION_TTL_S.
+func TestValueHub_EvictStale_LiveUsesShorterTTL(t *testing.T) {
+	hub := NewValueHub(Config{SnapshotCacheMs: 500})
+	const (
+		liveFlag  = "football-live:l1:MATCH_WINNER:0.00|DRAW|tipsport"
+		liveEvent = "football-live:l2:MATCH_WINNER:0.00|DRAW|tipsport"
+		prematch  = "football:p1:MATCH_WINNER:0.00|DRAW|pinnacle"
+	)
+	hub.ApplyOpportunity(mustValueBet(t, `{"id":"`+liveFlag+`","event_id":"football-live:l1","sport":"football","is_live":true}`))
+	hub.ApplyOpportunity(mustValueBet(t, `{"id":"`+liveEvent+`","event_id":"football-live:l2","sport":"football"}`))
+	hub.ApplyOpportunity(mustValueBet(t, `{"id":"`+prematch+`","event_id":"football:p1","sport":"football","is_live":false}`))
+
+	hub.stateMu.Lock()
+	for k, e := range hub.state {
+		e.lastSeen = time.Now().Add(-20 * time.Second) // > live 15s, < prematch 120s
+		hub.state[k] = e
+	}
+	hub.stateMu.Unlock()
+
+	ops := hub.evictStale(120*time.Second, 15*time.Second)
+	got := map[string]bool{}
+	for _, op := range ops {
+		got[op.Path] = true
+	}
+	if len(ops) != 2 || !got["/value/"+liveFlag] || !got["/value/"+liveEvent] {
+		t.Fatalf("want both live value bets evicted, got %+v", ops)
+	}
+	hub.stateMu.RLock()
+	_, prematchStill := hub.state[prematch]
+	hub.stateMu.RUnlock()
+	if !prematchStill {
+		t.Error("prematch value bet must survive the live TTL")
+	}
+}
+
+func TestConfig_ValueLiveEvictionTTLDefault(t *testing.T) {
+	t.Setenv("VALUE_LIVE_EVICTION_TTL_S", "")
+	if got := configFromEnv().ValueLiveEvictionTTLS; got != 15 {
+		t.Errorf("VALUE_LIVE_EVICTION_TTL_S default = %d, want 15", got)
+	}
+	t.Setenv("VALUE_LIVE_EVICTION_TTL_S", "7")
+	if got := configFromEnv().ValueLiveEvictionTTLS; got != 7 {
+		t.Errorf("VALUE_LIVE_EVICTION_TTL_S = %d, want 7", got)
+	}
+}
+
 func TestValueHub_SnapshotIsFlatMapOfVerbatimValueBets(t *testing.T) {
 	hub := NewValueHub(Config{SnapshotCacheMs: 500})
 	hub.ApplyOpportunity(mustValueBet(t, fullValueJSON))

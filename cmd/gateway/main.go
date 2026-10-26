@@ -36,7 +36,9 @@ type Config struct {
 	EvictionTTLS      int // EVICTION_TTL_S: seconds until an unseen PREMATCH entry is evicted
 	EvictionLiveTTLS  int // EVICTION_LIVE_TTL_S: shorter TTL for "-live" arbs (fast removal)
 	EvictionIntervalS int // EVICTION_INTERVAL_S: sweep cadence in seconds
-	ValueEvictionTTLS int // VALUE_EVICTION_TTL_S: seconds until an unseen value bet is evicted
+	ValueEvictionTTLS int // VALUE_EVICTION_TTL_S: seconds until an unseen PREMATCH value bet is evicted
+	// VALUE_LIVE_EVICTION_TTL_S: shorter TTL for live value bets (engine heartbeats them every ~3s)
+	ValueLiveEvictionTTLS int
 }
 
 func configFromEnv() Config {
@@ -52,6 +54,8 @@ func configFromEnv() Config {
 		EvictionLiveTTLS:  getenvInt("EVICTION_LIVE_TTL_S", 8),
 		EvictionIntervalS: getenvInt("EVICTION_INTERVAL_S", 3),
 		ValueEvictionTTLS: getenvInt("VALUE_EVICTION_TTL_S", 120),
+
+		ValueLiveEvictionTTLS: getenvInt("VALUE_LIVE_EVICTION_TTL_S", 15),
 	}
 }
 
@@ -128,16 +132,30 @@ type StakeAllocation struct {
 }
 
 // ── ValueBet (mirrors the arb-engine's value.rs ValueBet) ──────────────────
-// The gateway only needs three fields to route a value bet (id = state key,
-// sport = eviction class, removed = explicit removal), so it decodes just those
-// and relays the engine's original JSON verbatim. Unlike ArbOpportunity there is
+// The gateway only needs the routing fields of a value bet (id = state key,
+// is_live / event_id = eviction class, removed = explicit removal), so it decodes
+// just those and relays the engine's original JSON verbatim. Unlike ArbOpportunity there is
 // no struct mirror to keep in sync: a field the engine adds reaches the frontend
 // without a gateway change.
 type ValueBet struct {
 	ID      string `json:"id"`
-	Sport   string `json:"sport"`
+	EventID string `json:"event_id"`
+	Sport   string `json:"sport"` // bare sport — never carries "-live" (use isLive)
+	IsLive  bool   `json:"is_live"`
 	Removed bool   `json:"removed"`
 	raw     json.RawMessage
+}
+
+// isLive reports whether v is a live value bet: the engine's is_live flag, or —
+// for a payload without it — an event_id whose sport segment ends in "-live"
+// (`football-live:abc123`). `sport` itself is bare for value bets, so it cannot
+// carry the live class the way ArbOpportunity.Sport does.
+func (v ValueBet) isLive() bool {
+	if v.IsLive {
+		return true
+	}
+	sport, _, _ := strings.Cut(v.EventID, ":")
+	return strings.HasSuffix(sport, "-live")
 }
 
 // UnmarshalJSON decodes the routing fields and keeps the full original payload.
@@ -165,14 +183,14 @@ func (v ValueBet) MarshalJSON() ([]byte, error) {
 // ── Hub — manages all WebSocket client connections ───────────────────────────
 
 // hubSpec describes one independent channel served by a StateHub: how an item is
-// keyed, which sport class it belongs to (eviction TTL), whether it is an explicit
+// keyed, whether it is live (eviction TTL class), whether it is an explicit
 // removal, and the JSON Patch path prefix its ops use. The arb channel (/ws) and
 // the value-bet channel (/ws/value) are two StateHubs with different specs.
 type hubSpec[T any] struct {
 	name    string // "arb" | "value" — used in log lines
 	prefix  string // patch path prefix incl. slashes, e.g. "/arb/"
 	key     func(T) string
-	sport   func(T) string
+	isLive  func(T) bool
 	removed func(T) bool
 }
 
@@ -180,7 +198,7 @@ var arbSpec = hubSpec[ArbOpportunity]{
 	name:    "arb",
 	prefix:  "/arb/",
 	key:     oppStateKey,
-	sport:   func(o ArbOpportunity) string { return o.Sport },
+	isLive:  func(o ArbOpportunity) bool { return strings.HasSuffix(o.Sport, "-live") },
 	removed: func(o ArbOpportunity) bool { return o.Removed },
 }
 
@@ -191,7 +209,7 @@ var valueSpec = hubSpec[ValueBet]{
 	name:    "value",
 	prefix:  "/value/",
 	key:     func(v ValueBet) string { return v.ID },
-	sport:   func(v ValueBet) string { return v.Sport },
+	isLive:  ValueBet.isLive,
 	removed: func(v ValueBet) bool { return v.Removed },
 }
 
@@ -291,7 +309,7 @@ func (h *StateHub[T]) RemoveOpportunity(opp T) (PatchOp, bool) {
 }
 
 // evictStale removes Hub state entries not updated within their TTL and returns
-// one "remove" PatchOp per evicted key. Live arbs ("-live" sport) use the shorter
+// one "remove" PatchOp per evicted key. Live items (spec.isLive) use the shorter
 // liveTTL so a vanished live arb disappears fast; prematch uses prematchTTL. The
 // arb-engine re-publishes a still-valid live arb on the fetcher heartbeat cadence
 // (~3s), so liveTTL only fires once an arb genuinely stops being detected.
@@ -301,7 +319,7 @@ func (h *StateHub[T]) evictStale(prematchTTL, liveTTL time.Duration) []PatchOp {
 	h.stateMu.Lock()
 	for key, entry := range h.state {
 		ttl := prematchTTL
-		if strings.HasSuffix(h.spec.sport(entry.opp), "-live") {
+		if h.spec.isLive(entry.opp) {
 			ttl = liveTTL
 		}
 		if time.Since(entry.lastSeen) > ttl {
@@ -456,14 +474,20 @@ func runEvictionSweep(ctx context.Context, hub *Hub) {
 		time.Duration(hub.cfg.EvictionLiveTTLS)*time.Second)
 }
 
-// runValueEvictionSweep evicts value bets unseen for VALUE_EVICTION_TTL_S. Value
-// bets are prematch-only, so the same TTL is passed for the live class.
+// runValueEvictionSweep evicts prematch value bets unseen for VALUE_EVICTION_TTL_S
+// and live ones (is_live) unseen for VALUE_LIVE_EVICTION_TTL_S. The engine
+// heartbeats active live value bets every VALUE_LIVE_HEARTBEAT_MS (~3s) and removes
+// them explicitly, so the live TTL is only the backstop for a missed removal.
 func runValueEvictionSweep(ctx context.Context, hub *ValueHub) {
 	ttl := time.Duration(hub.cfg.ValueEvictionTTLS) * time.Second
 	if ttl <= 0 {
 		ttl = 120 * time.Second
 	}
-	runHubEvictionSweep(ctx, hub, ttl, ttl)
+	liveTTL := time.Duration(hub.cfg.ValueLiveEvictionTTLS) * time.Second
+	if liveTTL <= 0 {
+		liveTTL = 15 * time.Second
+	}
+	runHubEvictionSweep(ctx, hub, ttl, liveTTL)
 }
 
 func runHubEvictionSweep[T any](ctx context.Context, hub *StateHub[T], prematchTTL, liveTTL time.Duration) {
