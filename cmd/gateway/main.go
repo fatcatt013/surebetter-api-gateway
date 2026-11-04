@@ -144,6 +144,12 @@ type StakeAllocation struct {
 	// every update, incl. the ~3s heartbeat, even when the value is unchanged). Relayed
 	// verbatim so the frontend can show a per-odd "last updated" stamp.
 	OddsUpdatedAt int64 `json:"odds_updated_at"`
+	// SourceID is the bookmaker's own id for this selection (Betano: the odds button's
+	// data-selnid). Relayed verbatim for the browser extension; omitted when unavailable.
+	SourceID string `json:"source_id,omitempty"`
+	// SourceMarketRef is the bookmaker's own id for this leg's market container on its
+	// page (Fortuna: the card's market-type-id). Relayed verbatim for the browser extension.
+	SourceMarketRef string `json:"source_market_ref,omitempty"`
 }
 
 // ── ValueBet (mirrors the arb-engine's value.rs ValueBet) ──────────────────

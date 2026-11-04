@@ -54,6 +54,25 @@ func TestArbOpportunity_AllFieldsDeserialized(t *testing.T) {
 	}
 }
 
+// source_id (the bookmaker's own selection id) must survive the gateway's
+// unmarshal → re-marshal, or the browser extension cannot locate the selection.
+func TestStakeAllocation_SourceIDRelayed(t *testing.T) {
+	in := `{"bookmaker":"betano","outcome_id":"DRAW","decimal_odds":3.65,"stake_pct":27.4,"source_id":"10309227780","source_market_ref":"ufo:mtyp:00-00"}`
+	var s StakeAllocation
+	if err := json.Unmarshal([]byte(in), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	out, _ := json.Marshal(s)
+	var back map[string]any
+	_ = json.Unmarshal(out, &back)
+	if back["source_id"] != "10309227780" {
+		t.Errorf("source_id = %v, want 10309227780 (re-marshalled: %s)", back["source_id"], out)
+	}
+	if back["source_market_ref"] != "ufo:mtyp:00-00" {
+		t.Errorf("source_market_ref = %v, want ufo:mtyp:00-00 (re-marshalled: %s)", back["source_market_ref"], out)
+	}
+}
+
 // ── oppStateKey ───────────────────────────────────────────────────────────────
 
 func TestOppStateKey_NoLine(t *testing.T) {
