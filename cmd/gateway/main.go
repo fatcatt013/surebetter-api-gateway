@@ -20,6 +20,8 @@ import (
 	"github.com/rs/zerolog/log"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
+
+	"github.com/surebetter/api-gateway/internal/telegram"
 )
 
 var version = "dev"
@@ -39,6 +41,13 @@ type Config struct {
 	ValueEvictionTTLS int // VALUE_EVICTION_TTL_S: seconds until an unseen PREMATCH value bet is evicted
 	// VALUE_LIVE_EVICTION_TTL_S: shorter TTL for live value bets (engine heartbeats them every ~3s)
 	ValueLiveEvictionTTLS int
+
+	// Telegram bot (internal/telegram). Empty token or chat id → the feature is off.
+	TelegramToken         string
+	TelegramChatID        string
+	TelegramEditIntervalS int
+	TelegramRatePerMin    int
+	TelegramTZ            string
 }
 
 func configFromEnv() Config {
@@ -56,6 +65,12 @@ func configFromEnv() Config {
 		ValueEvictionTTLS: getenvInt("VALUE_EVICTION_TTL_S", 120),
 
 		ValueLiveEvictionTTLS: getenvInt("VALUE_LIVE_EVICTION_TTL_S", 15),
+
+		TelegramToken:         getenv("TELEGRAM_TOKEN", ""),
+		TelegramChatID:        getenv("TELEGRAM_CHAT_ID", ""),
+		TelegramEditIntervalS: getenvInt("TELEGRAM_EDIT_INTERVAL_S", 10),
+		TelegramRatePerMin:    getenvInt("TELEGRAM_RATE_PER_MIN", 18),
+		TelegramTZ:            getenv("TELEGRAM_TZ", "Europe/Prague"),
 	}
 }
 
@@ -237,6 +252,11 @@ type StateHub[T any] struct {
 	cfg       Config
 	connCount atomic.Int64
 	msgSent   atomic.Int64
+
+	// onChange, when set (arb hub with Telegram on), observes every state transition: an apply
+	// (removed=false) and an explicit removal or eviction (removed=true). Called outside stateMu;
+	// it must not block (the Telegram notifier's Observe is a non-blocking channel send).
+	onChange func(key string, item T, removed bool)
 }
 
 // Hub is the arbitrage channel (/ws, arb.opportunities).
@@ -274,6 +294,14 @@ func (h *StateHub[T]) Unregister(c *Client) {
 
 func (h *StateHub[T]) ClientCount() int64 { return h.connCount.Load() }
 
+// Has reports whether key is in the hub's current state (the Telegram reconcile sweep uses it).
+func (h *StateHub[T]) Has(key string) bool {
+	h.stateMu.RLock()
+	defer h.stateMu.RUnlock()
+	_, ok := h.state[key]
+	return ok
+}
+
 // ApplyOpportunity stores opp under its composite key and returns the patch op to broadcast.
 func (h *StateHub[T]) ApplyOpportunity(opp T) PatchOp {
 	key := h.spec.key(opp)
@@ -281,6 +309,9 @@ func (h *StateHub[T]) ApplyOpportunity(opp T) PatchOp {
 	h.state[key] = hubEntry[T]{opp: opp, lastSeen: time.Now()}
 	h.snapshotCache = nil
 	h.stateMu.Unlock()
+	if h.onChange != nil {
+		h.onChange(key, opp, false)
+	}
 	return PatchOp{
 		Op:    "replace",
 		Path:  h.spec.prefix + key,
@@ -305,6 +336,9 @@ func (h *StateHub[T]) RemoveOpportunity(opp T) (PatchOp, bool) {
 	if !present {
 		return PatchOp{}, false
 	}
+	if h.onChange != nil {
+		h.onChange(key, opp, true)
+	}
 	return PatchOp{Op: "remove", Path: h.spec.prefix + key}, true
 }
 
@@ -316,6 +350,8 @@ func (h *StateHub[T]) RemoveOpportunity(opp T) (PatchOp, bool) {
 // Invalidates snapshotCache if any entries were removed. Safe to call concurrently.
 func (h *StateHub[T]) evictStale(prematchTTL, liveTTL time.Duration) []PatchOp {
 	var ops []PatchOp
+	var evicted []hubEntry[T]
+	var evictedKeys []string
 	h.stateMu.Lock()
 	for key, entry := range h.state {
 		ttl := prematchTTL
@@ -325,12 +361,19 @@ func (h *StateHub[T]) evictStale(prematchTTL, liveTTL time.Duration) []PatchOp {
 		if time.Since(entry.lastSeen) > ttl {
 			delete(h.state, key)
 			ops = append(ops, PatchOp{Op: "remove", Path: h.spec.prefix + key})
+			evicted = append(evicted, entry)
+			evictedKeys = append(evictedKeys, key)
 		}
 	}
 	if len(ops) > 0 {
 		h.snapshotCache = nil
 	}
 	h.stateMu.Unlock()
+	if h.onChange != nil {
+		for i, e := range evicted {
+			h.onChange(evictedKeys[i], e.opp, true)
+		}
+	}
 	return ops
 }
 
@@ -564,7 +607,7 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, `{"status":"ok","service":"api-gateway","version":"%s"}`, version)
 }
 
-func metricsHandler(hub *Hub, valueHub *ValueHub) http.HandlerFunc {
+func metricsHandler(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprintf(w,
@@ -575,19 +618,23 @@ func metricsHandler(hub *Hub, valueHub *ValueHub) http.HandlerFunc {
 			"gateway_value_ws_clients_connected %d\ngateway_value_messages_sent_total %d\n",
 			valueHub.ClientCount(), valueHub.msgSent.Load(),
 		)
+		if tg != nil {
+			tg.WriteMetrics(w)
+		}
 	}
 }
 
 // newMux wires the HTTP routes. Patterns without a trailing slash match exactly,
-// so "/ws" does not swallow "/ws/value".
-func newMux(hub *Hub, valueHub *ValueHub) *http.ServeMux {
+// so "/ws" does not swallow "/ws/value". tg may be nil (Telegram off).
+func newMux(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler(hub))
 	mux.HandleFunc("/ws/value", wsHandler(valueHub))
 	mux.HandleFunc("/api/arb/snapshot", snapshotHandler(hub))
 	mux.HandleFunc("/api/value/snapshot", snapshotHandler(valueHub))
+	mux.Handle("/api/telegram/", telegram.Handler(tg))
 	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc("/metrics", metricsHandler(hub, valueHub))
+	mux.HandleFunc("/metrics", metricsHandler(hub, valueHub, tg))
 	return mux
 }
 
@@ -636,6 +683,9 @@ func main() {
 	}
 	log.Info().Str("url", cfg.RedisURL).Msg("Connected to Redis")
 
+	// Telegram bot: hook the arb hub before the bridge starts feeding it
+	tg := setupTelegram(ctx, cfg, hub, rdb)
+
 	// Start NATS→hub bridge
 	go runNATSBridge(ctx, nc, hub)
 
@@ -648,7 +698,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
-		Handler:      newMux(hub, valueHub),
+		Handler:      newMux(hub, valueHub, tg),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 0, // no timeout for WS connections
 	}
