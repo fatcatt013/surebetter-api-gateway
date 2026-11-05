@@ -70,7 +70,7 @@ func configFromEnv() Config {
 		TelegramToken:         getenv("TELEGRAM_TOKEN", ""),
 		TelegramChatID:        getenv("TELEGRAM_CHAT_ID", ""),
 		TelegramEditIntervalS: getenvInt("TELEGRAM_EDIT_INTERVAL_S", 10),
-		TelegramGoneDeleteS:   getenvInt("TELEGRAM_GONE_DELETE_AFTER_S", 300),
+		TelegramGoneDeleteS:   getenvInt("TELEGRAM_GONE_DELETE_AFTER_S", 0),
 		TelegramRatePerMin:    getenvInt("TELEGRAM_RATE_PER_MIN", 18),
 		TelegramTZ:            getenv("TELEGRAM_TZ", "Europe/Prague"),
 	}
