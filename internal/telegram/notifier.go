@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,12 +26,15 @@ type enqueuer interface{ Enqueue(Job) }
 
 // Options tune the notifier; zero values get defaults.
 type Options struct {
-	EditInterval   time.Duration         // TELEGRAM_EDIT_INTERVAL_S (default 10s)
-	ReconcileEvery time.Duration         // default 30s
-	StartupGrace   time.Duration         // no reconcile before this; EVICTION_TTL_S + 5s (default 125s)
-	SendPause      time.Duration         // pause new sends after a permanent send failure (default 60s)
-	Present        func(key string) bool // is the arb still in the gateway's hub? (hub.Has)
-	Now            func() time.Time
+	EditInterval   time.Duration // TELEGRAM_EDIT_INTERVAL_S (default 10s)
+	ReconcileEvery time.Duration // default 30s
+	StartupGrace   time.Duration // no reconcile before this; EVICTION_TTL_S + 5s (default 125s)
+	SendPause      time.Duration // pause new sends after a permanent send failure (default 60s)
+	// GoneDeleteAfter: a gone arb's message shows GONE this long, then is deleted. 0 deletes it at
+	// once without the GONE edit (TELEGRAM_GONE_DELETE_AFTER_S).
+	GoneDeleteAfter time.Duration
+	Present         func(key string) bool // is the arb still in the gateway's hub? (hub.Has)
+	Now             func() time.Time
 }
 
 // Status is GET /api/telegram/status.
@@ -50,7 +55,7 @@ type entryState int
 const (
 	stateSending entryState = iota // sendMessage in flight, no message id yet
 	stateLive
-	stateGone // delete (or GONE-edit fallback) queued
+	stateGone // GONE edit (or, with GoneDeleteAfter 0, the delete) queued
 )
 
 type entry struct {
@@ -60,6 +65,14 @@ type entry struct {
 	dirty   bool   // a change waits for the edit interval
 	text    string // text of the in-flight send
 }
+
+// fade is a message already edited to GONE; it is deleted GoneDeleteAfter later.
+type fade struct {
+	Tracked
+	queued bool
+}
+
+const fadePrefix = "gone:"
 
 // Notifier owns the per-arb lifecycle. handle/onResult/tick/reconcile run only on the Run goroutine.
 type Notifier struct {
@@ -76,6 +89,7 @@ type Notifier struct {
 
 	seen       map[string]Arb // last-seen arb per key still in the hub (min-age / enable candidates)
 	tracked    map[string]*entry
+	fading     map[string]*fade // "gone:<message_id>" → a GONE message waiting for its delete
 	startedAt  time.Time
 	pauseUntil time.Time
 
@@ -109,7 +123,7 @@ func NewNotifier(store Store, out enqueuer, render *Renderer, opts Options) *Not
 	return &Notifier{
 		store: store, out: out, render: render, opts: opts,
 		events: make(chan Event, 1024), results: make(chan Result, 256),
-		seen: map[string]Arb{}, tracked: map[string]*entry{}, startedAt: opts.Now(),
+		seen: map[string]Arb{}, tracked: map[string]*entry{}, fading: map[string]*fade{}, startedAt: opts.Now(),
 	}
 }
 
@@ -143,6 +157,10 @@ func (n *Notifier) Load(ctx context.Context) error {
 	for key, t := range msgs {
 		if now.Sub(time.UnixMilli(t.SentAt)) > 48*time.Hour {
 			_ = n.store.DeleteMessage(ctx, key)
+			continue
+		}
+		if strings.HasPrefix(key, fadePrefix) {
+			n.fading[key] = &fade{Tracked: t}
 			continue
 		}
 		n.tracked[key] = &entry{Tracked: t, state: stateLive}
@@ -250,12 +268,29 @@ func (n *Notifier) goGone(key string, e *entry, now time.Time) {
 		e.removed = true
 	case stateLive:
 		e.state = stateGone
+		if n.opts.GoneDeleteAfter <= 0 {
+			n.out.Enqueue(Job{Kind: JobDelete, Key: key, MessageID: e.MessageID})
+			return
+		}
 		n.out.Enqueue(Job{Kind: JobGone, Key: key, MessageID: e.MessageID, Text: n.render.Render(n.view(e, now, true))})
 	}
 }
 
 func (n *Notifier) onResult(ctx context.Context, r Result, now time.Time) {
 	key := r.Job.Key
+	if r.Job.Kind == JobDelete {
+		// "not found" = deleted by hand; anything else (e.g. >48h, can't be deleted) leaves it as is.
+		if r.Err != nil && !descContains(r.Err, "message to delete not found") {
+			n.recordErr(r.Err, now)
+		}
+		if _, ok := n.fading[key]; ok {
+			delete(n.fading, key)
+			n.dropStored(ctx, key)
+		} else if n.tracked[key] != nil {
+			n.untrack(ctx, key, true)
+		}
+		return
+	}
 	e := n.tracked[key]
 	if e == nil {
 		return
@@ -300,7 +335,14 @@ func (n *Notifier) onResult(ctx context.Context, r Result, now time.Time) {
 		} else {
 			n.editsN.Add(1)
 		}
-		n.untrack(ctx, key, true)
+		n.untrack(ctx, key, true) // the key is free for a re-detected arb right away
+		if r.Err != nil && isMessageGone(r.Err) {
+			return
+		}
+		fk := fadePrefix + strconv.FormatInt(e.MessageID, 10)
+		f := &fade{Tracked: Tracked{MessageID: e.MessageID, SentAt: e.SentAt, GoneAt: now.UnixMilli()}}
+		n.fading[fk] = f
+		n.persist(ctx, fk, &entry{Tracked: f.Tracked})
 	}
 }
 
@@ -315,6 +357,12 @@ func (n *Notifier) tick(now time.Time) {
 	for key, a := range n.seen {
 		if _, ok := n.tracked[key]; !ok {
 			n.maybeSend(key, a, now)
+		}
+	}
+	for fk, f := range n.fading {
+		if !f.queued && now.Sub(time.UnixMilli(f.GoneAt)) >= n.opts.GoneDeleteAfter {
+			f.queued = true
+			n.out.Enqueue(Job{Kind: JobDelete, Key: fk, MessageID: f.MessageID})
 		}
 	}
 }
@@ -340,9 +388,13 @@ func (n *Notifier) untrack(ctx context.Context, key string, stored bool) {
 	delete(n.tracked, key)
 	n.trackedN.Add(-1)
 	if stored {
-		if err := n.store.DeleteMessage(ctx, key); err != nil {
-			log.Warn().Err(err).Str("key", key).Msg("telegram: deleting tracked message failed")
-		}
+		n.dropStored(ctx, key)
+	}
+}
+
+func (n *Notifier) dropStored(ctx context.Context, key string) {
+	if err := n.store.DeleteMessage(ctx, key); err != nil {
+		log.Warn().Err(err).Str("key", key).Msg("telegram: deleting tracked message failed")
 	}
 }
 

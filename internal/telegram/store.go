@@ -12,7 +12,7 @@ import (
 
 const (
 	ConfigKey   = "telegram:bot_config" // JSON BotConfig, no TTL
-	MessagesKey = "telegram:messages"   // hash: oppStateKey → JSON Tracked
+	MessagesKey = "telegram:messages"   // hash: oppStateKey (or "gone:<message_id>") → JSON Tracked
 )
 
 // Tracked is a posted message's persisted state, enough to keep editing it after a restart.
@@ -24,8 +24,9 @@ type Tracked struct {
 	LastTextSHA     string   `json:"last_text_sha"`
 	LastEditAt      int64    `json:"last_edit_at"`
 	Arb             Arb      `json:"arb"`
-	Bankroll        Bankroll `json:"bankroll"`    // as at send time; edits keep it
-	PresetName      string   `json:"preset_name"` // as at send time
+	Bankroll        Bankroll `json:"bankroll"`          // as at send time; edits keep it
+	PresetName      string   `json:"preset_name"`       // as at send time
+	GoneAt          int64    `json:"gone_at,omitempty"` // set on "gone:<message_id>" fields: GONE shown, delete pending
 }
 
 // Store persists config and tracked messages.

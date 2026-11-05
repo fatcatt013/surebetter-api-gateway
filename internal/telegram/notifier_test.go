@@ -115,6 +115,60 @@ func TestNotifier_GoneIgnoresThrottleAndUntracks(t *testing.T) {
 	if _, ok := st.msgs["k"]; ok || n.Status().Tracked != 0 {
 		t.Fatal("gone message must be untracked and deleted from the store")
 	}
+	if f, ok := st.msgs["gone:1"]; !ok || f.MessageID != 1 {
+		t.Fatalf("the pending delete must be stored, got %+v", st.msgs)
+	}
+}
+
+func TestNotifier_GoneMessageDeletedAfterDelay(t *testing.T) {
+	st := newMemStore()
+	n, out := newTestNotifier(t, st, nil)
+	now := t0()
+	sendLive(t, n, out, "k", SampleArb(now), now, 1)
+	n.handle(bg, remove("k"), now.Add(time.Second))
+	n.onResult(bg, Result{Job: onlyJob(t, out, JobGone), MessageID: 1}, now.Add(2*time.Second))
+	n.tick(now.Add(4 * time.Minute))
+	noJobs(t, out)
+	n.tick(now.Add(5*time.Minute + 2*time.Second))
+	d := onlyJob(t, out, JobDelete)
+	if d.MessageID != 1 {
+		t.Fatalf("delete job %+v", d)
+	}
+	n.tick(now.Add(5*time.Minute + 3*time.Second))
+	noJobs(t, out) // queued once
+	n.onResult(bg, Result{Job: d}, now.Add(5*time.Minute+4*time.Second))
+	if len(st.msgs) != 0 {
+		t.Fatalf("store must be empty after the delete, got %+v", st.msgs)
+	}
+}
+
+func TestNotifier_PendingDeleteSurvivesRestart(t *testing.T) {
+	now := t0()
+	st := newMemStore()
+	st.cfg = validConfig()
+	st.msgs["gone:9"] = Tracked{MessageID: 9, SentAt: now.UnixMilli(), GoneAt: now.UnixMilli()}
+	n, out := newTestNotifier(t, st, nil)
+	if n.Status().Tracked != 0 {
+		t.Fatal("a pending delete is not a tracked arb")
+	}
+	n.tick(now.Add(5 * time.Minute))
+	if d := onlyJob(t, out, JobDelete); d.MessageID != 9 {
+		t.Fatalf("delete job %+v", d)
+	}
+}
+
+func TestNotifier_ZeroDelayDeletesAtOnce(t *testing.T) {
+	st := newMemStore()
+	n, out := newTestNotifier(t, st, nil)
+	n.opts.GoneDeleteAfter = 0
+	now := t0()
+	sendLive(t, n, out, "k", SampleArb(now), now, 1)
+	n.handle(bg, remove("k"), now.Add(time.Second))
+	d := onlyJob(t, out, JobDelete)
+	n.onResult(bg, Result{Job: d}, now.Add(2*time.Second))
+	if len(st.msgs) != 0 || n.Status().Tracked != 0 {
+		t.Fatalf("store %+v tracked %d", st.msgs, n.Status().Tracked)
+	}
 }
 
 func TestNotifier_RemoveWhileSendingGoesGoneAfterSend(t *testing.T) {

@@ -12,10 +12,11 @@ import (
 type JobKind int
 
 const (
-	JobGone JobKind = iota // delete the message of a vanished arb (Text = GONE fallback edit)
-	JobTest                // POST /api/telegram/test
-	JobSend                // first message for an arb
-	JobEdit                // live update (coalesced per key)
+	JobGone   JobKind = iota // GONE edit of a vanished arb
+	JobDelete                // delete a gone arb's message (after GoneDeleteAfter)
+	JobTest                  // POST /api/telegram/test
+	JobSend                  // first message for an arb
+	JobEdit                  // live update (coalesced per key)
 )
 
 // Job is one Bot API call. Reply, when set, receives the Result instead of the outbox callback.
@@ -67,7 +68,7 @@ func NewOutbox(c Client, ratePerMin int, deliver func(Result)) *Outbox {
 func (o *Outbox) Enqueue(j Job) {
 	o.mu.Lock()
 	switch j.Kind {
-	case JobGone:
+	case JobGone, JobDelete:
 		o.dropEdit(j.Key)
 		o.gone = append(o.gone, j)
 	case JobTest:
@@ -182,12 +183,8 @@ func (o *Outbox) call(ctx context.Context, j Job) (int64, error) {
 	switch j.Kind {
 	case JobSend, JobTest:
 		return o.client.Send(ctx, j.Text)
-	case JobGone:
-		err := o.client.Delete(ctx, j.MessageID)
-		if cannotDelete(err) {
-			return j.MessageID, o.client.Edit(ctx, j.MessageID, j.Text)
-		}
-		return j.MessageID, err
+	case JobDelete:
+		return j.MessageID, o.client.Delete(ctx, j.MessageID)
 	default:
 		return j.MessageID, o.client.Edit(ctx, j.MessageID, j.Text)
 	}

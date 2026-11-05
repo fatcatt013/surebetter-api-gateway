@@ -29,6 +29,7 @@ func setupTelegram(ctx context.Context, cfg Config, hub *Hub, rdb *redis.Client)
 		RatePerMin:   cfg.TelegramRatePerMin,
 		TZ:           cfg.TelegramTZ,
 		StartupGrace: prematchTTL + 5*time.Second,
+		GoneDelete:   time.Duration(cfg.TelegramGoneDeleteS) * time.Second,
 		Present:      hub.Has,
 	}, rdb)
 	if err != nil {

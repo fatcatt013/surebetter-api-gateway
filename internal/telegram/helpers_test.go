@@ -134,7 +134,7 @@ func newTestNotifier(t *testing.T, store *memStore, present map[string]bool) (*N
 		store.cfg = validConfig()
 	}
 	out := &fakeOut{}
-	opts := Options{EditInterval: 10 * time.Second, StartupGrace: 125 * time.Second, SendPause: 60 * time.Second}
+	opts := Options{EditInterval: 10 * time.Second, StartupGrace: 125 * time.Second, SendPause: 60 * time.Second, GoneDeleteAfter: 5 * time.Minute}
 	if present != nil {
 		opts.Present = func(k string) bool { return present[k] }
 	}

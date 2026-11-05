@@ -53,12 +53,6 @@ func isMessageGone(err error) bool {
 	return descContains(err, "message to edit not found") || descContains(err, "MESSAGE_ID_INVALID")
 }
 
-// cannotDelete: Telegram refuses to delete the message (bots may delete their own messages only
-// within 48h of sending); the caller falls back to the GONE edit.
-func cannotDelete(err error) bool {
-	return descContains(err, "message can't be deleted")
-}
-
 // HTTPClient talks to api.telegram.org.
 type HTTPClient struct {
 	BaseURL string

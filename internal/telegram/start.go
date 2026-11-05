@@ -16,6 +16,7 @@ type Settings struct {
 	RatePerMin   int
 	TZ           string
 	StartupGrace time.Duration
+	GoneDelete   time.Duration // TELEGRAM_GONE_DELETE_AFTER_S; 0 = delete at once, no GONE edit
 	Present      func(key string) bool
 }
 
@@ -28,7 +29,7 @@ func Start(ctx context.Context, s Settings, rdb *redis.Client) (*Notifier, error
 	}
 	var n *Notifier
 	out := NewOutbox(NewHTTPClient(s.Token, s.ChatID), s.RatePerMin, func(r Result) { n.Deliver(r) })
-	n = NewNotifier(NewRedisStore(rdb), out, render, Options{EditInterval: s.EditInterval, StartupGrace: s.StartupGrace, Present: s.Present})
+	n = NewNotifier(NewRedisStore(rdb), out, render, Options{EditInterval: s.EditInterval, StartupGrace: s.StartupGrace, GoneDeleteAfter: s.GoneDelete, Present: s.Present})
 	if err := n.Load(ctx); err != nil {
 		log.Error().Err(err).Msg("telegram: loading state from Redis failed; the bot stays disabled until a config is saved")
 	}
