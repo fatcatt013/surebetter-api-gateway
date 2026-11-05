@@ -76,6 +76,13 @@ func (s *scriptedClient) Edit(_ context.Context, id int64, text string) error {
 	return s.pop()
 }
 
+func (s *scriptedClient) Delete(_ context.Context, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, "delete")
+	return s.pop()
+}
+
 type memStore struct {
 	cfg  BotConfig
 	msgs map[string]Tracked

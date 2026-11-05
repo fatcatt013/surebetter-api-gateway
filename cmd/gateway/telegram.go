@@ -49,7 +49,7 @@ func setupTelegram(ctx context.Context, cfg Config, hub *Hub, rdb *redis.Client)
 func toTelegramArb(o ArbOpportunity) telegram.Arb {
 	stakes := make([]telegram.Stake, len(o.Stakes))
 	for i, s := range o.Stakes {
-		stakes[i] = telegram.Stake{Bookmaker: s.Bookmaker, OutcomeID: s.OutcomeID, Label: s.Label, DecimalOdds: s.DecimalOdds, StakePct: s.StakePct, MatchURL: s.MatchURL}
+		stakes[i] = telegram.Stake{Bookmaker: s.Bookmaker, OutcomeID: s.OutcomeID, Label: s.Label, DecimalOdds: s.DecimalOdds, StakePct: s.StakePct, MatchURL: s.MatchURL, MarketName: s.MarketName}
 	}
 	return telegram.Arb{
 		EventID: o.EventID, Sport: o.Sport, MarketType: o.MarketType, Line: o.Line, ProfitPct: o.ProfitPct, Stakes: stakes,

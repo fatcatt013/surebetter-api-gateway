@@ -14,8 +14,8 @@ func SampleArb(now time.Time) Arb {
 		Line:       3.5,
 		ProfitPct:  2.96,
 		Stakes: []Stake{
-			{Bookmaker: "betano", OutcomeID: "cody benton:+3.5", Label: "Cody Benton +3.5", DecimalOdds: 2.10, StakePct: 49.03, MatchURL: "https://www.betano.cz/"},
-			{Bookmaker: "tipsport", OutcomeID: "cody benton:-3.5", Label: "Kai-Luca Ampaw -3.5", DecimalOdds: 2.02, StakePct: 50.97, MatchURL: "https://www.tipsport.cz/"},
+			{Bookmaker: "betano", OutcomeID: "cody benton:+3.5", Label: "Cody Benton +3.5", DecimalOdds: 2.10, StakePct: 49.03, MatchURL: "https://www.betano.cz/", MarketName: "Handicap (gamy) 3.5"},
+			{Bookmaker: "tipsport", OutcomeID: "cody benton:-3.5", Label: "Kai-Luca Ampaw -3.5", DecimalOdds: 2.02, StakePct: 50.97, MatchURL: "https://www.tipsport.cz/", MarketName: "Handicap na gamy"},
 		},
 		DetectedAt:      now.UnixMilli(),
 		FirstDetectedAt: first.UnixMilli(),

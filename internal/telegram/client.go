@@ -15,6 +15,7 @@ import (
 type Client interface {
 	Send(ctx context.Context, text string) (int64, error)
 	Edit(ctx context.Context, messageID int64, text string) error
+	Delete(ctx context.Context, messageID int64) error
 }
 
 // APIError is a Bot API "ok": false response.
@@ -50,6 +51,12 @@ func descContains(err error, sub string) bool {
 // isMessageGone: the message was deleted from the chat by hand; stop tracking it.
 func isMessageGone(err error) bool {
 	return descContains(err, "message to edit not found") || descContains(err, "MESSAGE_ID_INVALID")
+}
+
+// cannotDelete: Telegram refuses to delete the message (bots may delete their own messages only
+// within 48h of sending); the caller falls back to the GONE edit.
+func cannotDelete(err error) bool {
+	return descContains(err, "message can't be deleted")
 }
 
 // HTTPClient talks to api.telegram.org.
@@ -139,6 +146,15 @@ func (c *HTTPClient) Edit(ctx context.Context, messageID int64, text string) err
 	body["message_id"] = messageID
 	_, err := c.call(ctx, "editMessageText", body)
 	if descContains(err, "message is not modified") {
+		return nil
+	}
+	return err
+}
+
+// Delete removes a message; one already deleted by hand counts as done.
+func (c *HTTPClient) Delete(ctx context.Context, messageID int64) error {
+	_, err := c.call(ctx, "deleteMessage", map[string]any{"chat_id": c.ChatID, "message_id": messageID})
+	if descContains(err, "message to delete not found") {
 		return nil
 	}
 	return err

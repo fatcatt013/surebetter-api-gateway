@@ -137,3 +137,19 @@ func containsDuration(ds []time.Duration, want time.Duration) bool {
 	}
 	return false
 }
+
+func TestOutbox_GoneDeletesTheMessage(t *testing.T) {
+	c := &scriptedClient{}
+	r := newTestOutbox(c, newFakeClock()).do(context.Background(), Job{Kind: JobGone, MessageID: 5, Text: "gone"})
+	if r.Err != nil || !reflect.DeepEqual(c.calls, []string{"delete"}) {
+		t.Fatalf("result %+v calls %v, want a single delete", r, c.calls)
+	}
+}
+
+func TestOutbox_GoneFallsBackToEditWhenDeleteRefused(t *testing.T) {
+	c := &scriptedClient{errs: []error{&APIError{Code: 400, Description: "Bad Request: message can't be deleted"}}}
+	r := newTestOutbox(c, newFakeClock()).do(context.Background(), Job{Kind: JobGone, MessageID: 5, Text: "gone"})
+	if r.Err != nil || !reflect.DeepEqual(c.calls, []string{"delete", "edit:gone"}) {
+		t.Fatalf("result %+v calls %v, want delete then the GONE edit", r, c.calls)
+	}
+}

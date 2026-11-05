@@ -90,3 +90,19 @@ func TestErrorClassifiers(t *testing.T) {
 		t.Fatal("migration hint must name the new chat id")
 	}
 }
+
+func TestHTTPClient_DeleteAlreadyGoneIsSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/deleteMessage") {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"ok":false,"error_code":400,"description":"Bad Request: message to delete not found"}`)
+	}))
+	defer srv.Close()
+	c := NewHTTPClient("T", "1")
+	c.BaseURL = srv.URL
+	if err := c.Delete(context.Background(), 5); err != nil {
+		t.Fatalf("already deleted must be nil, got %v", err)
+	}
+}

@@ -50,7 +50,7 @@ type entryState int
 const (
 	stateSending entryState = iota // sendMessage in flight, no message id yet
 	stateLive
-	stateGone // GONE edit queued
+	stateGone // delete (or GONE-edit fallback) queued
 )
 
 type entry struct {

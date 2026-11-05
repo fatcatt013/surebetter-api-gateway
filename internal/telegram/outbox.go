@@ -12,7 +12,7 @@ import (
 type JobKind int
 
 const (
-	JobGone JobKind = iota // final edit of a vanished arb
+	JobGone JobKind = iota // delete the message of a vanished arb (Text = GONE fallback edit)
 	JobTest                // POST /api/telegram/test
 	JobSend                // first message for an arb
 	JobEdit                // live update (coalesced per key)
@@ -182,6 +182,12 @@ func (o *Outbox) call(ctx context.Context, j Job) (int64, error) {
 	switch j.Kind {
 	case JobSend, JobTest:
 		return o.client.Send(ctx, j.Text)
+	case JobGone:
+		err := o.client.Delete(ctx, j.MessageID)
+		if cannotDelete(err) {
+			return j.MessageID, o.client.Edit(ctx, j.MessageID, j.Text)
+		}
+		return j.MessageID, err
 	default:
 		return j.MessageID, o.client.Edit(ctx, j.MessageID, j.Text)
 	}

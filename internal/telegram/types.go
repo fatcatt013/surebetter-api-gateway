@@ -1,11 +1,11 @@
 // Package telegram posts arbitrage opportunities to a Telegram chat and keeps each message
-// in step with its arb (edit on change, GONE on removal). See
+// in step with its arb (edit on change, deleted on removal). See
 // surebetter-common/docs/superpowers/specs/2026-11-04-telegram-bot-design.md.
 package telegram
 
 // Arb is the gateway's ArbOpportunity (cmd/gateway/main.go) reduced to the fields the notifier
 // reads; cmd/gateway/telegram.go converts. The JSON tags are only used to persist the last-seen
-// arb in telegram:messages so a GONE edit can still be rendered after a restart.
+// arb in telegram:messages so the GONE fallback edit (when Telegram refuses the delete) can still be rendered after a restart.
 type Arb struct {
 	EventID         string  `json:"event_id"`
 	Sport           string  `json:"sport"`
@@ -31,6 +31,7 @@ type Stake struct {
 	DecimalOdds float64 `json:"decimal_odds"`
 	StakePct    float64 `json:"stake_pct"` // percent, e.g. 49.03
 	MatchURL    string  `json:"match_url"`
+	MarketName  string  `json:"market_name"` // the bookmaker's own market label for this leg
 }
 
 // firstSeen is the ms epoch the arb was first detected (first_detected_at, else detected_at, else 0).
