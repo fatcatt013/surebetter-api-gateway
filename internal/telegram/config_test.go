@@ -20,6 +20,7 @@ func TestValidate_RejectsBadFields(t *testing.T) {
 		"empty preset": func(c *BotConfig) { c.Preset = &PresetRef{} },
 		"live state":   func(c *BotConfig) { c.Filter.LiveState = "sometimes" },
 		"min age":      func(c *BotConfig) { c.Filter.MinAgeSec = -1 },
+		"three leg":    func(c *BotConfig) { c.Filter.ThreeLeg = "sometimes" },
 		"mode":         func(c *BotConfig) { c.Bankroll.Mode = "yolo" },
 		"split total":  func(c *BotConfig) { c.Bankroll.Total = 0 },
 		"maxleg max":   func(c *BotConfig) { c.Bankroll.Mode = "maxleg"; c.Bankroll.MaxLeg = 0 },
@@ -43,6 +44,9 @@ func TestNormalize_FillsBlockedMarkets(t *testing.T) {
 	_ = json.Unmarshal(raw, &back)
 	if _, ok := back["blocked_markets"].(map[string]any); !ok {
 		t.Fatalf("blocked_markets = %v, want {}", back["blocked_markets"])
+	}
+	if c.Filter.ThreeLeg != "include" {
+		t.Fatalf("three_leg = %q, want include (configs stored before it existed)", c.Filter.ThreeLeg)
 	}
 }
 

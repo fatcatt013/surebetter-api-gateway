@@ -21,6 +21,7 @@ type Filter struct {
 	ProfitMin      *float64            `json:"profit_min"`
 	ProfitMax      *float64            `json:"profit_max"`
 	MinAgeSec      int                 `json:"min_age_sec"`
+	ThreeLeg       string              `json:"three_leg"` // include | exclude: arbs with 3+ legs
 	BlockedMarkets map[string][]string `json:"blocked_markets"`
 }
 
@@ -52,9 +53,13 @@ type ValidationError struct{ Err error }
 func (e *ValidationError) Error() string { return e.Err.Error() }
 func (e *ValidationError) Unwrap() error { return e.Err }
 
-// Normalize fills the nil map so the stored JSON says {} like the frontend payload, which keeps
-// the frontend's "is the server copy up to date?" comparison exact.
+// Normalize fills the nil map so the stored JSON says {} like the frontend payload, and defaults a
+// missing three_leg (configs stored before it existed) to "include", which keeps the frontend's
+// "is the server copy up to date?" comparison exact.
 func (c *BotConfig) Normalize() {
+	if c.Filter.ThreeLeg == "" {
+		c.Filter.ThreeLeg = "include"
+	}
 	if c.Filter.BlockedMarkets == nil {
 		c.Filter.BlockedMarkets = map[string][]string{}
 	}
@@ -72,6 +77,9 @@ func (c BotConfig) Validate() error {
 	case "all", "live", "prematch":
 	default:
 		return fmt.Errorf("filter.live_state %q: want all, live or prematch", c.Filter.LiveState)
+	}
+	if c.Filter.ThreeLeg != "include" && c.Filter.ThreeLeg != "exclude" {
+		return fmt.Errorf("filter.three_leg %q: want include or exclude", c.Filter.ThreeLeg)
 	}
 	if c.Filter.MinAgeSec < 0 {
 		return errors.New("filter.min_age_sec must be >= 0")

@@ -9,7 +9,7 @@ import (
 
 // openFilter lets every arb through (the frontend's default FilterState).
 func openFilter() Filter {
-	return Filter{LiveState: "all", BlockedMarkets: map[string][]string{}}
+	return Filter{LiveState: "all", ThreeLeg: "include", BlockedMarkets: map[string][]string{}}
 }
 
 // validConfig is an enabled config that passes Validate.

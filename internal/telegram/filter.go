@@ -39,6 +39,9 @@ func Matches(a Arb, f Filter, b Bankroll, nowMs int64) bool {
 			}
 		}
 	}
+	if f.ThreeLeg == "exclude" && len(a.Stakes) >= 3 {
+		return false
+	}
 	live := IsLive(a.Sport)
 	if f.LiveState == "live" && !live {
 		return false
