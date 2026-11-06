@@ -15,8 +15,34 @@ const liveSuffix = "-live"
 // IsLive reports whether the sport carries the pipeline's "-live" suffix.
 func IsLive(sport string) bool { return strings.HasSuffix(sport, liveSuffix) }
 
-// BaseSport strips the "-live" suffix.
-func BaseSport(sport string) string { return strings.TrimSuffix(sport, liveSuffix) }
+// Esports carries the game in the sport slug, one per game ("esports-cs2",
+// "esports-dota2-live"); the app shows them as one sport, "esports".
+const (
+	esportsSport  = "esports"
+	esportsPrefix = esportsSport + "-"
+)
+
+// BaseSport strips the "-live" suffix and collapses every per-game esports slug to
+// "esports" — the frontend's baseSport, which keys Filter.Sports and
+// Filter.BlockedMarkets. Without the collapse a preset with the Esports tile on
+// would match no esports arb at all.
+func BaseSport(sport string) string {
+	bare := strings.TrimSuffix(sport, liveSuffix)
+	if strings.HasPrefix(bare, esportsPrefix) {
+		return esportsSport
+	}
+	return bare
+}
+
+// esportsGameSlug returns the game part of an esports sport ("esports-cs2-live" →
+// "cs2"), or "" for any other sport.
+func esportsGameSlug(sport string) string {
+	bare := strings.TrimSuffix(sport, liveSuffix)
+	if !strings.HasPrefix(bare, esportsPrefix) {
+		return ""
+	}
+	return bare[len(esportsPrefix):]
+}
 
 func ageSec(a Arb, nowMs int64) float64 {
 	t := a.firstSeen()

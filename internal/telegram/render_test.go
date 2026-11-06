@@ -146,3 +146,33 @@ func TestFormatHelpers(t *testing.T) {
 		t.Fatal("sportMeta fallback")
 	}
 }
+
+func TestSportMeta_EsportsShowsTheGame(t *testing.T) {
+	for sport, want := range map[string]string{
+		"esports-cs2":           "Esports · CS2",
+		"esports-cs2-live":      "Esports · CS2",
+		"esports-dota2":         "Esports · Dota 2",
+		"esports-lol-live":      "Esports · LoL",
+		"esports-efootball":     "Esports · eFootball",
+		"esports-rocket-league": "Esports · Rocket League",
+		"esports":               "Esports",
+	} {
+		if e, l := sportMeta(sport); e != "🎮" || l != want {
+			t.Errorf("sportMeta(%q) = (%q, %q), want (🎮, %q)", sport, e, l, want)
+		}
+	}
+	if g := esportsGame("football"); g != "" {
+		t.Errorf("esportsGame(football) = %q, want empty", g)
+	}
+}
+
+func TestRender_EsportsHeadCarriesGameTag(t *testing.T) {
+	now := sampleNow(t)
+	a := SampleArb(now)
+	a.Sport, a.EventID = "esports-cs2-live", "esports-cs2-live:sample"
+	got := newTestRenderer(t).Render(View{Arb: a, Bankroll: DefaultBankroll, PresetName: "x", Now: now})
+	head := strings.SplitN(got, "\n", 2)[0]
+	if want := "🟢 <b>+296 CZK</b> · <i>+2.96%</i> · 🎮 Esports · CS2 · 🔴 LIVE"; head != want {
+		t.Fatalf("head = %q, want %q", head, want)
+	}
+}

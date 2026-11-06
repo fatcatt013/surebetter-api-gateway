@@ -70,3 +70,36 @@ func TestBaseSportAndIsLive(t *testing.T) {
 		t.Fatal("suffix helpers are wrong")
 	}
 }
+
+func TestBaseSport_CollapsesEsportsGames(t *testing.T) {
+	for in, want := range map[string]string{
+		"esports-cs2": "esports", "esports-cs2-live": "esports", "esports-dota2": "esports",
+		"esports": "esports", "tennis-doubles-live": "tennis-doubles", "football": "football",
+	} {
+		if got := BaseSport(in); got != want {
+			t.Errorf("BaseSport(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if !IsLive("esports-cs2-live") || IsLive("esports-cs2") {
+		t.Fatal("IsLive must read the -live suffix of an esports slug")
+	}
+}
+
+// The app's sport filter and market prefs are keyed "esports" for every game.
+func TestMatches_EsportsFilteredAsOneSport(t *testing.T) {
+	a := fArb("esports-dota2-live", "MATCH_WINNER", 2.5, "betano", "tipsport")
+	f := openFilter()
+	f.Sports = []string{"esports"}
+	if !Matches(a, f, DefaultBankroll, nowMs) {
+		t.Fatal("an esports-dota2-live arb must pass an Esports sport filter")
+	}
+	f.Sports = []string{"football"}
+	if Matches(a, f, DefaultBankroll, nowMs) {
+		t.Fatal("an esports arb must not pass a football-only filter")
+	}
+	f = openFilter()
+	f.BlockedMarkets = map[string][]string{"esports": {"MATCH_WINNER"}}
+	if Matches(a, f, DefaultBankroll, nowMs) {
+		t.Fatal("markets blocked under esports must block every game")
+	}
+}

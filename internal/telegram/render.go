@@ -282,14 +282,46 @@ func bookmakerName(id string) string {
 var sports = map[string][2]string{
 	"football": {"⚽", "Football"}, "ice-hockey": {"🏒", "Hockey"}, "tennis": {"🎾", "Tennis"},
 	"volleyball": {"🏐", "Volleyball"}, "basketball": {"🏀", "Basketball"}, "table-tennis": {"🏓", "Table tennis"},
+	"esports": {"🎮", "Esports"},
+}
+
+// Mirrors ESPORTS_GAMES in surebetter-frontend/src/app/config/sport-meta.ts: the game
+// tag per esports game slug (the part after "esports-").
+var esportsGames = map[string]string{
+	"cs2": "CS2", "dota2": "Dota 2", "lol": "LoL", "valorant": "Valorant", "cod": "CoD", "r6": "R6",
+	"overwatch": "Overwatch", "aov": "AoV", "kog": "KoG", "wc3": "WC3", "aoe": "AoE",
+	"efootball": "eFootball", "ebasketball": "eBasketball", "etennis": "eTennis", "ehockey": "eHockey",
+}
+
+// esportsGame is the display tag of an esports sport ("esports-cs2-live" → "CS2"); an
+// unlisted game is its slug title-cased per word ("rocket-league" → "Rocket League").
+// "" for any other sport.
+func esportsGame(sport string) string {
+	slug := esportsGameSlug(sport)
+	if slug == "" {
+		return ""
+	}
+	if g, ok := esportsGames[slug]; ok {
+		return g
+	}
+	words := strings.Split(slug, "-")
+	for i, w := range words {
+		words[i] = titleCase(w)
+	}
+	return strings.Join(words, " ")
 }
 
 func sportMeta(sport string) (emoji, label string) {
 	base := BaseSport(sport)
 	if m, ok := sports[base]; ok {
-		return m[0], m[1]
+		emoji, label = m[0], m[1]
+	} else {
+		emoji, label = "🏅", titleCase(strings.NewReplacer("-", " ", "_", " ").Replace(base))
 	}
-	return "🏅", titleCase(strings.NewReplacer("-", " ", "_", " ").Replace(base))
+	if g := esportsGame(sport); g != "" {
+		label += " · " + g
+	}
+	return emoji, label
 }
 
 func titleCase(s string) string {
