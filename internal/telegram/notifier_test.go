@@ -295,3 +295,88 @@ func TestNotifier_SendTestUsesSampleAndPrefix(t *testing.T) {
 		t.Fatalf("SendTest = %d, %v", id, err)
 	}
 }
+
+// An ambiguous send (timeout) may have posted a message whose id we never got. The next
+// successful send bounds the gap; every id in it is probed with a GONE edit.
+func TestNotifier_AmbiguousSendProbesGapAndFadesAcceptedOrphans(t *testing.T) {
+	st := newMemStore()
+	n, out := newTestNotifier(t, st, nil)
+	now := t0()
+	sendLive(t, n, out, "a", SampleArb(now), now, 10)
+
+	n.handle(bg, upsert("b", SampleArb(now)), now)
+	send := onlyJob(t, out, JobSend)
+	n.onResult(bg, Result{Job: send, Err: errors.New("context deadline exceeded")}, now)
+	noJobs(t, out)
+
+	// After the pause "b" is sent again and lands at 13: ids 11 and 12 may be orphans.
+	n.tick(now.Add(61 * time.Second))
+	resend := onlyJob(t, out, JobSend)
+	n.onResult(bg, Result{Job: resend, MessageID: 13}, now.Add(61*time.Second))
+	jobs := out.take()
+	if len(jobs) != 2 || jobs[0].Kind != JobOrphan || jobs[0].MessageID != 11 || jobs[1].MessageID != 12 {
+		t.Fatalf("probe jobs %+v, want orphan probes for 11 and 12", jobs)
+	}
+	if !strings.Contains(jobs[0].Text, "GONE") {
+		t.Fatalf("probe text %q, want a GONE render", jobs[0].Text)
+	}
+
+	// 11 was ours (edit accepted), 12 someone else's (rejected).
+	n.onResult(bg, Result{Job: jobs[0], MessageID: 11}, now.Add(62*time.Second))
+	n.onResult(bg, Result{Job: jobs[1], Err: &APIError{Code: 400, Description: "Bad Request: message can't be edited"}}, now.Add(62*time.Second))
+	if _, ok := st.msgs["gone:11"]; !ok {
+		t.Fatalf("accepted orphan must fade like a GONE message, store %+v", st.msgs)
+	}
+	if _, ok := st.msgs["gone:12"]; ok {
+		t.Fatal("a rejected probe must leave the message alone")
+	}
+	if n.Status().LastError != "context deadline exceeded" {
+		t.Fatalf("a rejected probe is not an error: %q", n.Status().LastError)
+	}
+	n.tick(now.Add(62*time.Second + 5*time.Minute))
+	if d := onlyJob(t, out, JobDelete); d.MessageID != 11 {
+		t.Fatalf("delete %+v, want the orphan 11", d)
+	}
+
+	// The gap is closed: the next send probes nothing.
+	n.handle(bg, upsert("c", SampleArb(now)), now.Add(7*time.Minute))
+	n.onResult(bg, Result{Job: onlyJob(t, out, JobSend), MessageID: 14}, now.Add(7*time.Minute))
+	noJobs(t, out)
+}
+
+func TestNotifier_PermanentSendFailureProbesNothing(t *testing.T) {
+	n, out := newTestNotifier(t, newMemStore(), nil)
+	now := t0()
+	sendLive(t, n, out, "a", SampleArb(now), now, 10)
+	n.handle(bg, upsert("b", SampleArb(now)), now)
+	n.onResult(bg, Result{Job: onlyJob(t, out, JobSend), Err: &APIError{Code: 400, Description: "Bad Request: can't parse entities"}}, now)
+	n.tick(now.Add(61 * time.Second))
+	n.onResult(bg, Result{Job: onlyJob(t, out, JobSend), MessageID: 12}, now.Add(61*time.Second))
+	noJobs(t, out)
+}
+
+func TestNotifier_OrphanProbeIsCapped(t *testing.T) {
+	n, out := newTestNotifier(t, newMemStore(), nil)
+	now := t0()
+	sendLive(t, n, out, "a", SampleArb(now), now, 10)
+	n.handle(bg, upsert("b", SampleArb(now)), now)
+	n.onResult(bg, Result{Job: onlyJob(t, out, JobSend), Err: &APIError{Code: 502}}, now)
+	n.tick(now.Add(61 * time.Second))
+	n.onResult(bg, Result{Job: onlyJob(t, out, JobSend), MessageID: 500}, now.Add(61*time.Second))
+	jobs := out.take()
+	if len(jobs) != orphanProbeMax || jobs[0].MessageID != 11 || jobs[len(jobs)-1].MessageID != 10+orphanProbeMax {
+		t.Fatalf("got %d probes (%+v), want ids 11..%d", len(jobs), jobs, 10+orphanProbeMax)
+	}
+}
+
+// After a restart the highest stored id bounds the gap.
+func TestNotifier_MaxMessageIDLoadedFromStore(t *testing.T) {
+	now := t0()
+	st := newMemStore()
+	st.cfg = validConfig()
+	st.msgs["gone:40"] = Tracked{MessageID: 40, SentAt: now.UnixMilli(), GoneAt: now.UnixMilli()}
+	n, _ := newTestNotifier(t, st, nil)
+	if n.maxMsgID != 40 {
+		t.Fatalf("maxMsgID = %d, want 40", n.maxMsgID)
+	}
+}

@@ -74,6 +74,12 @@ type fade struct {
 
 const fadePrefix = "gone:"
 
+// orphanProbeMax bounds how many message ids after an ambiguous send are probed. One ambiguous
+// send posts at most one orphan (sends are not retried); the slack covers a few in a row.
+const orphanProbeMax = 10
+
+const orphanPrefix = "orphan:"
+
 // Notifier owns the per-arb lifecycle. handle/onResult/tick/reconcile run only on the Run goroutine.
 type Notifier struct {
 	store  Store
@@ -92,6 +98,13 @@ type Notifier struct {
 	fading     map[string]*fade // "gone:<message_id>" → a GONE message waiting for its delete
 	startedAt  time.Time
 	pauseUntil time.Time
+
+	// Orphan recovery. A send that timed out may have been posted without us learning its id.
+	// Channel message ids are sequential, so it lies between the last id we know (maxMsgID at the
+	// failure) and the id of the next successful send; probeOrphans closes whatever is ours there.
+	maxMsgID     int64  // highest message id this bot is known to have posted
+	suspectAfter int64  // >0: an ambiguous send may have posted an id above this
+	suspect      *entry // the arb of that send, for the orphan's GONE text
 
 	trackedN, sentN, editsN, errorsN, droppedN atomic.Int64
 
@@ -155,6 +168,7 @@ func (n *Notifier) Load(ctx context.Context) error {
 	}
 	now := n.opts.Now()
 	for key, t := range msgs {
+		n.maxMsgID = max(n.maxMsgID, t.MessageID)
 		if now.Sub(time.UnixMilli(t.SentAt)) > 48*time.Hour {
 			_ = n.store.DeleteMessage(ctx, key)
 			continue
@@ -278,6 +292,10 @@ func (n *Notifier) goGone(key string, e *entry, now time.Time) {
 
 func (n *Notifier) onResult(ctx context.Context, r Result, now time.Time) {
 	key := r.Job.Key
+	if r.Job.Kind == JobOrphan {
+		n.onOrphanProbe(ctx, r, now)
+		return
+	}
 	if r.Job.Kind == JobDelete {
 		// "not found" = deleted by hand; anything else (e.g. >48h, can't be deleted) leaves it as is.
 		if r.Err != nil && !descContains(r.Err, "message to delete not found") {
@@ -299,10 +317,15 @@ func (n *Notifier) onResult(ctx context.Context, r Result, now time.Time) {
 	case JobSend:
 		if r.Err != nil {
 			n.recordErr(r.Err, now)
+			if retryable(r.Err) { // a timeout or 5xx: the message may have been posted anyway
+				n.noteSuspect(e)
+			}
 			n.pauseUntil = now.Add(n.opts.SendPause)
 			n.untrack(ctx, key, false)
 			return
 		}
+		n.probeOrphans(r.MessageID, now)
+		n.maxMsgID = max(n.maxMsgID, r.MessageID)
 		e.MessageID, e.SentAt = r.MessageID, now.UnixMilli()
 		e.LastEditAt, e.LastTextSHA, e.text = e.SentAt, digest(e.text), ""
 		e.state = stateLive
@@ -344,6 +367,50 @@ func (n *Notifier) onResult(ctx context.Context, r Result, now time.Time) {
 		n.fading[fk] = f
 		n.persist(ctx, fk, &entry{Tracked: f.Tracked})
 	}
+}
+
+// noteSuspect records an ambiguous send. Without a known id to start from the gap cannot be
+// bounded, so nothing is probed.
+func (n *Notifier) noteSuspect(e *entry) {
+	if n.maxMsgID == 0 {
+		log.Warn().Msg("telegram: a send may have posted a message, but no earlier message id is known to bound it")
+		return
+	}
+	if n.suspectAfter == 0 {
+		n.suspectAfter = n.maxMsgID
+	}
+	n.suspect = &entry{Tracked: e.Tracked}
+}
+
+// probeOrphans runs on the first successful send (id next) after an ambiguous one: every id in
+// the gap is edited to GONE. Only the bot's own messages accept the edit; anyone else's post
+// rejects it and is left alone.
+func (n *Notifier) probeOrphans(next int64, now time.Time) {
+	if n.suspectAfter == 0 {
+		return
+	}
+	from, to := n.suspectAfter+1, min(next-1, n.suspectAfter+orphanProbeMax)
+	text := n.render.Render(n.view(n.suspect, now, true))
+	n.suspectAfter, n.suspect = 0, nil
+	for id := from; id <= to; id++ {
+		n.out.Enqueue(Job{Kind: JobOrphan, Key: orphanPrefix + strconv.FormatInt(id, 10), MessageID: id, Text: text})
+	}
+}
+
+// onOrphanProbe: an accepted edit means the id was our orphan; it then fades like any GONE
+// message. A rejected edit is expected (someone else's post, or no orphan there) and not an error.
+func (n *Notifier) onOrphanProbe(ctx context.Context, r Result, now time.Time) {
+	id := r.Job.MessageID
+	if r.Err != nil {
+		log.Debug().Err(r.Err).Int64("message_id", id).Msg("telegram: orphan probe rejected")
+		return
+	}
+	n.editsN.Add(1)
+	log.Info().Int64("message_id", id).Msg("telegram: closed a message posted by an ambiguous send")
+	fk := fadePrefix + strconv.FormatInt(id, 10)
+	f := &fade{Tracked: Tracked{MessageID: id, SentAt: now.UnixMilli(), GoneAt: now.UnixMilli()}}
+	n.fading[fk] = f
+	n.persist(ctx, fk, &entry{Tracked: f.Tracked})
 }
 
 // tick sends throttled edits whose interval has passed, and posts untracked arbs that now match

@@ -17,6 +17,9 @@ const (
 	JobTest                  // POST /api/telegram/test
 	JobSend                  // first message for an arb
 	JobEdit                  // live update (coalesced per key)
+	// JobOrphan edits a message id that an ambiguous send may have posted to GONE. Telegram lets a
+	// bot edit only its own messages, so the edit doubles as an ownership probe. Runs in the gone queue.
+	JobOrphan
 )
 
 // Job is one Bot API call. Reply, when set, receives the Result instead of the outbox callback.
@@ -68,7 +71,7 @@ func NewOutbox(c Client, ratePerMin int, deliver func(Result)) *Outbox {
 func (o *Outbox) Enqueue(j Job) {
 	o.mu.Lock()
 	switch j.Kind {
-	case JobGone, JobDelete:
+	case JobGone, JobDelete, JobOrphan:
 		o.dropEdit(j.Key)
 		o.gone = append(o.gone, j)
 	case JobTest:
@@ -168,7 +171,10 @@ func (o *Outbox) do(ctx context.Context, j Job) Result {
 			}
 			continue
 		}
-		if retryable(err) && retries < maxRetries {
+		// A send that timed out or got a 5xx may still have been posted; retrying it posts a
+		// duplicate whose id we never learn. Sends retry only on 429 (not processed); the notifier
+		// re-sends on the next tick and probes for the orphan (see Notifier.probeOrphans).
+		if retryable(err) && retries < maxRetries && !isSend(j.Kind) {
 			if o.sleep(ctx, time.Duration(1<<retries)*time.Second) != nil {
 				return Result{Job: j, Err: err}
 			}
@@ -178,6 +184,8 @@ func (o *Outbox) do(ctx context.Context, j Job) Result {
 		return Result{Job: j, Err: err}
 	}
 }
+
+func isSend(k JobKind) bool { return k == JobSend || k == JobTest }
 
 func (o *Outbox) call(ctx context.Context, j Job) (int64, error) {
 	switch j.Kind {

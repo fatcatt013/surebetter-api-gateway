@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -70,7 +71,7 @@ func TestOutbox_RetriesServerErrorsThreeTimes(t *testing.T) {
 	e := &APIError{Code: 502}
 	c := &scriptedClient{errs: []error{e, e, e, e}}
 	o := newTestOutbox(c, clk)
-	r := o.do(context.Background(), Job{Kind: JobSend, Text: "x"})
+	r := o.do(context.Background(), Job{Kind: JobEdit, MessageID: 1, Text: "x"})
 	if r.Err == nil || len(c.calls) != 4 {
 		t.Fatalf("want 1 try + 3 retries then failure; calls=%d err=%v", len(c.calls), r.Err)
 	}
@@ -145,5 +146,31 @@ func TestOutbox_GoneEditsAndDeleteDeletes(t *testing.T) {
 	o.do(context.Background(), Job{Kind: JobDelete, MessageID: 5})
 	if !reflect.DeepEqual(c.calls, []string{"edit:gone", "delete"}) {
 		t.Fatalf("calls %v, want the GONE edit then a delete", c.calls)
+	}
+}
+
+// A send that timed out may have been posted; a retry would post a duplicate nobody tracks.
+func TestOutbox_SendIsNotRetriedOnTimeoutOr5xx(t *testing.T) {
+	for _, e := range []error{errors.New("context deadline exceeded"), &APIError{Code: 502}} {
+		c := &scriptedClient{errs: []error{e}}
+		r := newTestOutbox(c, newFakeClock()).do(context.Background(), Job{Kind: JobSend, Text: "x"})
+		if r.Err == nil || len(c.calls) != 1 {
+			t.Fatalf("%v: calls=%d err=%v, want one attempt", e, len(c.calls), r.Err)
+		}
+	}
+}
+
+func TestOutbox_OrphanProbeEditsInGoneQueue(t *testing.T) {
+	c := &scriptedClient{}
+	o := newTestOutbox(c, newFakeClock())
+	o.Enqueue(Job{Kind: JobSend, Key: "s", Text: "s"})
+	o.Enqueue(Job{Kind: JobOrphan, Key: "orphan:7", MessageID: 7, Text: "gone"})
+	j, _ := o.next()
+	if j.Kind != JobOrphan {
+		t.Fatalf("first job %+v, want the orphan probe ahead of sends", j)
+	}
+	o.do(context.Background(), j)
+	if !reflect.DeepEqual(c.calls, []string{"edit:gone"}) {
+		t.Fatalf("calls %v, want an edit", c.calls)
 	}
 }
