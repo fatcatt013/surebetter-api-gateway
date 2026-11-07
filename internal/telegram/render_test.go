@@ -154,6 +154,9 @@ func TestSportMeta_EsportsShowsTheGame(t *testing.T) {
 		"esports-dota2":         "Esports · Dota 2",
 		"esports-lol-live":      "Esports · LoL",
 		"esports-efootball":     "Esports · eFootball",
+		"esports-mlbb":          "Esports · MLBB",
+		"esports-mlbb-live":     "Esports · MLBB",
+		"esports-crossfire":     "Esports · CrossFire",
 		"esports-rocket-league": "Esports · Rocket League",
 		"esports":               "Esports",
 	} {
@@ -163,6 +166,28 @@ func TestSportMeta_EsportsShowsTheGame(t *testing.T) {
 	}
 	if g := esportsGame("football"); g != "" {
 		t.Errorf("esportsGame(football) = %q, want empty", g)
+	}
+}
+
+// The esports handicaps and totals reach the generic HANDICAP / TOTAL_ rules, so they show their line.
+func TestMarketLabel_EsportsTypes(t *testing.T) {
+	for _, c := range []struct {
+		typ  string
+		line float64
+		want string
+	}{
+		{"MAP_HANDICAP", -1.5, "X ±1.5"},
+		{"ROUND_HANDICAP_MAP_1", 4.5, "X ±4.5"},
+		{"KILL_HANDICAP_MAP_5", -7.5, "X ±7.5"},
+		{"TOTAL_MAPS", 2.5, "X 2.5"},
+		{"TOTAL_ROUNDS_MAP_2", 26.5, "X 26.5"},
+		{"TOTAL_KILLS_MAP_3", 28.5, "X 28.5"},
+		{"MAP_1_WINNER", 0, "X"},
+		{"MAP_2_WINNER_3WAY", 0, "X"},
+	} {
+		if got := marketLabel(Arb{MarketName: "X", MarketType: c.typ, Line: c.line}); got != c.want {
+			t.Errorf("marketLabel(%s, %v) = %q, want %q", c.typ, c.line, got, c.want)
+		}
 	}
 }
 

@@ -289,7 +289,7 @@ var sports = map[string][2]string{
 // tag per esports game slug (the part after "esports-").
 var esportsGames = map[string]string{
 	"cs2": "CS2", "dota2": "Dota 2", "lol": "LoL", "valorant": "Valorant", "cod": "CoD", "r6": "R6",
-	"overwatch": "Overwatch", "aov": "AoV", "kog": "KoG", "wc3": "WC3", "aoe": "AoE",
+	"overwatch": "Overwatch", "aov": "AoV", "kog": "KoG", "wc3": "WC3", "aoe": "AoE", "mlbb": "MLBB", "crossfire": "CrossFire",
 	"efootball": "eFootball", "ebasketball": "eBasketball", "etennis": "eTennis", "ehockey": "eHockey",
 }
 
