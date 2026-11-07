@@ -282,7 +282,7 @@ func bookmakerName(id string) string {
 var sports = map[string][2]string{
 	"football": {"⚽", "Football"}, "ice-hockey": {"🏒", "Hockey"}, "tennis": {"🎾", "Tennis"},
 	"volleyball": {"🏐", "Volleyball"}, "basketball": {"🏀", "Basketball"}, "table-tennis": {"🏓", "Table tennis"},
-	"esports": {"🎮", "Esports"},
+	"esports": {"🎮", "Esports"}, "american-football": {"🏈", "American football"},
 }
 
 // Mirrors ESPORTS_GAMES in surebetter-frontend/src/app/config/sport-meta.ts: the game

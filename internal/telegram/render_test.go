@@ -147,6 +147,45 @@ func TestFormatHelpers(t *testing.T) {
 	}
 }
 
+func TestSportMeta_AmericanFootballIsNotFootball(t *testing.T) {
+	for _, s := range []string{"american-football", "american-football-live"} {
+		if e, l := sportMeta(s); e != "🏈" || l != "American football" {
+			t.Errorf("sportMeta(%q) = (%q, %q), want (🏈, American football)", s, e, l)
+		}
+	}
+	if e, l := sportMeta("football-live"); e != "⚽" || l != "Football" {
+		t.Errorf("sportMeta(football-live) = (%q, %q)", e, l)
+	}
+	if b := BaseSport("american-football-live"); b != "american-football" {
+		t.Errorf("BaseSport(american-football-live) = %q", b)
+	}
+}
+
+// The american-football handicaps and totals reach the generic HANDICAP / TOTAL_ rules; the
+// draw-no-bet period results carry no line.
+func TestMarketLabel_AmericanFootballTypes(t *testing.T) {
+	for _, c := range []struct {
+		typ  string
+		line float64
+		want string
+	}{
+		{"ASIAN_HANDICAP", -3.5, "X ±3.5"},
+		{"HALF_1_HANDICAP", 2.5, "X ±2.5"},
+		{"QUARTER_3_HANDICAP", -0.5, "X ±0.5"},
+		{"TOTAL_POINTS", 47.5, "X 47.5"},
+		{"TOTAL_POINTS_QUARTER_2", 10.5, "X 10.5"},
+		{"TEAM_TOTAL_POINTS_HALF_1", 13.5, "X 13.5"},
+		{"HALF_1_DNB", 0, "X"},
+		{"QUARTER_1_DNB", 0, "X"},
+		{"QUARTER_2_WINNER", 0, "X"},
+		{"MATCH_WINNER_REG", 0, "X"},
+	} {
+		if got := marketLabel(Arb{MarketName: "X", MarketType: c.typ, Line: c.line}); got != c.want {
+			t.Errorf("marketLabel(%s, %v) = %q, want %q", c.typ, c.line, got, c.want)
+		}
+	}
+}
+
 func TestSportMeta_EsportsShowsTheGame(t *testing.T) {
 	for sport, want := range map[string]string{
 		"esports-cs2":           "Esports · CS2",
