@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -78,6 +77,3 @@ func dummyHash() string {
 	dummyOnce.Do(func() { dummy, _ = hashPassword("timing equaliser, never a real password") })
 	return dummy
 }
-
-// ErrWeakPassword is temporary here; Task 4 moves it to service.go.
-var ErrWeakPassword = errors.New("weak_password")
