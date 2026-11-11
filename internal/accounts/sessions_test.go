@@ -88,3 +88,23 @@ func TestLogin_LocksPerIP(t *testing.T) {
 		t.Fatalf("IP must be locked, got %v", err)
 	}
 }
+
+func TestPurgeExpiredSessions(t *testing.T) {
+	s, clk, _ := newTestService(t)
+	mustUser(t, s, "a@example.com", RoleUser) // register creates a session
+	if n, err := s.PurgeExpiredSessions(); err != nil || n != 0 {
+		t.Fatalf("fresh purge: %d %v", n, err)
+	}
+	clk.advance(31 * 24 * time.Hour)
+	_, tok, err := s.Login("1.1.1.1", "a@example.com", testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.PurgeExpiredSessions()
+	if err != nil || n != 1 {
+		t.Fatalf("purge: %d %v, want 1", n, err)
+	}
+	if _, ok, _ := s.AuthenticateSession(tok); !ok {
+		t.Fatal("live session must survive the purge")
+	}
+}

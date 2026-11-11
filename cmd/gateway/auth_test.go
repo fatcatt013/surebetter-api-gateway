@@ -300,3 +300,15 @@ func TestAuthRequired_FailsClosed(t *testing.T) {
 		}
 	}
 }
+
+func TestAuth_AnonymousFeedOffRejectedEvenWhenNotRequired(t *testing.T) {
+	srv, _ := newAuthServer(t, false)
+	if _, status, _ := dial(t, srv, "/ws?feed=0", nil); status != 401 {
+		t.Fatalf("anonymous /ws?feed=0: status %d, want 401", status)
+	}
+	conn, _, err := dial(t, srv, "/ws", nil)
+	if err != nil {
+		t.Fatalf("anonymous /ws must still work: %v", err)
+	}
+	conn.CloseNow()
+}

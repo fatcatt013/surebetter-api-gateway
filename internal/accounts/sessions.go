@@ -115,3 +115,12 @@ func (s *Service) AuthenticateSession(token string) (Principal, bool, error) {
 	p.Onboarded = onboarded.Valid
 	return p, true, nil
 }
+
+// PurgeExpiredSessions deletes sessions past their expiry and returns how many were removed.
+func (s *Service) PurgeExpiredSessions() (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE expires_at <= ?`, s.nowMs())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}

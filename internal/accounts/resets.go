@@ -27,8 +27,20 @@ func (s *Service) CreateReset(adminID, userID int64) (NewReset, error) {
 	code := newShortCode()
 	now := s.nowMs()
 	exp := now + ResetTTL.Milliseconds()
-	if _, err := s.db.Exec(`INSERT INTO reset_codes (user_id, code_hash, hint, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`,
+	tx, err := s.db.Begin()
+	if err != nil {
+		return NewReset{}, err
+	}
+	defer tx.Rollback()
+	// A new code supersedes the user's earlier unused ones.
+	if _, err := tx.Exec(`UPDATE reset_codes SET used_at = ? WHERE user_id = ? AND used_at IS NULL`, now, userID); err != nil {
+		return NewReset{}, err
+	}
+	if _, err := tx.Exec(`INSERT INTO reset_codes (user_id, code_hash, hint, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		userID, hashSecret(code), hint(code), adminID, now, exp); err != nil {
+		return NewReset{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return NewReset{}, err
 	}
 	return NewReset{Code: code, Path: "/app/reset?code=" + code, ExpiresAt: exp}, nil

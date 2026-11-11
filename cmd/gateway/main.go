@@ -88,7 +88,7 @@ func configFromEnv() Config {
 
 // ── Message types sent to Angular clients ────────────────────────────────────
 type WSMessage struct {
-	Type string          `json:"type"` // "snapshot" | "patch" | "ping"
+	Type string          `json:"type"` // "snapshot" | "patch" | "ping" | "state"
 	Data json.RawMessage `json:"data,omitempty"`
 	Ops  []PatchOp       `json:"ops,omitempty"` // RFC 6902 JSON Patch
 	Key  string          `json:"key,omitempty"` // "state" messages: the per-user state key that changed
@@ -597,6 +597,12 @@ func wsHandler[T any](hub *StateHub[T], gate *wsGate, notify bool) http.HandlerF
 			return
 		}
 
+		if notify && r.URL.Query().Get("feed") == "0" && principal.UserID == 0 {
+			// Feed-off sockets only carry per-user state messages; an anonymous one can never receive anything.
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			// Origin is checked by gate.admit for cookie sessions; tickets come from the
 			// extension's own origin.
@@ -725,6 +731,11 @@ func main() {
 	} else if created {
 		log.Warn().Str("invite_path", inv.Path).
 			Msg("No accounts yet: open <your server>" + inv.Path + " to create the admin account (a new link is made on every start until then)")
+	}
+	if n, err := acc.PurgeExpiredSessions(); err != nil {
+		log.Error().Err(err).Msg("Failed to purge expired sessions")
+	} else if n > 0 {
+		log.Info().Int64("purged", n).Msg("Expired sessions purged")
 	}
 	if !cfg.AuthRequired {
 		log.Warn().Msg("AUTH_REQUIRED=false: the feed, the snapshots and the Telegram settings are open to anyone")

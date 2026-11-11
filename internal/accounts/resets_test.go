@@ -56,3 +56,25 @@ func TestReset_SetsPasswordAndEndsSessions(t *testing.T) {
 		t.Fatalf("unknown user: %v", err)
 	}
 }
+
+func TestReset_NewCodeSupersedesOlder(t *testing.T) {
+	s, _, _ := newTestService(t)
+	admin, _ := mustUser(t, s, "admin@example.com", RoleAdmin)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	other, _ := mustUser(t, s, "other@example.com", RoleUser)
+	ro, _ := s.CreateReset(admin.UserID, other.UserID)
+	r1, _ := s.CreateReset(admin.UserID, user.UserID)
+	r2, err := s.CreateReset(admin.UserID, user.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.CheckReset("1.1.1.1", r1.Code); ok {
+		t.Fatal("older code must be unusable")
+	}
+	if _, ok, _ := s.CheckReset("1.1.1.1", r2.Code); !ok {
+		t.Fatal("newest code must be usable")
+	}
+	if _, ok, _ := s.CheckReset("1.1.1.1", ro.Code); !ok {
+		t.Fatal("another user's code must be unaffected")
+	}
+}
