@@ -21,6 +21,7 @@ import (
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 
+	"github.com/surebetter/api-gateway/internal/accounts"
 	"github.com/surebetter/api-gateway/internal/telegram"
 )
 
@@ -35,10 +36,12 @@ type Config struct {
 	SnapshotCacheMs   int64
 	BroadcastBatchMs  int64
 	JWTSecret         string
-	EvictionTTLS      int // EVICTION_TTL_S: seconds until an unseen PREMATCH entry is evicted
-	EvictionLiveTTLS  int // EVICTION_LIVE_TTL_S: shorter TTL for "-live" arbs (fast removal)
-	EvictionIntervalS int // EVICTION_INTERVAL_S: sweep cadence in seconds
-	ValueEvictionTTLS int // VALUE_EVICTION_TTL_S: seconds until an unseen PREMATCH value bet is evicted
+	AccountsDB        string // ACCOUNTS_DB: SQLite file for users, sessions, codes and per-user state
+	AuthRequired      bool   // AUTH_REQUIRED: feed, snapshots and Telegram need a login (default true)
+	EvictionTTLS      int    // EVICTION_TTL_S: seconds until an unseen PREMATCH entry is evicted
+	EvictionLiveTTLS  int    // EVICTION_LIVE_TTL_S: shorter TTL for "-live" arbs (fast removal)
+	EvictionIntervalS int    // EVICTION_INTERVAL_S: sweep cadence in seconds
+	ValueEvictionTTLS int    // VALUE_EVICTION_TTL_S: seconds until an unseen PREMATCH value bet is evicted
 	// VALUE_LIVE_EVICTION_TTL_S: shorter TTL for live value bets (engine heartbeats them every ~3s)
 	ValueLiveEvictionTTLS int
 
@@ -60,6 +63,8 @@ func configFromEnv() Config {
 		SnapshotCacheMs:   int64(getenvInt("SNAPSHOT_CACHE_MS", 500)),
 		BroadcastBatchMs:  int64(getenvInt("BROADCAST_BATCH_MS", 50)),
 		JWTSecret:         getenv("JWT_SECRET", ""),
+		AccountsDB:        getenv("ACCOUNTS_DB", "/data/accounts.db"),
+		AuthRequired:      getenv("AUTH_REQUIRED", "true") == "true",
 		EvictionTTLS:      getenvInt("EVICTION_TTL_S", 120),
 		EvictionLiveTTLS:  getenvInt("EVICTION_LIVE_TTL_S", 8),
 		EvictionIntervalS: getenvInt("EVICTION_INTERVAL_S", 3),
@@ -81,6 +86,7 @@ type WSMessage struct {
 	Type string          `json:"type"` // "snapshot" | "patch" | "ping"
 	Data json.RawMessage `json:"data,omitempty"`
 	Ops  []PatchOp       `json:"ops,omitempty"` // RFC 6902 JSON Patch
+	Key  string          `json:"key,omitempty"` // "state" messages: the per-user state key that changed
 }
 
 type PatchOp struct {
@@ -431,8 +437,10 @@ func (h *StateHub[T]) Snapshot() []byte {
 
 // ── Client — a single WebSocket connection ───────────────────────────────────
 type Client struct {
-	conn *websocket.Conn
-	send chan []byte
+	conn      *websocket.Conn
+	send      chan []byte
+	principal accounts.Principal // zero when AUTH_REQUIRED is off and nobody signed in
+	notify    bool               // receives {"type":"state"} messages (the /ws feed only)
 }
 
 func (c *Client) writePump(ctx context.Context) {
@@ -570,24 +578,33 @@ func runHubEvictionSweep[T any](ctx context.Context, hub *StateHub[T], prematchT
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
-func wsHandler[T any](hub *StateHub[T]) http.HandlerFunc {
+func wsHandler[T any](hub *StateHub[T], gate *wsGate, notify bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if hub.ClientCount() >= int64(hub.cfg.MaxClients) {
 			http.Error(w, "max clients reached", http.StatusServiceUnavailable)
 			return
 		}
+		principal, ok := gate.admit(r)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			InsecureSkipVerify: true, // TODO: add JWT auth check here
+			// Origin is checked by gate.admit for cookie sessions; tickets come from the
+			// extension's own origin.
+			InsecureSkipVerify: true,
 		})
 		if err != nil {
 			log.Error().Err(err).Msg("WS accept failed")
 			return
 		}
 
-		client := &Client{conn: conn, send: make(chan []byte, 64)}
+		client := &Client{conn: conn, send: make(chan []byte, 64), principal: principal, notify: notify}
 		hub.Register(client)
 		defer hub.Unregister(client)
+		gate.track(client)
+		defer gate.untrack(client)
 
 		ctx := r.Context()
 
@@ -632,15 +649,21 @@ func metricsHandler(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier) http.Ha
 	}
 }
 
-// newMux wires the HTTP routes. Patterns without a trailing slash match exactly,
-// so "/ws" does not swallow "/ws/value". tg may be nil (Telegram off).
-func newMux(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier) *http.ServeMux {
+// newMux wires the HTTP routes. Patterns without a trailing slash match exactly, so "/ws" does
+// not swallow "/ws/value". tg may be nil (Telegram off); gate may be nil (no accounts: all open).
+func newMux(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier, gate *wsGate) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", wsHandler(hub))
-	mux.HandleFunc("/ws/value", wsHandler(valueHub))
-	mux.HandleFunc("/api/arb/snapshot", snapshotHandler(hub))
-	mux.HandleFunc("/api/value/snapshot", snapshotHandler(valueHub))
-	mux.Handle("/api/telegram/", telegram.Handler(tg))
+	mux.HandleFunc("/ws", wsHandler(hub, gate, true))
+	mux.HandleFunc("/ws/value", wsHandler(valueHub, gate, false))
+	mux.Handle("/api/arb/snapshot", gate.protect(snapshotHandler(hub)))
+	mux.Handle("/api/value/snapshot", gate.protect(snapshotHandler(valueHub)))
+	mux.Handle("/api/telegram/", gate.adminOnly(telegram.Handler(tg)))
+	if gate != nil && gate.acc != nil {
+		accountsAPI := gate.acc.Handler()
+		mux.Handle("/api/auth/", accountsAPI)
+		mux.Handle("/api/me/", accountsAPI)
+		mux.Handle("/api/admin/", accountsAPI)
+	}
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/metrics", metricsHandler(hub, valueHub, tg))
 	return mux
@@ -666,6 +689,27 @@ func main() {
 	log.Info().Str("version", version).Msg("surebetter-api-gateway starting")
 
 	cfg := configFromEnv()
+
+	// Accounts: users, sessions, extension codes and per-user state.
+	accountsDB, err := accounts.OpenDB(cfg.AccountsDB)
+	if err != nil {
+		log.Fatal().Err(err).Str("path", cfg.AccountsDB).Msg("Failed to open accounts database")
+	}
+	defer accountsDB.Close()
+	acc := accounts.NewService(accountsDB, nil)
+	reg := newConnRegistry()
+	acc.SetConnections(reg)
+	if inv, created, err := acc.EnsureBootstrapInvite(); err != nil {
+		log.Fatal().Err(err).Msg("Failed to create the bootstrap admin invite")
+	} else if created {
+		log.Warn().Str("invite_path", inv.Path).
+			Msg("No accounts yet: open <your server>" + inv.Path + " to create the admin account (a new link is made on every start until then)")
+	}
+	if !cfg.AuthRequired {
+		log.Warn().Msg("AUTH_REQUIRED=false: the feed, the snapshots and the Telegram settings are open to anyone")
+	}
+	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired}
+
 	hub := NewHub(cfg)
 	valueHub := NewValueHub(cfg)
 
@@ -706,7 +750,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
-		Handler:      newMux(hub, valueHub, tg),
+		Handler:      newMux(hub, valueHub, tg, gate),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 0, // no timeout for WS connections
 	}

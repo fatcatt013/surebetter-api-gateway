@@ -265,7 +265,7 @@ func TestMux_ValueSnapshotEndpoint(t *testing.T) {
 	cfg := Config{SnapshotCacheMs: 500, MaxClients: 10}
 	hub, val := NewHub(cfg), NewValueHub(cfg)
 	val.ApplyOpportunity(mustValueBet(t, fullValueJSON))
-	srv := httptest.NewServer(newMux(hub, val, nil))
+	srv := httptest.NewServer(newMux(hub, val, nil, nil))
 	defer srv.Close()
 
 	for path, want := range map[string]string{
@@ -294,7 +294,7 @@ func TestMux_WSValueServesValueHub(t *testing.T) {
 	hub, val := NewHub(cfg), NewValueHub(cfg)
 	hub.ApplyOpportunity(ArbOpportunity{EventID: "football:zzz", MarketType: "MATCH_WINNER"})
 	val.ApplyOpportunity(mustValueBet(t, fullValueJSON))
-	srv := httptest.NewServer(newMux(hub, val, nil))
+	srv := httptest.NewServer(newMux(hub, val, nil, nil))
 	defer srv.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -336,7 +336,7 @@ func TestMux_WSStillServesArbHub(t *testing.T) {
 	cfg := Config{SnapshotCacheMs: 500, MaxClients: 10}
 	hub, val := NewHub(cfg), NewValueHub(cfg)
 	val.ApplyOpportunity(mustValueBet(t, fullValueJSON))
-	srv := httptest.NewServer(newMux(hub, val, nil))
+	srv := httptest.NewServer(newMux(hub, val, nil, nil))
 	defer srv.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
