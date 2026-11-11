@@ -1,6 +1,9 @@
 package accounts
 
-import "strings"
+import (
+	"database/sql"
+	"strings"
+)
 
 // normalizeEmail lower-cases and trims; it rejects anything that is not one local@domain.tld.
 func normalizeEmail(s string) (string, error) {
@@ -71,4 +74,61 @@ func (s *Service) Register(ip, code, email, password string) (Principal, string,
 		return Principal{}, "", err
 	}
 	return Principal{UserID: uid, Email: email, Role: inv.role, SessionID: sid}, token, nil
+}
+
+// UserInfo is one row of the admin user list.
+type UserInfo struct {
+	ID          int64  `json:"id"`
+	Email       string `json:"email"`
+	Role        string `json:"role"`
+	CreatedAt   int64  `json:"created_at"`
+	OnboardedAt *int64 `json:"onboarded_at"`
+	LastSeenAt  *int64 `json:"last_seen_at"`
+	DisabledAt  *int64 `json:"disabled_at"`
+}
+
+// ListUsers returns every user, oldest first.
+func (s *Service) ListUsers() ([]UserInfo, error) {
+	rows, err := s.db.Query(`SELECT id, email, role, created_at, onboarded_at, last_seen_at, disabled_at FROM users ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []UserInfo{}
+	for rows.Next() {
+		var u UserInfo
+		var onboarded, seen, disabled sql.NullInt64
+		if err := rows.Scan(&u.ID, &u.Email, &u.Role, &u.CreatedAt, &onboarded, &seen, &disabled); err != nil {
+			return nil, err
+		}
+		u.OnboardedAt, u.LastSeenAt, u.DisabledAt = nullable(onboarded), nullable(seen), nullable(disabled)
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// SetDisabled disables or re-enables a user. Disabling ends their sessions and closes their
+// sockets; their extension codes stop authenticating while disabled. Admins cannot disable themselves.
+func (s *Service) SetDisabled(adminID, userID int64, disabled bool) error {
+	if adminID == userID {
+		return ErrSelf
+	}
+	var at any // nil = NULL (enabled)
+	if disabled {
+		at = s.nowMs()
+	}
+	res, err := s.db.Exec(`UPDATE users SET disabled_at = ? WHERE id = ?`, at, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	if disabled {
+		if _, err := s.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, userID); err != nil {
+			return err
+		}
+		s.conns.CloseUser(userID)
+	}
+	return nil
 }
