@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -106,16 +107,17 @@ func SameHost(origin string, r *http.Request) bool {
 
 // CSRF rejects state-changing browser requests from other sites: they need an Origin naming
 // this host and, for POST/PUT, a JSON content type (which a plain HTML form cannot send).
-// Requests with an Authorization header are exempt: Authenticate then ignores the cookie.
+// Requests with a Bearer Authorization header are exempt: Authenticate then ignores the cookie
+// (a browser cannot attach one cross-site without a CORS preflight, which gets no CORS answer).
 func CSRF(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Header.Get("Authorization") == "" {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 			if !SameHost(r.Header.Get("Origin"), r) {
 				writeErr(w, http.StatusForbidden, "bad_origin")
 				return
 			}
 			if (r.Method == http.MethodPost || r.Method == http.MethodPut) &&
-				!strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+				!isJSON(r.Header.Get("Content-Type")) {
 				writeErr(w, http.StatusUnsupportedMediaType, "json_required")
 				return
 			}
@@ -221,4 +223,9 @@ func writeServiceError(w http.ResponseWriter, err error) {
 	default:
 		internalError(w, err)
 	}
+}
+
+func isJSON(contentType string) bool {
+	mt, _, err := mime.ParseMediaType(contentType)
+	return err == nil && mt == "application/json"
 }

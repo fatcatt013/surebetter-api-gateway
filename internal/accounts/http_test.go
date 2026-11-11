@@ -3,6 +3,7 @@ package accounts
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -217,5 +218,54 @@ func TestHTTP_AdminRoutes(t *testing.T) {
 	}
 	if code, _ := a.call(admin, "DELETE", "/api/admin/invites/999", nil, nil); code != 404 {
 		t.Fatalf("revoke unknown invite: %d", code)
+	}
+}
+
+func TestHTTP_CredentialRules(t *testing.T) {
+	s, _, _ := newTestService(t)
+	a := newAPI(t, s)
+	admin := newClient()
+	inv, _ := s.CreateInvite(0, RoleAdmin)
+	a.call(admin, "POST", "/api/auth/register", map[string]string{"code": inv.Code, "email": "admin@example.com", "password": testPassword}, nil)
+	_, b := a.call(admin, "POST", "/api/me/extension-codes", map[string]string{"name": "Laptop"}, nil)
+	ext := obj(t, b)["code"].(string)
+	bearer := map[string]string{"Authorization": "Bearer " + ext}
+
+	// A Bearer header means only the code counts: a bad code with a valid cookie is rejected.
+	if code, _ := a.call(admin, "GET", "/api/auth/me", nil, map[string]string{"Authorization": "Bearer SBX-0000-0000-0000-0000-0000"}); code != 401 {
+		t.Fatalf("valid cookie + bad Bearer: %d, want 401", code)
+	}
+	// Codes are read-only and never admin, even an admin's code.
+	bare := &http.Client{}
+	for _, c := range []struct{ method, path string }{
+		{"POST", "/api/me/extension-codes"},
+		{"POST", "/api/auth/logout"},
+		{"GET", "/api/admin/users"},
+	} {
+		if code, _ := a.call(bare, c.method, c.path, map[string]any{}, bearer); code != 403 {
+			t.Errorf("%s %s with a code: %d, want 403", c.method, c.path, code)
+		}
+	}
+	// Only Bearer exempts from the Origin check (Basic auth would be sent by browsers cross-site).
+	if code, _ := a.call(admin, "POST", "/api/me/onboarded", map[string]any{}, map[string]string{"Authorization": "Basic eDp5", "Origin": "http://evil.example"}); code != 403 {
+		t.Fatalf("Basic auth must not skip CSRF: %d", code)
+	}
+	// Content-Type parameters and case are fine.
+	if code, _ := a.call(admin, "POST", "/api/me/onboarded", map[string]any{}, map[string]string{"Content-Type": "Application/JSON; charset=utf-8"}); code != 204 {
+		t.Fatalf("JSON with charset: %d", code)
+	}
+}
+
+func TestRegister_JunkInviteDoesNotHash(t *testing.T) {
+	s, _, _ := newTestService(t)
+	hashSlots <- struct{}{} // occupy both slots: any hash would now block
+	hashSlots <- struct{}{}
+	defer func() { <-hashSlots; <-hashSlots }()
+	var ie *InviteError
+	if _, _, err := s.Register("9.9.9.9", "AAAA-BBBB-CCCC", "x@example.com", testPassword); !errors.As(err, &ie) {
+		t.Fatalf("junk invite: %v", err)
+	}
+	if _, _, err := s.ResetPassword("9.9.9.9", "AAAA-BBBB-CCCC", testPassword); !errors.Is(err, ErrResetInvalid) {
+		t.Fatalf("junk reset code: %v", err)
 	}
 }

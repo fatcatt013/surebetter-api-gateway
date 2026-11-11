@@ -76,6 +76,13 @@ func (s *Service) ResetPassword(ip, code, password string) (Principal, string, e
 	if err := checkPassword(password); err != nil {
 		return Principal{}, "", err
 	}
+	// Check the code before the expensive hash, so junk codes cost nothing; re-checked in the tx.
+	if _, _, _, ok, err := s.resetByCode(s.db, code); err != nil {
+		return Principal{}, "", err
+	} else if !ok {
+		s.ipLimit.fail(ip)
+		return Principal{}, "", ErrResetInvalid
+	}
 	hash, err := hashPassword(password)
 	if err != nil {
 		return Principal{}, "", err

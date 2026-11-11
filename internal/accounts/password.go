@@ -36,7 +36,7 @@ func hashPassword(pw string) (string, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
-	key := argon2.IDKey([]byte(pw), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	key := argonKey([]byte(pw), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s", argon2.Version, argonMemory, argonTime, argonThreads,
 		base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(key)), nil
 }
@@ -62,7 +62,7 @@ func verifyPassword(pw, encoded string) bool {
 	if err != nil || len(want) == 0 {
 		return false
 	}
-	got := argon2.IDKey([]byte(pw), salt, t, m, p, uint32(len(want)))
+	got := argonKey([]byte(pw), salt, t, m, p, uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
@@ -76,4 +76,14 @@ var (
 func dummyHash() string {
 	dummyOnce.Do(func() { dummy, _ = hashPassword("timing equaliser, never a real password") })
 	return dummy
+}
+
+// hashSlots caps concurrent argon2 runs (19 MiB each), so a burst of login or sign-up attempts
+// queues instead of exhausting the host's memory.
+var hashSlots = make(chan struct{}, 2)
+
+func argonKey(pw, salt []byte, t, m uint32, p uint8, keyLen uint32) []byte {
+	hashSlots <- struct{}{}
+	defer func() { <-hashSlots }()
+	return argon2.IDKey(pw, salt, t, m, p, keyLen)
 }

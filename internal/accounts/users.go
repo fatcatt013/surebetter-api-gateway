@@ -32,6 +32,13 @@ func (s *Service) Register(ip, code, email, password string) (Principal, string,
 	if err := checkPassword(password); err != nil {
 		return Principal{}, "", err
 	}
+	// Check the invite before the expensive hash, so junk codes cost nothing; re-checked in the tx.
+	if _, status, err := s.inviteByCode(s.db, code); err != nil {
+		return Principal{}, "", err
+	} else if status != InviteValid {
+		s.ipLimit.fail(ip)
+		return Principal{}, "", &InviteError{Status: status}
+	}
 	hash, err := hashPassword(password)
 	if err != nil {
 		return Principal{}, "", err
