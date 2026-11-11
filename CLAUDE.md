@@ -8,7 +8,7 @@ Go WebSocket gateway. Subscribes to `arb.opportunities` on NATS JetStream, maint
 
 ## Structure
 
-All application code lives in a **single file**: `cmd/gateway/main.go` (no internal packages).
+The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
 
 Key types in that file:
 - `Config` — env vars loaded at startup
@@ -43,6 +43,7 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 | `GET /api/arb/snapshot` | REST fallback — returns full current state as JSON |
 | `GET /ws/value` | WebSocket upgrade — streams value-bet deltas (independent hub; same protocol, path prefix `/value/{id}`) |
 | `GET /api/value/snapshot` | Full current value-bet state as JSON (`{id: ValueBet}`) |
+| `/api/auth/*`, `/api/me/*`, `/api/admin/*` | Accounts API — see `../surebetter-common/docs/api-reference.md` → Accounts |
 | `GET /health` | `{"status":"ok","service":"api-gateway","version":"dev"}` |
 | `GET /metrics` | Prometheus counters: `gateway_ws_clients_connected`, `gateway_messages_sent_total` |
 
@@ -64,7 +65,9 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 | `MAX_CLIENTS` | `100` | Connection cap enforced at accept |
 | `SNAPSHOT_CACHE_MS` | `500` | Snapshot JSON cached to avoid re-marshaling |
 | `BROADCAST_BATCH_MS` | `50` | Delta batching window |
-| `JWT_SECRET` | `""` | Not implemented yet — WebSocket accepts all connections |
+| `JWT_SECRET` | `""` | Unused by the gateway (accounts use opaque session tokens, not JWTs); compose still requires it |
+| `ACCOUNTS_DB` | `/data/accounts.db` | SQLite file for users, invites, sessions, reset codes, extension codes and per-user state. Compose mounts the `surebetter-gateway-data` volume at `/data`. Back it up (see `docs/DEPLOY.md`) |
+| `AUTH_REQUIRED` | `true` (compose: `false` until the frontend has login) | `true`: `/ws`, `/ws/value` and both snapshots need a session cookie or an extension code (`/ws` also a ticket); `/api/telegram/*` needs an admin session. `false`: those stay open; the account API works either way |
 | `LOG_LEVEL` | `info` | zerolog levels: debug/info/warn/error |
 | `EVICTION_TTL_S` | `120` | Seconds since last update before an entry is evicted |
 | `EVICTION_INTERVAL_S` | `3` | Eviction sweep cadence in seconds (shared by both hubs) |
@@ -84,5 +87,4 @@ Uses `FROM scratch` — no shell, no OS. Only the stripped binary + TLS certs ar
 
 ## Known Gaps / TODOs
 
-- JWT auth on `/ws` is stubbed (`InsecureSkipVerify: true` in accept options)
 - Redis client is initialized and pinged but never read/written
