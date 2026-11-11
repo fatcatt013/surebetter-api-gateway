@@ -162,7 +162,7 @@ func TestAuth_ExtensionTicket(t *testing.T) {
 	}
 }
 
-func TestAuth_StateNotifiesOtherSessionsAndLogoutCloses(t *testing.T) {
+func TestAuth_StateNotifiesOtherSocketsAndLogoutCloses(t *testing.T) {
 	srv, svc := newAuthServer(t, true)
 	tokenA := newUser(t, svc, "u@example.com", accounts.RoleUser)
 	_, tokenB, err := svc.Login("127.0.0.2", "u@example.com", authTestPassword)
@@ -176,7 +176,7 @@ func TestAuth_StateNotifiesOtherSessionsAndLogoutCloses(t *testing.T) {
 	defer conn.CloseNow()
 	readType(t, conn) // snapshot
 
-	if code, _ := request(t, srv, "PUT", "/api/me/state/pins", tokenB, `{"value":[]}`, nil); code != 204 {
+	if code, _ := request(t, srv, "PUT", "/api/me/state/pins", tokenB, `{"value":[]}`, map[string]string{"X-Client-Id": "writer"}); code != 204 {
 		t.Fatalf("put state: %d", code)
 	}
 	if got := readType(t, conn); got != "state:pins" {
@@ -220,5 +220,83 @@ func TestAuth_NotRequiredKeepsFeedOpen(t *testing.T) {
 	}
 	if code, _ := request(t, srv, "GET", "/api/telegram/status", "", "", nil); code != 200 {
 		t.Fatalf("telegram: %d", code)
+	}
+}
+
+func expectNoMessage(t *testing.T, conn *websocket.Conn, what string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, b, err := conn.Read(ctx); err == nil {
+		t.Fatalf("%s received %s", what, b)
+	}
+}
+
+func TestAuth_StateSkipsOnlyWritingSocket(t *testing.T) {
+	srv, svc := newAuthServer(t, true)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	a, _, err := dial(t, srv, "/ws?cid=a", cookie(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.CloseNow()
+	b, _, err := dial(t, srv, "/ws?cid=b", cookie(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.CloseNow()
+	v, _, err := dial(t, srv, "/ws/value?cid=c", cookie(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseNow()
+	readType(t, a)
+	readType(t, b)
+	readType(t, v)
+
+	if code, _ := request(t, srv, "PUT", "/api/me/state/pins", token, `{"value":[]}`, map[string]string{"X-Client-Id": "a"}); code != 204 {
+		t.Fatalf("put state: %d", code)
+	}
+	if got := readType(t, b); got != "state:pins" {
+		t.Fatalf("socket b got %s", got)
+	}
+	expectNoMessage(t, a, "writing socket a")
+	expectNoMessage(t, v, "/ws/value socket")
+}
+
+func TestAuth_FeedOffSocketGetsOnlyState(t *testing.T) {
+	db, err := accounts.OpenDB(filepath.Join(t.TempDir(), "accounts.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	svc := accounts.NewService(db, nil)
+	reg := newConnRegistry()
+	svc.SetConnections(reg)
+	cfg := Config{SnapshotCacheMs: 500, MaxClients: 10}
+	hub := NewHub(cfg)
+	srv := httptest.NewServer(newMux(hub, NewValueHub(cfg), nil, &wsGate{acc: svc, reg: reg, required: true}))
+	t.Cleanup(srv.Close)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+
+	conn, _, err := dial(t, srv, "/ws?feed=0&cid=x", cookie(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	hub.BroadcastPatch([]PatchOp{{Op: "add", Path: "/a", Value: 1}})
+	if code, _ := request(t, srv, "PUT", "/api/me/state/pins", token, `{"value":[]}`, map[string]string{"X-Client-Id": "other"}); code != 204 {
+		t.Fatalf("put state: %d", code)
+	}
+	if got := readType(t, conn); got != "state:pins" {
+		t.Fatalf("first message = %s, want state:pins", got)
+	}
+}
+
+func TestAuthRequired_FailsClosed(t *testing.T) {
+	for v, want := range map[string]bool{"false": false, " FALSE ": false, "true": true, "": true, "1": true, "TRUE": true, "flase": true, "0": true} {
+		if got := authRequired(v); got != want {
+			t.Errorf("authRequired(%q) = %v, want %v", v, got, want)
+		}
 	}
 }

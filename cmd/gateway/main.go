@@ -54,6 +54,11 @@ type Config struct {
 	TelegramTZ            string
 }
 
+// authRequired fails closed: only the exact value "false" disables authentication.
+func authRequired(v string) bool {
+	return strings.ToLower(strings.TrimSpace(v)) != "false"
+}
+
 func configFromEnv() Config {
 	return Config{
 		NatsURL:           getenv("NATS_URL", "nats://localhost:4222"),
@@ -64,7 +69,7 @@ func configFromEnv() Config {
 		BroadcastBatchMs:  int64(getenvInt("BROADCAST_BATCH_MS", 50)),
 		JWTSecret:         getenv("JWT_SECRET", ""),
 		AccountsDB:        getenv("ACCOUNTS_DB", "/data/accounts.db"),
-		AuthRequired:      getenv("AUTH_REQUIRED", "true") == "true",
+		AuthRequired:      authRequired(getenv("AUTH_REQUIRED", "true")),
 		EvictionTTLS:      getenvInt("EVICTION_TTL_S", 120),
 		EvictionLiveTTLS:  getenvInt("EVICTION_LIVE_TTL_S", 8),
 		EvictionIntervalS: getenvInt("EVICTION_INTERVAL_S", 3),
@@ -440,11 +445,13 @@ type Client struct {
 	conn      *websocket.Conn
 	send      chan []byte
 	principal accounts.Principal // zero when AUTH_REQUIRED is off and nobody signed in
+	cid       string             // client id from ?cid=; a state write skips the socket that made it
 	notify    bool               // receives {"type":"state"} messages (the /ws feed only)
 }
 
 func (c *Client) writePump(ctx context.Context) {
-	pingTicker := time.NewTicker(30 * time.Second)
+	pingTicker := time.NewTicker(20 * time.Second) // Chrome stops an extension service worker after 30 s without events; a /ws?feed=0 socket's only traffic is these pings, so they must come more often than every 30 s.
+
 	defer pingTicker.Stop()
 
 	for {
@@ -600,20 +607,34 @@ func wsHandler[T any](hub *StateHub[T], gate *wsGate, notify bool) http.HandlerF
 			return
 		}
 
-		client := &Client{conn: conn, send: make(chan []byte, 64), principal: principal, notify: notify}
-		hub.Register(client)
-		defer hub.Unregister(client)
+		defer conn.CloseNow()
+		// The gateway never reads client messages; CloseRead handles control frames and cancels
+		// ctx as soon as the peer closes or the connection breaks.
+		ctx := conn.CloseRead(r.Context())
+
+		q := r.URL.Query()
+		client := &Client{conn: conn, send: make(chan []byte, 64), principal: principal, notify: notify,
+			cid: accounts.ValidClientID(q.Get("cid"))}
+		feedOff := notify && q.Get("feed") == "0"
+		if !feedOff {
+			hub.Register(client)
+			defer hub.Unregister(client)
+		}
 		gate.track(client)
 		defer gate.untrack(client)
-
-		ctx := r.Context()
-
-		// Send initial full snapshot
-		snapshot := hub.Snapshot()
-		msg := WSMessage{Type: "snapshot", Data: snapshot}
-		if err := wsjson.Write(ctx, conn, msg); err != nil {
-			log.Error().Err(err).Msg("Failed to send snapshot")
+		if !gate.stillValid(principal) {
+			conn.Close(websocket.StatusPolicyViolation, "signed out")
 			return
+		}
+
+		if !feedOff {
+			// Send initial full snapshot
+			snapshot := hub.Snapshot()
+			msg := WSMessage{Type: "snapshot", Data: snapshot}
+			if err := wsjson.Write(ctx, conn, msg); err != nil {
+				log.Error().Err(err).Msg("Failed to send snapshot")
+				return
+			}
 		}
 
 		client.writePump(ctx)

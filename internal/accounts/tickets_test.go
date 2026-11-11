@@ -28,3 +28,17 @@ func TestTickets_SingleUseAndExpiry(t *testing.T) {
 		t.Fatal("unknown tickets must fail")
 	}
 }
+
+func TestStillValid(t *testing.T) {
+	s, _, _ := newTestService(t)
+	p, _ := mustUser(t, s, "u@example.com", RoleUser)
+	if !s.StillValid(p) {
+		t.Fatal("fresh principal must be valid")
+	}
+	if err := s.Logout(p.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	if s.StillValid(p) {
+		t.Fatal("ended session must be invalid")
+	}
+}

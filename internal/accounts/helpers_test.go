@@ -41,7 +41,7 @@ func mustUser(t *testing.T, s *Service, email, role string) (Principal, string) 
 type recConns struct {
 	mu                     sync.Mutex
 	users, sessions, codes []int64
-	states                 []string // "user:key:exceptSession"
+	states                 []string // "user:key:client"
 }
 
 func (r *recConns) CloseUser(id int64) { r.mu.Lock(); r.users = append(r.users, id); r.mu.Unlock() }
@@ -51,8 +51,8 @@ func (r *recConns) CloseSession(id int64) {
 	r.mu.Unlock()
 }
 func (r *recConns) CloseCode(id int64) { r.mu.Lock(); r.codes = append(r.codes, id); r.mu.Unlock() }
-func (r *recConns) NotifyState(user int64, key string, except int64) {
+func (r *recConns) NotifyState(user int64, key string, except string) {
 	r.mu.Lock()
-	r.states = append(r.states, fmt.Sprintf("%d:%s:%d", user, key, except))
+	r.states = append(r.states, fmt.Sprintf("%d:%s:%s", user, key, except))
 	r.mu.Unlock()
 }

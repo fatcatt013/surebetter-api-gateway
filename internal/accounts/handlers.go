@@ -3,6 +3,7 @@ package accounts
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 )
 
 const smallBody = 16 << 10
@@ -165,7 +166,7 @@ func (s *Service) handlePutState(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &in, MaxStateBytes+4096) {
 		return
 	}
-	if err := s.PutState(principal(r), r.PathValue("key"), in.Value); err != nil {
+	if err := s.PutState(principal(r), r.PathValue("key"), in.Value, clientID(r)); err != nil {
 		writeServiceError(w, err)
 		return
 	}
@@ -278,4 +279,22 @@ func (s *Service) handleCreateReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, reset)
+}
+
+// clientID reads the optional X-Client-Id header; invalid values are ignored.
+func clientID(r *http.Request) string {
+	return ValidClientID(strings.TrimSpace(r.Header.Get("X-Client-Id")))
+}
+
+// ValidClientID returns id if it is at most 64 chars of [A-Za-z0-9_-], else "".
+func ValidClientID(id string) string {
+	if len(id) > 64 {
+		return ""
+	}
+	for _, c := range id {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return ""
+		}
+	}
+	return id
 }

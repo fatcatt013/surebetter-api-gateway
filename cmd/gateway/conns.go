@@ -58,8 +58,8 @@ func (r *connRegistry) CloseCode(id int64) {
 }
 
 // NotifyState sends {"type":"state","key":…} to the user's /ws sockets (not /ws/value), except
-// those of exceptSession. A full send buffer drops the message; the next change resends.
-func (r *connRegistry) NotifyState(userID int64, key string, exceptSession int64) {
+// the writer's own socket (client id exceptClient; empty notifies all). A full send buffer drops the message; the next change resends.
+func (r *connRegistry) NotifyState(userID int64, key string, exceptClient string) {
 	if userID == 0 {
 		return
 	}
@@ -70,7 +70,7 @@ func (r *connRegistry) NotifyState(userID int64, key string, exceptSession int64
 		if !c.notify || c.principal.UserID != userID {
 			continue
 		}
-		if exceptSession != 0 && c.principal.SessionID == exceptSession {
+		if c.cid != "" && c.cid == exceptClient {
 			continue
 		}
 		select {

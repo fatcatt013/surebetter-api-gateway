@@ -44,8 +44,8 @@ func (s *Service) GetState(userID int64) (map[string]json.RawMessage, error) {
 	return out, rows.Err()
 }
 
-// PutState saves one key (last write wins) and notifies the user's other open sockets.
-func (s *Service) PutState(p Principal, key string, value json.RawMessage) error {
+// PutState saves one key (last write wins) and notifies the user's open sockets except the writer's (clientID).
+func (s *Service) PutState(p Principal, key string, value json.RawMessage, clientID string) error {
 	if !stateKeys[key] {
 		return ErrUnknownKey
 	}
@@ -60,7 +60,7 @@ func (s *Service) PutState(p Principal, key string, value json.RawMessage) error
 		p.UserID, key, string(value), s.nowMs()); err != nil {
 		return err
 	}
-	s.conns.NotifyState(p.UserID, key, p.SessionID)
+	s.conns.NotifyState(p.UserID, key, clientID)
 	return nil
 }
 

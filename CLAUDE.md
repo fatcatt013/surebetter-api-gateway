@@ -51,7 +51,9 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 
 1. On connect: full snapshot → `{"type":"snapshot","data":{...}}`
 2. On each NATS message: RFC 6902 patch → `{"type":"patch","ops":[{"op":"replace","path":"/arb/{eventID}:{marketType}:{line:.2f}","value":{...}}]}`
-3. Keepalive: `{"type":"ping"}` every 30s
+3. Keepalive: `{"type":"ping"}` every 20s (Chrome stops an idle extension service worker after 30 s)
+
+`/ws?cid=<id>` tags a socket with a client id (max 64 chars, `[A-Za-z0-9_-]`); a `PUT /api/me/state/{key}` sent with the same `X-Client-Id` header skips that socket but notifies the user's other sockets (`{"type":"state","key":...}`). `/ws?feed=0` (arb `/ws` only) gets no snapshot or patches, just `state` messages and pings.
 
 Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before broadcasting.
 
@@ -67,7 +69,7 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 | `BROADCAST_BATCH_MS` | `50` | Delta batching window |
 | `JWT_SECRET` | `""` | Unused by the gateway (accounts use opaque session tokens, not JWTs); compose still requires it |
 | `ACCOUNTS_DB` | `/data/accounts.db` | SQLite file for users, invites, sessions, reset codes, extension codes and per-user state. Compose mounts the `surebetter-gateway-data` volume at `/data`. Back it up (see `docs/DEPLOY.md`) |
-| `AUTH_REQUIRED` | `true` (compose: `false` until the frontend has login) | `true`: `/ws`, `/ws/value` and both snapshots need a session cookie or an extension code (`/ws` also a ticket); `/api/telegram/*` needs an admin session. `false`: those stay open; the account API works either way |
+| `AUTH_REQUIRED` | `true` (compose: `false` until the frontend has login) | `true`: `/ws`, `/ws/value` and both snapshots need a session cookie or an extension code (both sockets also accept a `?ticket=`); `/api/telegram/*` needs an admin session. Only the exact value `false` (trimmed, case-insensitive) turns it off; anything else, typos included, means required. `false`: those stay open; the account API works either way |
 | `LOG_LEVEL` | `info` | zerolog levels: debug/info/warn/error |
 | `EVICTION_TTL_S` | `120` | Seconds since last update before an entry is evicted |
 | `EVICTION_INTERVAL_S` | `3` | Eviction sweep cadence in seconds (shared by both hubs) |

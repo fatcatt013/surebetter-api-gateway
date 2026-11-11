@@ -32,16 +32,16 @@ type Connections interface {
 	CloseSession(sessionID int64)
 	CloseCode(codeID int64)
 	// NotifyState tells the user's open feed sockets that a state key changed, except the
-	// sockets of exceptSession (that tab wrote the value). exceptSession 0 notifies all.
-	NotifyState(userID int64, key string, exceptSession int64)
+	// writer's own socket, identified by its client id (exceptClient). Empty notifies all.
+	NotifyState(userID int64, key string, exceptClient string)
 }
 
 type noConnections struct{}
 
-func (noConnections) CloseUser(int64)                  {}
-func (noConnections) CloseSession(int64)               {}
-func (noConnections) CloseCode(int64)                  {}
-func (noConnections) NotifyState(int64, string, int64) {}
+func (noConnections) CloseUser(int64)                   {}
+func (noConnections) CloseSession(int64)                {}
+func (noConnections) CloseCode(int64)                   {}
+func (noConnections) NotifyState(int64, string, string) {}
 
 // Errors. Their text is the API's "error" value.
 var (
@@ -112,15 +112,21 @@ func (s *Service) RedeemTicket(t string) (Principal, bool) {
 	if !ok {
 		return Principal{}, false
 	}
+	if !s.StillValid(p) {
+		return Principal{}, false
+	}
+	return p, true
+}
+
+// StillValid reports whether p's user exists and is enabled, its session (if any) still exists
+// and its extension code (if any) is not revoked.
+func (s *Service) StillValid(p Principal) bool {
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM users u WHERE u.id = ? AND u.disabled_at IS NULL
 		AND (? = 0 OR EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = u.id))
 		AND (? = 0 OR EXISTS (SELECT 1 FROM extension_codes WHERE id = ? AND user_id = u.id AND revoked_at IS NULL))`,
 		p.UserID, p.SessionID, p.SessionID, p.CodeID, p.CodeID).Scan(&n)
-	if err != nil || n == 0 {
-		return Principal{}, false
-	}
-	return p, true
+	return err == nil && n > 0
 }
 
 func (s *Service) nowMs() int64 { return s.now().UnixMilli() }

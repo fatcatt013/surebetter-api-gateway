@@ -48,6 +48,15 @@ func (g *wsGate) track(c *Client) {
 	}
 }
 
+// stillValid re-checks a principal after track(), closing the window in which a logout could
+// have run between admit and registration. Zero principals and nil gates are always valid.
+func (g *wsGate) stillValid(p accounts.Principal) bool {
+	if g == nil || g.acc == nil || p.UserID == 0 {
+		return true
+	}
+	return g.acc.StillValid(p)
+}
+
 func (g *wsGate) untrack(c *Client) {
 	if g != nil && g.reg != nil {
 		g.reg.remove(c)

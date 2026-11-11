@@ -12,13 +12,13 @@ func TestState_PutGetNotify(t *testing.T) {
 	user, _ := mustUser(t, s, "user@example.com", RoleUser)
 	other, _ := mustUser(t, s, "other@example.com", RoleUser)
 
-	if err := s.PutState(user, "pins", json.RawMessage(`[{"key":"a"}]`)); err != nil {
+	if err := s.PutState(user, "pins", json.RawMessage(`[{"key":"a"}]`), "c1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutState(user, "pins", json.RawMessage(`[{"key":"b"}]`)); err != nil {
+	if err := s.PutState(user, "pins", json.RawMessage(`[{"key":"b"}]`), "c2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutState(user, "profile", json.RawMessage(`{"bookmakers":["tipsport","betano"]}`)); err != nil {
+	if err := s.PutState(user, "profile", json.RawMessage(`{"bookmakers":["tipsport","betano"]}`), ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetState(user.UserID)
@@ -29,25 +29,25 @@ func TestState_PutGetNotify(t *testing.T) {
 		t.Fatalf("users must not see each other's state: %v", empty)
 	}
 	want := []string{
-		"1:pins:" + itoa(user.SessionID),
-		"1:pins:" + itoa(user.SessionID),
-		"1:profile:" + itoa(user.SessionID),
+		"1:pins:c1",
+		"1:pins:c2",
+		"1:profile:",
 	}
 	if strings.Join(rec.states, ",") != strings.Join(want, ",") {
 		t.Fatalf("notifications = %v, want %v", rec.states, want)
 	}
 
-	if err := s.PutState(user, "sb.theme", json.RawMessage(`"dark"`)); !errors.Is(err, ErrUnknownKey) {
+	if err := s.PutState(user, "sb.theme", json.RawMessage(`"dark"`), ""); !errors.Is(err, ErrUnknownKey) {
 		t.Fatalf("theme is not an account key: %v", err)
 	}
-	if err := s.PutState(user, "pins", json.RawMessage(`{broken`)); !errors.Is(err, ErrBadValue) {
+	if err := s.PutState(user, "pins", json.RawMessage(`{broken`), ""); !errors.Is(err, ErrBadValue) {
 		t.Fatalf("invalid JSON: %v", err)
 	}
-	if err := s.PutState(user, "pins", nil); !errors.Is(err, ErrBadValue) {
+	if err := s.PutState(user, "pins", nil, ""); !errors.Is(err, ErrBadValue) {
 		t.Fatalf("missing value: %v", err)
 	}
 	big := json.RawMessage(`"` + strings.Repeat("x", MaxStateBytes) + `"`)
-	if err := s.PutState(user, "pins", big); !errors.Is(err, ErrTooLarge) {
+	if err := s.PutState(user, "pins", big, ""); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("over 256 KB: %v", err)
 	}
 }
