@@ -39,3 +39,14 @@ func TestPassword_Rules(t *testing.T) {
 		t.Error("over 256 bytes must be rejected")
 	}
 }
+
+func TestPassword_RejectsZeroParameters(t *testing.T) {
+	for _, h := range []string{
+		"$argon2id$v=19$m=19456,t=0,p=1$c2FsdHNhbHRzYWx0c2FsdA$a2V5",
+		"$argon2id$v=19$m=19456,t=2,p=0$c2FsdHNhbHRzYWx0c2FsdA$a2V5",
+	} {
+		if verifyPassword("x", h) {
+			t.Errorf("%s must not verify", h)
+		}
+	}
+}

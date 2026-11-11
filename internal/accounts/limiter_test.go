@@ -55,3 +55,19 @@ func TestLimiter_OldFailuresExpireAndResetClears(t *testing.T) {
 		t.Fatal("reset must clear the count")
 	}
 }
+
+func TestLimiter_FailuresDuringLockDoNotExtendIt(t *testing.T) {
+	clk := newClock()
+	l := newLimiter(5, 15*time.Minute, 15*time.Minute, clk.now)
+	for i := 0; i < 5; i++ {
+		l.fail("k")
+	}
+	clk.advance(10 * time.Minute)
+	for i := 0; i < 5; i++ {
+		l.fail("k")
+	}
+	clk.advance(5 * time.Minute)
+	if ok, _ := l.check("k"); !ok {
+		t.Fatal("failures recorded while locked must not extend the lock")
+	}
+}

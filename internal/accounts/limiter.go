@@ -45,6 +45,9 @@ func (l *limiter) fail(key string) {
 	defer l.mu.Unlock()
 	now := l.now()
 	e := l.entries[key]
+	if e != nil && now.Before(e.lockedUntil) {
+		return // already locked: failures during the lock must not extend it
+	}
 	if e == nil {
 		if len(l.entries) >= 10000 {
 			l.prune(now)

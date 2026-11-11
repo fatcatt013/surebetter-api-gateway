@@ -52,6 +52,9 @@ func verifyPassword(pw, encoded string) bool {
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &m, &t, &p); err != nil {
 		return false
 	}
+	if t == 0 || p == 0 || m == 0 || m > 1<<20 { // argon2.IDKey panics on t or p of 0; cap memory at 1 GiB
+		return false
+	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
 	if err != nil {
 		return false
