@@ -41,3 +41,39 @@ func TestUsers_ListDisableEnable(t *testing.T) {
 		t.Fatalf("login after enable: %v", err)
 	}
 }
+
+func TestTicket_InvalidAfterDisableOrRevoke(t *testing.T) {
+	s, _, _ := newTestService(t)
+	admin, _ := mustUser(t, s, "admin@example.com", RoleAdmin)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	c, _ := s.CreateExtensionCode(user.UserID, "Laptop")
+	codeP, _, _ := s.AuthenticateCode(c.Code)
+
+	if _, ok := s.RedeemTicket(s.IssueTicket(user)); !ok {
+		t.Fatal("a session ticket must work")
+	}
+	revoked := s.IssueTicket(codeP)
+	s.RevokeExtensionCode(user.UserID, c.ID)
+	if _, ok := s.RedeemTicket(revoked); ok {
+		t.Fatal("a ticket must not outlive its revoked code")
+	}
+	disabled := s.IssueTicket(user)
+	s.SetDisabled(admin.UserID, user.UserID, true)
+	if _, ok := s.RedeemTicket(disabled); ok {
+		t.Fatal("a ticket must not work for a user disabled after it was issued")
+	}
+}
+
+func TestReset_DisabledUserCodeIsNotUsable(t *testing.T) {
+	s, _, _ := newTestService(t)
+	admin, _ := mustUser(t, s, "admin@example.com", RoleAdmin)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	r, _ := s.CreateReset(admin.UserID, user.UserID)
+	s.SetDisabled(admin.UserID, user.UserID, true)
+	if _, ok, _ := s.CheckReset("1.1.1.1", r.Code); ok {
+		t.Fatal("a disabled user's reset code must not check out")
+	}
+	if err := s.SetDisabled(admin.UserID, user.UserID, true); err != nil {
+		t.Fatalf("disabling twice: %v", err)
+	}
+}

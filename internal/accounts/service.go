@@ -105,8 +105,23 @@ func (s *Service) SetConnections(c Connections) {
 // IssueTicket returns a 30-second single-use WebSocket ticket for p.
 func (s *Service) IssueTicket(p Principal) string { return s.tickets.issue(p) }
 
-// RedeemTicket returns the principal a ticket was issued to; a ticket works once.
-func (s *Service) RedeemTicket(t string) (Principal, bool) { return s.tickets.redeem(t) }
+// RedeemTicket returns the principal a ticket was issued to. A ticket works once, and not for a
+// user disabled, a session ended or a code revoked since it was issued.
+func (s *Service) RedeemTicket(t string) (Principal, bool) {
+	p, ok := s.tickets.redeem(t)
+	if !ok {
+		return Principal{}, false
+	}
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users u WHERE u.id = ? AND u.disabled_at IS NULL
+		AND (? = 0 OR EXISTS (SELECT 1 FROM sessions WHERE id = ? AND user_id = u.id))
+		AND (? = 0 OR EXISTS (SELECT 1 FROM extension_codes WHERE id = ? AND user_id = u.id AND revoked_at IS NULL))`,
+		p.UserID, p.SessionID, p.SessionID, p.CodeID, p.CodeID).Scan(&n)
+	if err != nil || n == 0 {
+		return Principal{}, false
+	}
+	return p, true
+}
 
 func (s *Service) nowMs() int64 { return s.now().UnixMilli() }
 

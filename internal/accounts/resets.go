@@ -34,19 +34,20 @@ func (s *Service) CreateReset(adminID, userID int64) (NewReset, error) {
 	return NewReset{Code: code, Path: "/app/reset?code=" + code, ExpiresAt: exp}, nil
 }
 
-// resetByCode finds a reset code; usable = not used and not expired.
+// resetByCode finds a reset code; usable = not used, not expired, and the user not disabled.
 func (s *Service) resetByCode(q querier, code string) (id, userID int64, email string, usable bool, err error) {
 	var exp int64
-	var used sql.NullInt64
-	err = q.QueryRow(`SELECT r.id, r.user_id, u.email, r.expires_at, r.used_at FROM reset_codes r JOIN users u ON u.id = r.user_id
-		WHERE r.code_hash = ?`, hashSecret(normalizeCode(code))).Scan(&id, &userID, &email, &exp, &used)
+	var used, disabled sql.NullInt64
+	err = q.QueryRow(`SELECT r.id, r.user_id, u.email, r.expires_at, r.used_at, u.disabled_at FROM reset_codes r
+		JOIN users u ON u.id = r.user_id WHERE r.code_hash = ?`, hashSecret(normalizeCode(code))).
+		Scan(&id, &userID, &email, &exp, &used, &disabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, 0, "", false, nil
 	}
 	if err != nil {
 		return 0, 0, "", false, err
 	}
-	return id, userID, email, !used.Valid && s.nowMs() < exp, nil
+	return id, userID, email, !used.Valid && !disabled.Valid && s.nowMs() < exp, nil
 }
 
 // CheckReset returns the email a usable reset code belongs to (for the "New password" page).

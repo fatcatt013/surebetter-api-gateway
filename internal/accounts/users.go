@@ -113,11 +113,14 @@ func (s *Service) SetDisabled(adminID, userID int64, disabled bool) error {
 	if adminID == userID {
 		return ErrSelf
 	}
-	var at any // nil = NULL (enabled)
-	if disabled {
-		at = s.nowMs()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-	res, err := s.db.Exec(`UPDATE users SET disabled_at = ? WHERE id = ?`, at, userID)
+	defer tx.Rollback()
+	// Disabling keeps the first disable time; enabling clears it.
+	res, err := tx.Exec(`UPDATE users SET disabled_at = CASE WHEN ? THEN COALESCE(disabled_at, ?) ELSE NULL END WHERE id = ?`,
+		disabled, s.nowMs(), userID)
 	if err != nil {
 		return err
 	}
@@ -125,9 +128,14 @@ func (s *Service) SetDisabled(adminID, userID int64, disabled bool) error {
 		return ErrNotFound
 	}
 	if disabled {
-		if _, err := s.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, userID); err != nil {
+		if _, err := tx.Exec(`DELETE FROM sessions WHERE user_id = ?`, userID); err != nil {
 			return err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if disabled {
 		s.conns.CloseUser(userID)
 	}
 	return nil
