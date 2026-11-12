@@ -79,6 +79,7 @@ type botHub struct {
 	mu     sync.Mutex
 	agents map[int64]map[int64]*botPresence // user id → code id → presence
 	orders map[string]botOrder              // order id → order, until its final event or orderMemory
+	logs   logLimiter                       // POST /api/me/bot/logs lines per code per minute
 }
 
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
@@ -166,6 +167,7 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("POST /api/me/bot/status", acc.RequireBotCode(http.HandlerFunc(b.handleStatus)))
 	mux.Handle("POST /api/me/bot/events", acc.RequireBotCode(http.HandlerFunc(b.handleEvent)))
 	mux.Handle("GET /api/me/bot/agents", acc.RequireSession(http.HandlerFunc(b.handleAgents)))
+	mux.Handle("POST /api/me/bot/logs", acc.RequireBotCode(http.HandlerFunc(b.handlePostLogs)))
 	return accounts.CSRF(mux)
 }
 
