@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,4 +183,109 @@ func TestBot_PresenceNotifiesAppSockets(t *testing.T) {
 		t.Fatalf("app socket on bot disconnect got %s, want bot", got)
 	}
 	expectNoMessage(t, other, "another user's app socket")
+}
+
+// getBot returns the GET /api/me/bot body (trimmed) for a session.
+func getBot(t *testing.T, srv *httptest.Server, token string) string {
+	t.Helper()
+	status, body := request(t, srv, "GET", "/api/me/bot", token, "", nil)
+	if status != 200 {
+		t.Fatalf("GET /api/me/bot: %d %s", status, body)
+	}
+	return strings.TrimSpace(body)
+}
+
+func postStatus(t *testing.T, srv *httptest.Server, code, body string) (int, string) {
+	t.Helper()
+	return request(t, srv, "POST", "/api/me/bot/status", "", body, bearer(code))
+}
+
+func TestBot_StatusAndPresence(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	app := appSocket(t, srv, token)
+
+	if got := getBot(t, srv, token); got != `{"online":false,"books":[],"dryRun":true,"busy":false}` {
+		t.Fatalf("offline: %s", got)
+	}
+	if s, b := postStatus(t, srv, code, `{"books":[],"dryRun":true}`); s != 409 || !strings.Contains(b, `"bot_offline"`) {
+		t.Fatalf("status without a bot socket: %d %s", s, b)
+	}
+
+	bot := dialBot(t, srv, code)
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on bot connect: %s", got)
+	}
+	if got := getBot(t, srv, token); got != `{"online":true,"books":[],"dryRun":true,"busy":false}` {
+		t.Fatalf("online before any status: %s", got)
+	}
+
+	live := `{"books":[{"bookmaker":"tipsport","ready":true},{"bookmaker":"betano","ready":false}],"dryRun":false}`
+	if s, b := postStatus(t, srv, code, live); s != 204 {
+		t.Fatalf("status: %d %s", s, b)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on status change: %s", got)
+	}
+	if got := getBot(t, srv, token); got != `{"online":true,"books":[{"bookmaker":"tipsport","ready":true},{"bookmaker":"betano","ready":false}],"dryRun":false,"busy":false}` {
+		t.Fatalf("after status: %s", got)
+	}
+
+	// A missing dryRun is dry run: never Live by omission.
+	if s, b := postStatus(t, srv, code, `{"books":[{"bookmaker":"tipsport","ready":true}]}`); s != 204 {
+		t.Fatalf("status without dryRun: %d %s", s, b)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on status change: %s", got)
+	}
+	if got := getBot(t, srv, token); got != `{"online":true,"books":[{"bookmaker":"tipsport","ready":true}],"dryRun":true,"busy":false}` {
+		t.Fatalf("after status without dryRun: %s", got)
+	}
+
+	// The same status again is not a change.
+	if s, _ := postStatus(t, srv, code, `{"books":[{"bookmaker":"tipsport","ready":true}],"dryRun":true}`); s != 204 {
+		t.Fatalf("repeated status: %d", s)
+	}
+	expectNoMessage(t, app, "app socket after an unchanged status")
+	expectNoMessage(t, bot, "the bot socket (never gets bot messages)")
+}
+
+func TestBot_StatusOnlyFromTheConnectedCode(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	first := newCode(t, srv, token, "bot")
+	second := newCode(t, srv, token, "bot")
+
+	dialBot(t, srv, first)
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on bot connect: %s", got)
+	}
+	if s, b := postStatus(t, srv, second, `{"books":[],"dryRun":true}`); s != 409 || !strings.Contains(b, `"bot_offline"`) {
+		t.Fatalf("status from a code without the socket: %d %s", s, b)
+	}
+	if s, _ := postStatus(t, srv, first, `{"books":[],"dryRun":true}`); s != 204 {
+		t.Fatalf("status from the connected code: %d", s)
+	}
+}
+
+func TestBot_StatusRoutesNeedTheRightCredential(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	ext := newCode(t, srv, token, "extension")
+	bot := newCode(t, srv, token, "bot")
+
+	if s, b := request(t, srv, "POST", "/api/me/bot/status", token, `{}`, nil); s != 403 || !strings.Contains(b, `"bot_code_required"`) {
+		t.Fatalf("status with a session: %d %s", s, b)
+	}
+	if s, b := postStatus(t, srv, ext, `{}`); s != 403 || !strings.Contains(b, `"bot_code_required"`) {
+		t.Fatalf("status with an extension code: %d %s", s, b)
+	}
+	if s, _ := request(t, srv, "POST", "/api/me/bot/status", "", `{}`, nil); s != 401 {
+		t.Fatalf("status without a credential: %d", s)
+	}
+	if s, b := request(t, srv, "GET", "/api/me/bot", "", "", bearer(bot)); s != 403 || !strings.Contains(b, `"session_required"`) {
+		t.Fatalf("GET /api/me/bot with a code: %d %s", s, b)
+	}
 }

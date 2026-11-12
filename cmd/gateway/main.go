@@ -704,6 +704,10 @@ func newMux(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier, gate *wsGate) *
 		mux.Handle("/api/auth/", accountsAPI)
 		mux.Handle("/api/me/", accountsAPI)
 		mux.Handle("/api/admin/", accountsAPI)
+		// More specific than /api/me/, so these win over the accounts API.
+		botAPI := newBotAPI(gate.acc, gate.bots)
+		mux.Handle("/api/me/bot", botAPI)
+		mux.Handle("/api/me/bot/", botAPI)
 	}
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/metrics", metricsHandler(hub, valueHub, tg))
