@@ -135,6 +135,7 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("GET /api/me/bot", acc.RequireSession(http.HandlerFunc(b.handleGet)))
 	mux.Handle("POST /api/me/bot/orders", acc.RequireSession(http.HandlerFunc(b.handleOrder)))
 	mux.Handle("POST /api/me/bot/status", acc.RequireBotCode(http.HandlerFunc(b.handleStatus)))
+	mux.Handle("POST /api/me/bot/events", acc.RequireBotCode(http.HandlerFunc(b.handleEvent)))
 	return accounts.CSRF(mux)
 }
 
@@ -307,6 +308,89 @@ func (b *botHub) handleOrder(w http.ResponseWriter, r *http.Request) {
 		accounts.WriteError(w, http.StatusConflict, err.Error())
 	default:
 		log.Error().Err(err).Msg("bot order failed")
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+	}
+}
+
+// botEvents lists the events a bot may post; true = final (the order is over).
+var botEvents = map[string]bool{
+	"accepted":        false,
+	"leg_ready":       false,
+	"placed":          true,
+	"stopped":         true,
+	"outcome_unknown": true,
+}
+
+var errUnknownOrder = errors.New("unknown_order")
+
+// botEventIn is the POST /api/me/bot/events body.
+type botEventIn struct {
+	OrderID   string `json:"order_id"`
+	Event     string `json:"event"`
+	Bookmaker string `json:"bookmaker"`
+	Reason    string `json:"reason"`
+}
+
+// botEventMsg is the {"type":"botEvent"} message the user's non-bot /ws sockets receive.
+type botEventMsg struct {
+	Type      string `json:"type"`
+	OrderID   string `json:"order_id"`
+	ArbKey    string `json:"arb_key"`
+	Event     string `json:"event"`
+	Bookmaker string `json:"bookmaker,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// event relays one of userID's order events to the user's non-bot /ws sockets. A final event
+// forgets the order and, if the bot is still busy with it, clears busy. errUnknownOrder: the order
+// is unknown, finished, older than orderMemory, or another user's.
+func (b *botHub) event(userID int64, in botEventIn) error {
+	final := botEvents[in.Event]
+	b.mu.Lock()
+	b.pruneLocked()
+	o, ok := b.orders[in.OrderID]
+	if !ok || o.userID != userID {
+		b.mu.Unlock()
+		return errUnknownOrder
+	}
+	cleared := false
+	if final {
+		delete(b.orders, in.OrderID)
+		if p := b.bots[userID]; p != nil && p.busy == in.OrderID {
+			p.busy = ""
+			cleared = true
+		}
+	}
+	b.mu.Unlock()
+	payload, err := json.Marshal(botEventMsg{Type: "botEvent", OrderID: in.OrderID, ArbKey: o.arbKey,
+		Event: in.Event, Bookmaker: in.Bookmaker, Reason: in.Reason})
+	if err != nil {
+		return err
+	}
+	b.reg.sendUser(userID, payload)
+	if cleared {
+		b.changed(userID) // after the botEvent: same goroutine, same send channels, so in order
+	}
+	return nil
+}
+
+func (b *botHub) handleEvent(w http.ResponseWriter, r *http.Request) {
+	var in botEventIn
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&in); err != nil {
+		accounts.WriteError(w, http.StatusBadRequest, "bad_event")
+		return
+	}
+	if _, ok := botEvents[in.Event]; !ok {
+		accounts.WriteError(w, http.StatusBadRequest, "bad_event")
+		return
+	}
+	switch err := b.event(principalOf(r).UserID, in); {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, errUnknownOrder):
+		accounts.WriteError(w, http.StatusNotFound, "unknown_order")
+	default:
+		log.Error().Err(err).Msg("bot event failed")
 		accounts.WriteError(w, http.StatusInternalServerError, "internal")
 	}
 }

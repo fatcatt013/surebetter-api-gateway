@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -480,4 +481,154 @@ func TestBot_BusyClearsWhenBotSocketCloses(t *testing.T) {
 		t.Fatalf("after reconnect: %s", got)
 	}
 	placeOrder(t, srv, token, bot, app)
+}
+
+func postEvent(t *testing.T, srv *httptest.Server, code, body string) (int, string) {
+	t.Helper()
+	return request(t, srv, "POST", "/api/me/bot/events", "", body, bearer(code))
+}
+
+// botClock is a settable clock for botHub.now (read by handler goroutines, hence the lock).
+type botClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *botClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *botClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+func TestBot_EventsRelayedAndFinalClearsBusy(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	app := appSocket(t, srv, token)
+	bot := startBot(t, srv, code, app)
+	id := placeOrder(t, srv, token, bot, app)
+
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"accepted"}`); s != 204 {
+		t.Fatalf("accepted: %d %s", s, b)
+	}
+	m := readJSON(t, app)
+	if m["type"] != "botEvent" || m["order_id"] != id || m["arb_key"] != "arb-1" || m["event"] != "accepted" {
+		t.Fatalf("app got %v", m)
+	}
+	if _, ok := m["reason"]; ok {
+		t.Fatalf("no reason was posted, none may be relayed: %v", m)
+	}
+
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"leg_ready","bookmaker":"tipsport"}`); s != 204 {
+		t.Fatalf("leg_ready: %d %s", s, b)
+	}
+	if m := readJSON(t, app); m["event"] != "leg_ready" || m["bookmaker"] != "tipsport" {
+		t.Fatalf("app got %v", m)
+	}
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":true`) {
+		t.Fatalf("a non-final event must keep the bot busy: %s", got)
+	}
+
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"stopped","bookmaker":"betano","reason":"betano: odds dropped 2.05 → 2.00"}`); s != 204 {
+		t.Fatalf("stopped: %d %s", s, b)
+	}
+	if m := readJSON(t, app); m["event"] != "stopped" || m["bookmaker"] != "betano" || m["reason"] != "betano: odds dropped 2.05 → 2.00" {
+		t.Fatalf("app got %v", m)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app after the final event: %s, want bot (busy cleared)", got)
+	}
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":false`) {
+		t.Fatalf("after the final event: %s", got)
+	}
+	// A final event ends the order: later events for it are unknown.
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"placed"}`); s != 404 || !strings.Contains(b, `"unknown_order"`) {
+		t.Fatalf("event after the final one: %d %s", s, b)
+	}
+	expectNoMessage(t, bot, "the bot socket (never gets botEvent)")
+}
+
+func TestBot_EventErrors(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	ext := newCode(t, srv, token, "extension")
+	app := appSocket(t, srv, token)
+	bot := startBot(t, srv, code, app)
+	id := placeOrder(t, srv, token, bot, app)
+
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"exploded"}`); s != 400 || !strings.Contains(b, `"bad_event"`) {
+		t.Fatalf("unknown event: %d %s", s, b)
+	}
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`"`); s != 400 || !strings.Contains(b, `"bad_event"`) {
+		t.Fatalf("not JSON: %d %s", s, b)
+	}
+	if s, b := postEvent(t, srv, code, `{"order_id":"0123456789abcdef","event":"accepted"}`); s != 404 || !strings.Contains(b, `"unknown_order"`) {
+		t.Fatalf("unknown order: %d %s", s, b)
+	}
+	otherCode := newCode(t, srv, newUser(t, svc, "o@example.com", accounts.RoleUser), "bot")
+	if s, b := postEvent(t, srv, otherCode, `{"order_id":"`+id+`","event":"placed"}`); s != 404 || !strings.Contains(b, `"unknown_order"`) {
+		t.Fatalf("another user's order: %d %s", s, b)
+	}
+	if s, b := request(t, srv, "POST", "/api/me/bot/events", token, `{"order_id":"`+id+`","event":"placed"}`, nil); s != 403 || !strings.Contains(b, `"bot_code_required"`) {
+		t.Fatalf("event with a session: %d %s", s, b)
+	}
+	if s, b := postEvent(t, srv, ext, `{"order_id":"`+id+`","event":"placed"}`); s != 403 || !strings.Contains(b, `"bot_code_required"`) {
+		t.Fatalf("event with an extension code: %d %s", s, b)
+	}
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":true`) {
+		t.Fatalf("rejected events must not end the order: %s", got)
+	}
+}
+
+func TestBot_FinalEventAfterReconnectIsRelayed(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	app := appSocket(t, srv, token)
+	bot := startBot(t, srv, code, app)
+	id := placeOrder(t, srv, token, bot, app)
+
+	bot.Close(websocket.StatusNormalClosure, "")
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on bot disconnect: %s", got)
+	}
+	startBot(t, srv, code, app)
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"placed"}`); s != 204 {
+		t.Fatalf("final event after reconnect: %d %s", s, b)
+	}
+	if m := readJSON(t, app); m["type"] != "botEvent" || m["order_id"] != id || m["arb_key"] != "arb-1" || m["event"] != "placed" {
+		t.Fatalf("app got %v", m)
+	}
+	// The new socket was never busy with this order, so its busy flag does not change.
+	expectNoMessage(t, app, "app socket after the old order's final event")
+}
+
+func TestBot_OrdersForgottenAfterTenMinutes(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	clk := &botClock{t: time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now // before any request touches the hub
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	app := appSocket(t, srv, token)
+	bot := startBot(t, srv, code, app)
+	id := placeOrder(t, srv, token, bot, app)
+
+	clk.advance(orderMemory - time.Second)
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"accepted"}`); s != 204 {
+		t.Fatalf("event within 10 min: %d %s", s, b)
+	}
+	if m := readJSON(t, app); m["event"] != "accepted" {
+		t.Fatalf("app got %v", m)
+	}
+	clk.advance(2 * time.Second)
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"placed"}`); s != 404 || !strings.Contains(b, `"unknown_order"`) {
+		t.Fatalf("event after 10 min: %d %s", s, b)
+	}
 }
