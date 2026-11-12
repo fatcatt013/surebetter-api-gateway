@@ -88,7 +88,7 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 - One `writePump` goroutine per connected client (per-client send channel buffer: 64).
 - Two `sync.RWMutex` on `Hub`: one for the client map (`mu`), one for the odds state (`stateMu`). Keep locks short.
 - `connCount` and `msgSent` are `atomic.Int64` — no lock needed.
-- `botHub.mu` guards the agents' presence and the sent orders. The log rate limiter (`logLimiter`, `bot_logs.go`) has its own mutex. `runPrune` (`bot_prune.go`) deletes logs and screenshots older than 7 days at start and hourly. An order's send to the bot socket happens under it (non-blocking); `bot`/`botEvent` sends to the app sockets happen after it is released.
+- `botHub.mu` guards the agents' presence and the sent orders. The per-user log and screenshot rate limiters (`minuteLimiter`, `bot_logs.go`) have their own mutexes; `botHub.shotsMu` holds a user directory's size check through the screenshot write. `runPrune` (`bot_prune.go`) deletes logs and screenshots older than 7 days at start and hourly, and forgets expired orders every minute. An order's send to the bot socket happens under it (non-blocking); `bot`/`botEvent` sends to the app sockets happen after it is released.
 - An order queued in the microseconds between a bot socket's `writePump` exiting and its `detach` is lost, like on a TCP-dead socket; the app shows "Bot: offline".
 
 ## Production Image
