@@ -13,7 +13,8 @@ import (
 type wsGate struct {
 	acc      *accounts.Service
 	reg      *connRegistry
-	required bool // AUTH_REQUIRED
+	required bool    // AUTH_REQUIRED
+	bots     *botHub // bot presence and orders; newMux creates one when nil
 }
 
 // admit returns the connecting principal: a ?ticket= (extension), else the session cookie of a
@@ -77,4 +78,9 @@ func (g *wsGate) adminOnly(h http.Handler) http.Handler {
 		return h
 	}
 	return g.acc.RequireAdmin(accounts.CSRF(h))
+}
+
+// botAllowed reports whether p may open the bot socket (/ws?bot=1): only a bot code's principal.
+func (g *wsGate) botAllowed(p accounts.Principal) bool {
+	return g != nil && g.bots != nil && p.UserID != 0 && p.CodeID != 0 && p.CodeKind == accounts.KindBot
 }

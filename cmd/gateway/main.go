@@ -447,6 +447,7 @@ type Client struct {
 	principal accounts.Principal // zero when AUTH_REQUIRED is off and nobody signed in
 	cid       string             // client id from ?cid=; a state write skips the socket that made it
 	notify    bool               // receives {"type":"state"} messages (the /ws feed only)
+	bot       bool               // the user's bot socket (/ws?bot=1): gets orders, never bot/botEvent messages
 }
 
 func (c *Client) writePump(ctx context.Context) {
@@ -597,8 +598,16 @@ func wsHandler[T any](hub *StateHub[T], gate *wsGate, notify bool) http.HandlerF
 			return
 		}
 
-		if notify && r.URL.Query().Get("feed") == "0" && principal.UserID == 0 {
-			// Feed-off sockets only carry per-user state messages; an anonymous one can never receive anything.
+		q := r.URL.Query()
+		// /ws?bot=1 is the user's betting bot: only a bot code may open it, and it never gets the feed.
+		botSocket := notify && q.Get("bot") == "1"
+		if botSocket && !gate.botAllowed(principal) {
+			http.Error(w, "bot code required", http.StatusForbidden)
+			return
+		}
+		feedOff := notify && (q.Get("feed") == "0" || botSocket)
+		if feedOff && principal.UserID == 0 {
+			// Feed-off sockets only carry per-user messages; an anonymous one can never receive anything.
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -618,10 +627,8 @@ func wsHandler[T any](hub *StateHub[T], gate *wsGate, notify bool) http.HandlerF
 		// ctx as soon as the peer closes or the connection breaks.
 		ctx := conn.CloseRead(r.Context())
 
-		q := r.URL.Query()
 		client := &Client{conn: conn, send: make(chan []byte, 64), principal: principal, notify: notify,
-			cid: accounts.ValidClientID(q.Get("cid"))}
-		feedOff := notify && q.Get("feed") == "0"
+			cid: accounts.ValidClientID(q.Get("cid")), bot: botSocket}
 		if !feedOff {
 			hub.Register(client)
 			defer hub.Unregister(client)
@@ -631,6 +638,10 @@ func wsHandler[T any](hub *StateHub[T], gate *wsGate, notify bool) http.HandlerF
 		if !gate.stillValid(principal) {
 			conn.Close(websocket.StatusPolicyViolation, "signed out")
 			return
+		}
+		if botSocket {
+			gate.bots.attach(client)
+			defer gate.bots.detach(client)
 		}
 
 		if !feedOff {
@@ -680,6 +691,9 @@ func metricsHandler(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier) http.Ha
 // not swallow "/ws/value". tg may be nil (Telegram off); gate may be nil (no accounts: all open).
 func newMux(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier, gate *wsGate) *http.ServeMux {
 	mux := http.NewServeMux()
+	if gate != nil && gate.acc != nil && gate.bots == nil {
+		gate.bots = newBotHub(gate.reg) // tests build wsGate literals without one
+	}
 	mux.HandleFunc("/ws", wsHandler(hub, gate, true))
 	mux.HandleFunc("/ws/value", wsHandler(valueHub, gate, false))
 	mux.Handle("/api/arb/snapshot", gate.protect(snapshotHandler(hub)))
@@ -740,7 +754,7 @@ func main() {
 	if !cfg.AuthRequired {
 		log.Warn().Msg("AUTH_REQUIRED=false: the feed, the snapshots and the Telegram settings are open to anyone")
 	}
-	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired}
+	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired, bots: newBotHub(reg)}
 
 	hub := NewHub(cfg)
 	valueHub := NewValueHub(cfg)

@@ -79,3 +79,22 @@ func (r *connRegistry) NotifyState(userID int64, key string, exceptClient string
 		}
 	}
 }
+
+// sendUser sends payload to the user's /ws sockets except the bot socket (the app's tabs and the
+// extension). A full send buffer drops the message.
+func (r *connRegistry) sendUser(userID int64, payload []byte) {
+	if r == nil || userID == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for c := range r.clients {
+		if !c.notify || c.bot || c.principal.UserID != userID {
+			continue
+		}
+		select {
+		case c.send <- payload:
+		default:
+		}
+	}
+}
