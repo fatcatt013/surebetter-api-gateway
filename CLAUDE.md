@@ -8,7 +8,7 @@ Go WebSocket gateway. Subscribes to `arb.opportunities` on NATS JetStream, maint
 
 ## Structure
 
-The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
+The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal, `bot.go`: bot presence, orders and the `/api/me/bot*` routes). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
 
 Key types in that file:
 - `Config` — env vars loaded at startup
@@ -17,6 +17,7 @@ Key types in that file:
 - `Client` — single WebSocket connection with a send channel
 - `ArbOpportunity` / `StakeAllocation` — mirrors the Rust arb-engine structs
 - `WSMessage` / `PatchOp` — WebSocket protocol types (RFC 6902 JSON Patch)
+- `botHub` (`bot.go`) — per-user bot presence (bot socket, last status, busy order) and sent orders (10 min), in memory
 
 ## Running & Building
 
@@ -44,6 +45,7 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 | `GET /ws/value` | WebSocket upgrade — streams value-bet deltas (independent hub; same protocol, path prefix `/value/{id}`) |
 | `GET /api/value/snapshot` | Full current value-bet state as JSON (`{id: ValueBet}`) |
 | `/api/auth/*`, `/api/me/*`, `/api/admin/*` | Accounts API — see `../surebetter-common/docs/api-reference.md` → Accounts |
+| `/api/me/bot`, `/api/me/bot/{status,orders,events}` | Bot orders — see `../surebetter-common/docs/api-reference.md` → Bot orders |
 | `GET /health` | `{"status":"ok","service":"api-gateway","version":"dev"}` |
 | `GET /metrics` | Prometheus counters: `gateway_ws_clients_connected`, `gateway_messages_sent_total` |
 
@@ -52,8 +54,12 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 1. On connect: full snapshot → `{"type":"snapshot","data":{...}}`
 2. On each NATS message: RFC 6902 patch → `{"type":"patch","ops":[{"op":"replace","path":"/arb/{eventID}:{marketType}:{line:.2f}","value":{...}}]}`
 3. Keepalive: `{"type":"ping"}` every 20s (Chrome stops an idle extension service worker after 30 s)
+4. Bot presence changed: `{"type":"bot"}` to the user's non-bot `/ws` sockets (the app re-fetches `GET /api/me/bot`)
+5. Bot order progress: `{"type":"botEvent","order_id","arb_key","event","bookmaker"?,"reason"?}` to the same sockets
 
 `/ws?cid=<id>` tags a socket with a client id (max 64 chars, `[A-Za-z0-9_-]`); a `PUT /api/me/state/{key}` sent with the same `X-Client-Id` header skips that socket but notifies the user's other sockets (`{"type":"state","key":...}`). `/ws?feed=0` (arb `/ws` only) gets no snapshot or patches, just `state` messages and pings.
+
+`/ws?ticket=…&feed=0&bot=1` is the user's bot socket: only a ticket issued to a bot code (kind `bot`) may open it (403 otherwise); feed always off; one per user (a new one closes the old with 1000). It receives `{"type":"order","order":{…}}` from `POST /api/me/bot/orders` and never `bot`/`botEvent`.
 
 Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before broadcasting.
 
@@ -82,6 +88,7 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 - One `writePump` goroutine per connected client (per-client send channel buffer: 64).
 - Two `sync.RWMutex` on `Hub`: one for the client map (`mu`), one for the odds state (`stateMu`). Keep locks short.
 - `connCount` and `msgSent` are `atomic.Int64` — no lock needed.
+- `botHub.mu` guards bot presence and sent orders. An order's send to the bot socket happens under it (non-blocking); `bot`/`botEvent` sends to the app sockets happen after it is released.
 
 ## Production Image
 
