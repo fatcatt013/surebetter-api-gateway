@@ -75,6 +75,30 @@ var migrations = []string{
 	);`,
 	// 2: code kinds. A bot code can also open the bot socket (/ws?bot=1) and post bot status and events.
 	`ALTER TABLE extension_codes ADD COLUMN kind TEXT NOT NULL DEFAULT 'extension' CHECK (kind IN ('extension', 'bot'));`,
+	// 3: bot agents (one per bot code that has connected) and their log lines (kept 7 days).
+	`CREATE TABLE bot_agents (
+		code_id       INTEGER PRIMARY KEY REFERENCES extension_codes (id),
+		user_id       INTEGER NOT NULL REFERENCES users (id),
+		version       TEXT    NOT NULL DEFAULT '',
+		host_name     TEXT    NOT NULL DEFAULT '',
+		windows_json  TEXT    NOT NULL DEFAULT '[]',
+		first_seen_at INTEGER NOT NULL,
+		last_seen_at  INTEGER NOT NULL
+	);
+	CREATE TABLE bot_logs (
+		id        INTEGER PRIMARY KEY,
+		user_id   INTEGER NOT NULL REFERENCES users (id),
+		code_id   INTEGER NOT NULL,
+		ts        INTEGER NOT NULL,
+		level     TEXT    NOT NULL CHECK (level IN ('info', 'warn', 'error')),
+		window_id TEXT    NOT NULL DEFAULT '',
+		order_id  TEXT    NOT NULL DEFAULT '',
+		step      TEXT    NOT NULL DEFAULT '',
+		msg       TEXT    NOT NULL,
+		detail    TEXT    NOT NULL DEFAULT ''
+	);
+	CREATE INDEX bot_logs_user_id ON bot_logs (user_id, id);
+	CREATE INDEX bot_logs_ts ON bot_logs (ts);`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)
