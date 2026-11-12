@@ -31,6 +31,7 @@ func newBotServer(t *testing.T) (*httptest.Server, *accounts.Service, *botHub) {
 	reg := newConnRegistry()
 	svc.SetConnections(reg)
 	bots := newBotHub(reg, svc)
+	bots.shotsDir = filepath.Join(t.TempDir(), "bot-screenshots")
 	cfg := Config{SnapshotCacheMs: 500, MaxClients: 10}
 	srv := httptest.NewServer(newMux(NewHub(cfg), NewValueHub(cfg), nil, &wsGate{acc: svc, reg: reg, required: true, bots: bots}))
 	t.Cleanup(srv.Close)

@@ -80,6 +80,8 @@ type botHub struct {
 	agents map[int64]map[int64]*botPresence // user id → code id → presence
 	orders map[string]botOrder              // order id → order, until its final event or orderMemory
 	logs   logLimiter                       // POST /api/me/bot/logs lines per code per minute
+	// shotsDir holds screenshots as <user id>/<id>.jpg (<data dir>/bot-screenshots); "" = none.
+	shotsDir string
 }
 
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
@@ -170,6 +172,8 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("POST /api/me/bot/logs", acc.RequireBotCode(http.HandlerFunc(b.handlePostLogs)))
 	mux.Handle("GET /api/me/bot/logs", acc.RequireSession(http.HandlerFunc(b.handleGetLogs)))
 	mux.Handle("GET /api/me/bot/logs.txt", acc.RequireSession(http.HandlerFunc(b.handleLogsText)))
+	mux.Handle("POST /api/me/bot/screenshots", acc.RequireBotCode(http.HandlerFunc(b.handlePostShot)))
+	mux.Handle("GET /api/me/bot/screenshots/{id}", acc.RequireSession(http.HandlerFunc(b.handleGetShot)))
 	return accounts.CSRF(mux)
 }
 

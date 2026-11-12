@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -758,7 +759,9 @@ func main() {
 	if !cfg.AuthRequired {
 		log.Warn().Msg("AUTH_REQUIRED=false: the feed, the snapshots and the Telegram settings are open to anyone")
 	}
-	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired, bots: newBotHub(reg, acc)}
+	bots := newBotHub(reg, acc)
+	bots.shotsDir = filepath.Join(filepath.Dir(cfg.AccountsDB), "bot-screenshots") // same volume as the DB
+	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired, bots: bots}
 
 	hub := NewHub(cfg)
 	valueHub := NewValueHub(cfg)
