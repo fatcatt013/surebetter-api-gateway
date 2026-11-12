@@ -185,11 +185,12 @@ func (s *Service) handleListCodes(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleCreateCode(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Name string `json:"name"`
+		Kind string `json:"kind"`
 	}
 	if !decodeJSON(w, r, &in, smallBody) {
 		return
 	}
-	c, err := s.CreateExtensionCode(principal(r).UserID, in.Name)
+	c, err := s.CreateCode(principal(r).UserID, in.Name, in.Kind)
 	if err != nil {
 		writeServiceError(w, err)
 		return

@@ -73,6 +73,8 @@ var migrations = []string{
 		updated_at INTEGER NOT NULL,
 		PRIMARY KEY (user_id, key)
 	);`,
+	// 2: code kinds. A bot code can also open the bot socket (/ws?bot=1) and post bot status and events.
+	`ALTER TABLE extension_codes ADD COLUMN kind TEXT NOT NULL DEFAULT 'extension' CHECK (kind IN ('extension', 'bot'));`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

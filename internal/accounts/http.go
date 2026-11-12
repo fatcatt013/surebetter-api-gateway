@@ -218,7 +218,7 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
 	case errors.Is(err, ErrInvalidEmail), errors.Is(err, ErrWeakPassword), errors.Is(err, ErrResetInvalid),
 		errors.Is(err, ErrUnknownKey), errors.Is(err, ErrBadValue), errors.Is(err, ErrBadName),
-		errors.Is(err, ErrBadRole), errors.Is(err, ErrSelf):
+		errors.Is(err, ErrBadRole), errors.Is(err, ErrSelf), errors.Is(err, ErrBadKind):
 		writeErr(w, http.StatusBadRequest, err.Error())
 	default:
 		internalError(w, err)

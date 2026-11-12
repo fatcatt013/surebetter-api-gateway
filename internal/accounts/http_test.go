@@ -269,3 +269,25 @@ func TestRegister_JunkInviteDoesNotHash(t *testing.T) {
 		t.Fatalf("junk reset code: %v", err)
 	}
 }
+
+func TestHTTP_CodeKind(t *testing.T) {
+	s, _, _ := newTestService(t)
+	a := newAPI(t, s)
+	c := newClient()
+	inv, _ := s.CreateInvite(0, RoleUser)
+	a.call(c, "POST", "/api/auth/register", map[string]string{"code": inv.Code, "email": "u@example.com", "password": testPassword}, nil)
+
+	if code, b := a.call(c, "POST", "/api/me/extension-codes", map[string]string{"name": "Bot PC", "kind": "bot"}, nil); code != 201 || obj(t, b)["kind"] != "bot" {
+		t.Fatalf("create bot code: %d %s", code, b)
+	}
+	if code, b := a.call(c, "POST", "/api/me/extension-codes", map[string]string{"name": "Laptop"}, nil); code != 201 || obj(t, b)["kind"] != "extension" {
+		t.Fatalf("kind omitted: %d %s", code, b)
+	}
+	if code, b := a.call(c, "POST", "/api/me/extension-codes", map[string]string{"kind": "robot"}, nil); code != 400 || obj(t, b)["error"] != "bad_kind" {
+		t.Fatalf("bad kind: %d %s", code, b)
+	}
+	code, b := a.call(c, "GET", "/api/me/extension-codes", nil, nil)
+	if code != 200 || !strings.Contains(string(b), `"kind":"bot"`) || !strings.Contains(string(b), `"kind":"extension"`) {
+		t.Fatalf("list must carry kind: %d %s", code, b)
+	}
+}

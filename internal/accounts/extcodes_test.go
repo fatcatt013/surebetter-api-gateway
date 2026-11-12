@@ -54,3 +54,35 @@ func TestExtensionCodes(t *testing.T) {
 		t.Fatal("a disabled user's code must not authenticate")
 	}
 }
+
+func TestExtensionCodes_Kind(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+
+	ext, err := s.CreateCode(user.UserID, "", "")
+	if err != nil || ext.Kind != KindExtension || ext.Name != "Extension" {
+		t.Fatalf("default kind: %+v %v", ext, err)
+	}
+	bot, err := s.CreateCode(user.UserID, "", KindBot)
+	if err != nil || bot.Kind != KindBot || bot.Name != "Bot" || !strings.HasPrefix(bot.Code, "SBX-") {
+		t.Fatalf("bot code: %+v %v", bot, err)
+	}
+	if _, err := s.CreateCode(user.UserID, "X", "robot"); !errors.Is(err, ErrBadKind) {
+		t.Fatalf("unknown kind: %v", err)
+	}
+	if old, _ := s.CreateExtensionCode(user.UserID, "Laptop"); old.Kind != KindExtension {
+		t.Fatalf("CreateExtensionCode must make an extension code, got %q", old.Kind)
+	}
+
+	list, err := s.ListExtensionCodes(user.UserID)
+	if err != nil || len(list) != 3 {
+		t.Fatalf("list: %+v %v", list, err)
+	}
+	kinds := map[int64]string{}
+	for _, c := range list {
+		kinds[c.ID] = c.Kind
+	}
+	if kinds[ext.ID] != KindExtension || kinds[bot.ID] != KindBot {
+		t.Fatalf("listed kinds: %v", kinds)
+	}
+}

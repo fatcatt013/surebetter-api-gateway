@@ -7,10 +7,18 @@ import (
 	"unicode/utf8"
 )
 
+// Code kinds. A bot code can do everything an extension code can (read-only), plus open the bot
+// socket (/ws?bot=1) and post bot status and events.
+const (
+	KindExtension = "extension"
+	KindBot       = "bot"
+)
+
 // NewExtCode is returned once, when a code is created.
 type NewExtCode struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
+	Kind string `json:"kind"`
 	Code string `json:"code"`
 	Hint string `json:"hint"`
 }
@@ -19,16 +27,17 @@ type NewExtCode struct {
 type ExtCodeInfo struct {
 	ID         int64  `json:"id"`
 	Name       string `json:"name"`
+	Kind       string `json:"kind"`
 	Hint       string `json:"hint"`
 	CreatedAt  int64  `json:"created_at"`
 	LastUsedAt *int64 `json:"last_used_at"`
 	RevokedAt  *int64 `json:"revoked_at"`
 }
 
-func cleanName(n string) (string, error) {
+func cleanName(n, fallback string) (string, error) {
 	n = strings.TrimSpace(n)
 	if n == "" {
-		n = "Extension"
+		n = fallback
 	}
 	if utf8.RuneCountInString(n) > 40 {
 		return "", ErrBadName
@@ -36,15 +45,30 @@ func cleanName(n string) (string, error) {
 	return n, nil
 }
 
-// CreateExtensionCode makes a new code for userID's extension (one per browser or bot profile).
+// CreateExtensionCode makes a new extension-kind code for userID (one per browser profile).
 func (s *Service) CreateExtensionCode(userID int64, name string) (NewExtCode, error) {
-	name, err := cleanName(name)
+	return s.CreateCode(userID, name, KindExtension)
+}
+
+// CreateCode makes a new code of kind ("" or "extension", or "bot") for userID. An empty name
+// becomes "Extension" or "Bot".
+func (s *Service) CreateCode(userID int64, name, kind string) (NewExtCode, error) {
+	fallback := "Extension"
+	switch kind {
+	case "", KindExtension:
+		kind = KindExtension
+	case KindBot:
+		fallback = "Bot"
+	default:
+		return NewExtCode{}, ErrBadKind
+	}
+	name, err := cleanName(name, fallback)
 	if err != nil {
 		return NewExtCode{}, err
 	}
 	code := newExtensionCode()
-	res, err := s.db.Exec(`INSERT INTO extension_codes (user_id, name, code_hash, hint, created_at) VALUES (?, ?, ?, ?, ?)`,
-		userID, name, hashSecret(code), hint(code), s.nowMs())
+	res, err := s.db.Exec(`INSERT INTO extension_codes (user_id, name, kind, code_hash, hint, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		userID, name, kind, hashSecret(code), hint(code), s.nowMs())
 	if err != nil {
 		return NewExtCode{}, err
 	}
@@ -52,12 +76,12 @@ func (s *Service) CreateExtensionCode(userID int64, name string) (NewExtCode, er
 	if err != nil {
 		return NewExtCode{}, err
 	}
-	return NewExtCode{ID: id, Name: name, Code: code, Hint: hint(code)}, nil
+	return NewExtCode{ID: id, Name: name, Kind: kind, Code: code, Hint: hint(code)}, nil
 }
 
-// ListExtensionCodes returns userID's codes, newest first, revoked ones included.
+// ListExtensionCodes returns userID's codes (both kinds), newest first, revoked ones included.
 func (s *Service) ListExtensionCodes(userID int64) ([]ExtCodeInfo, error) {
-	rows, err := s.db.Query(`SELECT id, name, hint, created_at, last_used_at, revoked_at FROM extension_codes
+	rows, err := s.db.Query(`SELECT id, name, kind, hint, created_at, last_used_at, revoked_at FROM extension_codes
 		WHERE user_id = ? ORDER BY created_at DESC, id DESC`, userID)
 	if err != nil {
 		return nil, err
@@ -67,7 +91,7 @@ func (s *Service) ListExtensionCodes(userID int64) ([]ExtCodeInfo, error) {
 	for rows.Next() {
 		var c ExtCodeInfo
 		var used, revoked sql.NullInt64
-		if err := rows.Scan(&c.ID, &c.Name, &c.Hint, &c.CreatedAt, &used, &revoked); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Kind, &c.Hint, &c.CreatedAt, &used, &revoked); err != nil {
 			return nil, err
 		}
 		c.LastUsedAt, c.RevokedAt = nullable(used), nullable(revoked)

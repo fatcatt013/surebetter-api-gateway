@@ -58,6 +58,7 @@ var (
 	ErrTooLarge           = errors.New("too_large")
 	ErrBadName            = errors.New("invalid_name")
 	ErrBadRole            = errors.New("invalid_role")
+	ErrBadKind            = errors.New("bad_kind")
 )
 
 // LockedError: too many failures from this IP or for this email; try again after RetryAfter.
