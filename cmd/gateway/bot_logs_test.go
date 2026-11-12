@@ -305,3 +305,31 @@ func TestBotLogs_QueryReadsOnlySevenDays(t *testing.T) {
 		t.Fatalf("without q every stored line is listed: %v", got)
 	}
 }
+
+// Every logs.txt field is one line: a line break in any of them becomes a space.
+func TestBotLogs_TextFieldsHaveNoLineBreaks(t *testing.T) {
+	l := accounts.BotLog{TS: logTS, Agent: "Home\nPC", WindowID: "fortuna\r1", OrderID: "c81e\r\n55a0", Step: "check\nOdds",
+		Level: "warn\n", Msg: "odds\ndropped"}
+	want := "2026-11-12T12:00:00.000Z  Home PC · fortuna 1  c81e 55a0  check Odds  warn   odds dropped"
+	if got := logText(l); got != want {
+		t.Fatalf("logText:\n got %q\nwant %q", got, want)
+	}
+}
+
+// A full batch can exceed 1 MiB as JSON (escaped multi-byte messages and details), so the body cap is 2 MiB.
+func TestBotLogs_BodyUpTo2MiB(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	fixClock(bots)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	line := logLine(logTS, "info", "", "", "", "x")
+	padded := func(size int) string { // whitespace inside the object, so the decoder must read all of it
+		return `{"lines":[` + strings.Repeat(" ", size-len(line)-len(`{"lines":[]}`)) + line + `]}`
+	}
+	if s, b := postLogs(t, srv, code, padded(2<<20)); s != 204 {
+		t.Fatalf("2 MiB body: %d %s", s, b)
+	}
+	if s, b := postLogs(t, srv, code, padded(2<<20+1)); s != 400 || !strings.Contains(b, `"bad_logs"`) {
+		t.Fatalf("2 MiB + 1 byte: %d %s", s, b)
+	}
+}

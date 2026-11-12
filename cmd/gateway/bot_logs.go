@@ -41,9 +41,10 @@ type logDetail struct {
 var logLevels = map[string]bool{"info": true, "warn": true, "error": true}
 
 const (
-	maxLogBatch    = 200  // lines per POST
-	maxDetailBytes = 2000 // stored detail JSON
-	logsPerMinute  = 2000 // lines per code per minute
+	maxLogBody     = 2 << 20 // POST body bytes: 200 lines of escaped 500-char messages and details can pass 1 MiB
+	maxLogBatch    = 200     // lines per POST
+	maxDetailBytes = 2000    // stored detail JSON
+	logsPerMinute  = 2000    // lines per code per minute
 )
 
 // logFuture is how far ahead of the gateway's clock a line's ts may be (agent clock skew).
@@ -123,7 +124,7 @@ func (b *botHub) handlePostLogs(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Lines []logLineIn `json:"lines"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxLogBody)).Decode(&in); err != nil {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_logs")
 		return
 	}
@@ -218,20 +219,22 @@ func (b *botHub) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 var lineBreaks = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ")
 
 // logText is one logs.txt line: `<ISO time>  <agent> · <window>  <order>  <step>  <level>  <msg>`,
-// time in UTC with milliseconds, an agent-wide line shows just the agent, an empty order or step is "-".
+// time in UTC with milliseconds, an agent-wide line shows just the agent, an empty order or step is
+// "-". A line break in any field becomes a space, so one log is always one line.
 func logText(l accounts.BotLog) string {
-	where := l.Agent
+	one := lineBreaks.Replace
+	where := one(l.Agent)
 	if l.WindowID != "" {
-		where += " · " + l.WindowID
+		where += " · " + one(l.WindowID)
 	}
 	dash := func(s string) string {
 		if s == "" {
 			return "-"
 		}
-		return s
+		return one(s)
 	}
 	return fmt.Sprintf("%s  %s  %s  %s  %s  %s", time.UnixMilli(l.TS).UTC().Format("2006-01-02T15:04:05.000Z07:00"),
-		where, dash(l.OrderID), dash(l.Step), l.Level, lineBreaks.Replace(l.Msg))
+		where, dash(l.OrderID), dash(l.Step), one(l.Level), one(l.Msg))
 }
 
 // handleLogsText serves every line matching the filters (after, before and limit are ignored), oldest
