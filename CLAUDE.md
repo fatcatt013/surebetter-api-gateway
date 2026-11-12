@@ -8,7 +8,7 @@ Go WebSocket gateway. Subscribes to `arb.opportunities` on NATS JetStream, maint
 
 ## Structure
 
-The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal, `bot.go`: bot presence, orders and the `/api/me/bot*` routes). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
+The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal, `bot.go`: bot agents' presence, orders, events and the `/api/me/bot*` routes, `bot_agents.go`: agent status and the Fleet list, `bot_logs.go`: agent logs, `bot_shots.go`: screenshots, `bot_prune.go`: 7-day retention). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state, bot agents and bot logs) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
 
 Key types in that file:
 - `Config` — env vars loaded at startup
@@ -17,7 +17,7 @@ Key types in that file:
 - `Client` — single WebSocket connection with a send channel
 - `ArbOpportunity` / `StakeAllocation` — mirrors the Rust arb-engine structs
 - `WSMessage` / `PatchOp` — WebSocket protocol types (RFC 6902 JSON Patch)
-- `botHub` (`bot.go`) — per-user bot presence (bot socket, last status, busy order) and sent orders (10 min), in memory
+- `botHub` (`bot.go`) — per user, the bot agents online (one socket per bot code: last status, busy order, idle since) and the sent orders (10 min), in memory; the agent registry and logs are in the accounts DB, screenshots in `bot-screenshots/` next to it
 
 ## Running & Building
 
@@ -45,7 +45,7 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 | `GET /ws/value` | WebSocket upgrade — streams value-bet deltas (independent hub; same protocol, path prefix `/value/{id}`) |
 | `GET /api/value/snapshot` | Full current value-bet state as JSON (`{id: ValueBet}`) |
 | `/api/auth/*`, `/api/me/*`, `/api/admin/*` | Accounts API — see `../surebetter-common/docs/api-reference.md` → Accounts |
-| `/api/me/bot`, `/api/me/bot/{status,orders,events}` | Bot orders — see `../surebetter-common/docs/api-reference.md` → Bot orders |
+| `/api/me/bot`, `/api/me/bot/{status,orders,events,agents,logs,logs.txt,screenshots}` | Bot orders and the Bots controller — see `../surebetter-common/docs/api-reference.md` → Bot orders, Bots controller |
 | `GET /health` | `{"status":"ok","service":"api-gateway","version":"dev"}` |
 | `GET /metrics` | Prometheus counters: `gateway_ws_clients_connected`, `gateway_messages_sent_total` |
 
@@ -54,12 +54,12 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 1. On connect: full snapshot → `{"type":"snapshot","data":{...}}`
 2. On each NATS message: RFC 6902 patch → `{"type":"patch","ops":[{"op":"replace","path":"/arb/{eventID}:{marketType}:{line:.2f}","value":{...}}]}`
 3. Keepalive: `{"type":"ping"}` every 20s (Chrome stops an idle extension service worker after 30 s)
-4. Bot presence changed: `{"type":"bot"}` to the user's non-bot `/ws` sockets (the app re-fetches `GET /api/me/bot`)
+4. Bot presence changed: `{"type":"bot"}` to the user's non-bot `/ws` sockets when an agent's online state, books, dry run, busy, version, host name or windows change, not for CPU/RAM alone (the app re-fetches `GET /api/me/bot`)
 5. Bot order progress: `{"type":"botEvent","order_id","arb_key","event","bookmaker"?,"reason"?}` to the same sockets
 
 `/ws?cid=<id>` tags a socket with a client id (max 64 chars, `[A-Za-z0-9_-]`); a `PUT /api/me/state/{key}` sent with the same `X-Client-Id` header skips that socket but notifies the user's other sockets (`{"type":"state","key":...}`). `/ws?feed=0` (arb `/ws` only) gets no snapshot or patches, just `state` messages and pings.
 
-`/ws?ticket=…&feed=0&bot=1` is the user's bot socket: only a ticket issued to a bot code (kind `bot`) may open it (403 otherwise); feed always off; one per user (a new one closes the old with 1000). It receives `{"type":"order","order":{…}}` from `POST /api/me/bot/orders` and never `bot`/`botEvent`.
+`/ws?ticket=…&feed=0&bot=1` is the user's bot socket: only a ticket issued to a bot code (kind `bot`) may open it (403 otherwise); feed always off; one per bot code, several codes (agents) of one user may be online (a new socket with the same code closes the older one with 1000). It receives the orders the gateway picked its agent for (`{"type":"order","order":{…}}` from `POST /api/me/bot/orders`) and never `bot`/`botEvent`.
 
 Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before broadcasting.
 
@@ -74,7 +74,7 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 | `SNAPSHOT_CACHE_MS` | `500` | Snapshot JSON cached to avoid re-marshaling |
 | `BROADCAST_BATCH_MS` | `50` | Delta batching window |
 | `JWT_SECRET` | `""` | Unused by the gateway (accounts use opaque session tokens, not JWTs); compose still requires it |
-| `ACCOUNTS_DB` | `/data/accounts.db` | SQLite file for users, invites, sessions, reset codes, extension codes and per-user state. Compose mounts the `surebetter-gateway-data` volume at `/data`. Back it up (see `docs/DEPLOY.md`) |
+| `ACCOUNTS_DB` | `/data/accounts.db` | SQLite file for users, invites, sessions, reset codes, extension codes, per-user state, bot agents and bot logs. Bot screenshots go in `bot-screenshots/` in the same directory (kept 7 days). Compose mounts the `surebetter-gateway-data` volume at `/data`. Back it up (see `docs/DEPLOY.md`) |
 | `AUTH_REQUIRED` | `true` (compose: `false` until the frontend has login) | `true`: `/ws`, `/ws/value` and both snapshots need a session cookie or an extension code (both sockets also accept a `?ticket=`); `/api/telegram/*` needs an admin session. Only the exact value `false` (trimmed, case-insensitive) turns it off; anything else, typos included, means required. `false`: those stay open; the account API works either way |
 | `LOG_LEVEL` | `info` | zerolog levels: debug/info/warn/error |
 | `EVICTION_TTL_S` | `120` | Seconds since last update before an entry is evicted |
@@ -88,7 +88,7 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 - One `writePump` goroutine per connected client (per-client send channel buffer: 64).
 - Two `sync.RWMutex` on `Hub`: one for the client map (`mu`), one for the odds state (`stateMu`). Keep locks short.
 - `connCount` and `msgSent` are `atomic.Int64` — no lock needed.
-- `botHub.mu` guards bot presence and sent orders. An order's send to the bot socket happens under it (non-blocking); `bot`/`botEvent` sends to the app sockets happen after it is released.
+- `botHub.mu` guards the agents' presence and the sent orders. The log rate limiter (`logLimiter`, `bot_logs.go`) has its own mutex. `runPrune` (`bot_prune.go`) deletes logs and screenshots older than 7 days at start and hourly. An order's send to the bot socket happens under it (non-blocking); `bot`/`botEvent` sends to the app sockets happen after it is released.
 - An order queued in the microseconds between a bot socket's `writePump` exiting and its `detach` is lost, like on a TCP-dead socket; the app shows "Bot: offline".
 
 ## Production Image
