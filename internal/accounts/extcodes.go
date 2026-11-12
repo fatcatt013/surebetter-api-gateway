@@ -123,10 +123,10 @@ func (s *Service) AuthenticateCode(code string) (Principal, bool, error) {
 	}
 	var p Principal
 	var lastUsed, onboarded, disabled sql.NullInt64
-	err := s.db.QueryRow(`SELECT c.id, c.name, c.last_used_at, u.id, u.email, u.role, u.onboarded_at, u.disabled_at
+	err := s.db.QueryRow(`SELECT c.id, c.name, c.kind, c.last_used_at, u.id, u.email, u.role, u.onboarded_at, u.disabled_at
 		FROM extension_codes c JOIN users u ON u.id = c.user_id
 		WHERE c.code_hash = ? AND c.revoked_at IS NULL`, hashSecret(code)).
-		Scan(&p.CodeID, &p.CodeName, &lastUsed, &p.UserID, &p.Email, &p.Role, &onboarded, &disabled)
+		Scan(&p.CodeID, &p.CodeName, &p.CodeKind, &lastUsed, &p.UserID, &p.Email, &p.Role, &onboarded, &disabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Principal{}, false, nil
 	}

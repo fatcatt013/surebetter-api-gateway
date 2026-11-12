@@ -86,3 +86,25 @@ func TestExtensionCodes_Kind(t *testing.T) {
 		t.Fatalf("listed kinds: %v", kinds)
 	}
 }
+
+func TestCodeKind_PrincipalAndTicket(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	bot, _ := s.CreateCode(user.UserID, "Bot", KindBot)
+	ext, _ := s.CreateCode(user.UserID, "Laptop", KindExtension)
+
+	p, ok, err := s.AuthenticateCode(bot.Code)
+	if err != nil || !ok || p.CodeKind != KindBot || p.CodeID != bot.ID {
+		t.Fatalf("bot code principal: %+v %v %v", p, ok, err)
+	}
+	if e, _, _ := s.AuthenticateCode(ext.Code); e.CodeKind != KindExtension {
+		t.Fatalf("extension code principal kind = %q", e.CodeKind)
+	}
+	if user.CodeKind != "" {
+		t.Fatalf("a session principal has no code kind, got %q", user.CodeKind)
+	}
+	got, ok := s.RedeemTicket(s.IssueTicket(p))
+	if !ok || got.CodeKind != KindBot || got.CodeID != bot.ID {
+		t.Fatalf("a ticket must remember the code kind: %+v %v", got, ok)
+	}
+}

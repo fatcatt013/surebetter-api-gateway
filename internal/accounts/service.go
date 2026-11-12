@@ -22,6 +22,7 @@ type Principal struct {
 	SessionID int64  `json:"-"`
 	CodeID    int64  `json:"-"`
 	CodeName  string `json:"code_name,omitempty"`
+	CodeKind  string `json:"-"` // KindExtension or KindBot when CodeID is set; "" for a session
 }
 
 func (p Principal) IsAdmin() bool { return p.Role == RoleAdmin }

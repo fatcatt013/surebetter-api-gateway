@@ -91,6 +91,18 @@ func (s *Service) RequireAdmin(next http.Handler) http.Handler {
 	}))
 }
 
+// RequireBotCode admits only a bot code (Authorization: Bearer SBX-… of kind "bot"). Sessions and
+// extension codes get 403 bot_code_required.
+func (s *Service) RequireBotCode(next http.Handler) http.Handler {
+	return s.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if p := principal(r); p.CodeID == 0 || p.CodeKind != KindBot {
+			writeErr(w, http.StatusForbidden, "bot_code_required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
+}
+
 // SameHost reports whether origin (an Origin header value) names the request's host. Ports are
 // ignored: nginx forwards Host without the port, and another port on the same host is the same site.
 func SameHost(origin string, r *http.Request) bool {
@@ -188,6 +200,16 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// WriteJSON, WriteError and DecodeJSON let routes outside this package (cmd/gateway's bot API)
+// answer exactly like the accounts API.
+func WriteJSON(w http.ResponseWriter, code int, v any) { writeJSON(w, code, v) }
+
+func WriteError(w http.ResponseWriter, code int, msg string) { writeErr(w, code, msg) }
+
+func DecodeJSON(w http.ResponseWriter, r *http.Request, v any, max int64) bool {
+	return decodeJSON(w, r, v, max)
 }
 
 func internalError(w http.ResponseWriter, err error) {

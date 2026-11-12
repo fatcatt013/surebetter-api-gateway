@@ -291,3 +291,30 @@ func TestHTTP_CodeKind(t *testing.T) {
 		t.Fatalf("list must carry kind: %d %s", code, b)
 	}
 }
+
+func TestHTTP_RequireBotCode(t *testing.T) {
+	s, _, _ := newTestService(t)
+	srv := httptest.NewServer(s.RequireBotCode(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p, _ := PrincipalFrom(r.Context())
+		WriteJSON(w, http.StatusOK, map[string]string{"kind": p.CodeKind})
+	})))
+	t.Cleanup(srv.Close)
+	a := &api{t: t, base: srv.URL, c: newClient()}
+	user, token := mustUser(t, s, "u@example.com", RoleUser)
+	bot, _ := s.CreateCode(user.UserID, "Bot", KindBot)
+	ext, _ := s.CreateCode(user.UserID, "Laptop", KindExtension)
+	bare := &http.Client{}
+
+	if code, b := a.call(bare, "GET", "/", nil, map[string]string{"Authorization": "Bearer " + bot.Code}); code != 200 || obj(t, b)["kind"] != "bot" {
+		t.Fatalf("bot code: %d %s", code, b)
+	}
+	if code, b := a.call(bare, "GET", "/", nil, map[string]string{"Authorization": "Bearer " + ext.Code}); code != 403 || obj(t, b)["error"] != "bot_code_required" {
+		t.Fatalf("extension code: %d %s", code, b)
+	}
+	if code, b := a.call(bare, "GET", "/", nil, map[string]string{"Cookie": CookieName + "=" + token}); code != 403 || obj(t, b)["error"] != "bot_code_required" {
+		t.Fatalf("session: %d %s", code, b)
+	}
+	if code, _ := a.call(bare, "GET", "/", nil, nil); code != 401 {
+		t.Fatalf("no credential: %d", code)
+	}
+}
