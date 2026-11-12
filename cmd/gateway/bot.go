@@ -33,11 +33,15 @@ type botView struct {
 
 // botPresence is one agent's open bot socket (one per bot code) and its last status.
 type botPresence struct {
-	client    *Client
-	books     []botBook
-	dryRun    bool
-	busy      string    // id of the order the agent is running; "" = idle
-	freeSince time.Time // when the agent last became idle (socket open or busy cleared)
+	client      *Client
+	books       []botBook
+	dryRun      bool
+	busy        string    // id of the order the agent is running; "" = idle
+	freeSince   time.Time // when the agent last became idle (socket open or busy cleared)
+	version     string
+	hostName    string
+	cpu, mem    *int   // percent; nil = not reported
+	windowsJSON string // the last status's windows, as a JSON array
 }
 
 // viewOf aggregates a user's online agents. No agents is the offline answer. A bookmaker is ready
@@ -105,7 +109,7 @@ func (b *botHub) attach(c *Client) {
 		b.agents[userID] = map[int64]*botPresence{}
 	}
 	old := b.agents[userID][codeID]
-	b.agents[userID][codeID] = &botPresence{client: c, books: []botBook{}, dryRun: true, freeSince: b.now()}
+	b.agents[userID][codeID] = &botPresence{client: c, books: []botBook{}, dryRun: true, freeSince: b.now(), windowsJSON: "[]"}
 	b.mu.Unlock()
 	if old != nil {
 		// Close waits for the peer's close frame; do not hold up the new socket's handler.
@@ -154,27 +158,6 @@ func principalOf(r *http.Request) accounts.Principal {
 	return p
 }
 
-// setStatus stores an agent's last status. false: codeID has no open bot socket (never connected,
-// closed, or replaced).
-func (b *botHub) setStatus(userID, codeID int64, books []botBook, dryRun bool) bool {
-	if books == nil {
-		books = []botBook{}
-	}
-	b.mu.Lock()
-	p := b.presenceLocked(userID, codeID)
-	if p == nil {
-		b.mu.Unlock()
-		return false
-	}
-	changed := p.dryRun != dryRun || !slices.Equal(p.books, books)
-	p.books, p.dryRun = books, dryRun
-	b.mu.Unlock()
-	if changed {
-		b.changed(userID)
-	}
-	return true
-}
-
 // newBotAPI serves /api/me/bot and /api/me/bot/*, behind CSRF like the accounts API.
 func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux := http.NewServeMux()
@@ -187,23 +170,6 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 
 func (b *botHub) handleGet(w http.ResponseWriter, r *http.Request) {
 	accounts.WriteJSON(w, http.StatusOK, b.view(principalOf(r).UserID))
-}
-
-func (b *botHub) handleStatus(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Books  []botBook `json:"books"`
-		DryRun *bool     `json:"dryRun"`
-	}
-	if !accounts.DecodeJSON(w, r, &in, 16<<10) {
-		return
-	}
-	dryRun := in.DryRun == nil || *in.DryRun // never Live by omission
-	p := principalOf(r)
-	if !b.setStatus(p.UserID, p.CodeID, in.Books, dryRun) {
-		accounts.WriteError(w, http.StatusConflict, "bot_offline")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // orderMemory is how long a sent order is remembered for its events when no final event comes.
