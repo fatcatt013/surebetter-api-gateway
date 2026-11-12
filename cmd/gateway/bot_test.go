@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -163,7 +164,21 @@ func TestBot_NewSocketReplacesOld(t *testing.T) {
 	waitBot(t, bots, uid, true)
 	second := dialBot(t, srv, code)
 	expectClosedBy(t, first, websocket.StatusNormalClosure, "the older bot socket")
-	time.Sleep(100 * time.Millisecond) // the replaced socket's cleanup must not take the new one offline
+	// Wait until the replaced socket's handler is gone (only the new socket is registered), then its
+	// cleanup has run and must not have taken the new one offline.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		bots.reg.mu.Lock()
+		n := len(bots.reg.clients)
+		bots.reg.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replaced socket never unregistered (%d clients)", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if !bots.view(uid).Online {
 		t.Fatal("closing the replaced socket took the bot offline")
 	}
@@ -628,7 +643,96 @@ func TestBot_OrdersForgottenAfterTenMinutes(t *testing.T) {
 		t.Fatalf("app got %v", m)
 	}
 	clk.advance(2 * time.Second)
+	// Forgetting the order frees the bot: GET stops showing busy and the app is told.
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":false`) {
+		t.Fatalf("busy must clear when its order is forgotten: %s", got)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on forgotten order: %s, want bot", got)
+	}
 	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"placed"}`); s != 404 || !strings.Contains(b, `"unknown_order"`) {
 		t.Fatalf("event after 10 min: %d %s", s, b)
+	}
+	placeOrder(t, srv, token, bot, app) // a new order is accepted (202)
+}
+
+// The order path alone also frees a bot whose order was forgotten (no GET in between).
+func TestBot_ForgottenOrderDoesNotBlockNewOrder(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	clk := &botClock{t: time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	bot := startBot(t, srv, newCode(t, srv, token, "bot"), app)
+	placeOrder(t, srv, token, bot, app)
+	clk.advance(orderMemory + time.Second)
+	s, b := postOrder(t, srv, token, orderJSON("arb-2", legJSON("tipsport", "s1", 2.1, 100), legJSON("betano", "s2", 2.05, 102)))
+	if s != 202 {
+		t.Fatalf("order after the old one was forgotten: %d %s", s, b)
+	}
+}
+
+func TestBot_OrderValidationLimits(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	tip := legJSON("tipsport", "s1", 2.1, 100)
+	bet := legJSON("betano", "s2", 2.05, 102)
+	bad := map[string]string{
+		"arb_key over 256 bytes": orderJSON(strings.Repeat("k", 257), tip, bet),
+		"padded bookmaker":       orderJSON("k", tip, legJSON(" betano", "s2", 2.05, 102)),
+		"padded same bookmaker":  orderJSON("k", tip, legJSON("tipsport ", "s2", 2.05, 102)),
+	}
+	for name, body := range bad {
+		if s, b := postOrder(t, srv, token, body); s != 400 || !strings.Contains(b, `"bad_order"`) {
+			t.Errorf("%s: %d %s, want 400 bad_order", name, s, b)
+		}
+	}
+	if s, b := postOrder(t, srv, token, orderJSON(strings.Repeat("k", 256), tip, bet)); s != 409 || !strings.Contains(b, `"bot_offline"`) {
+		t.Fatalf("256-byte arb_key must pass validation: %d %s", s, b)
+	}
+}
+
+func TestBot_ReplacementWhileBusy(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	uid := userIDOf(t, svc, token)
+	app := appSocket(t, srv, token)
+	first := startBot(t, srv, code, app)
+	placeOrder(t, srv, token, first, app)
+
+	second := startBot(t, srv, code, app) // replaces the busy socket
+	expectClosedBy(t, first, websocket.StatusNormalClosure, "the older bot socket")
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":false`) {
+		t.Fatalf("a replacement starts idle: %s", got)
+	}
+	placeOrder(t, srv, token, second, app)
+	time.Sleep(150 * time.Millisecond) // let the old socket's cleanup run
+	if v := bots.view(uid); !v.Online || !v.Busy {
+		t.Fatalf("the old socket's close must not touch the new socket's busy order: %+v", v)
+	}
+}
+
+func TestBot_FullSendBufferIsOfflineNotBusy(t *testing.T) {
+	bots := newBotHub(newConnRegistry())
+	c := &Client{send: make(chan []byte, 1), bot: true}
+	c.principal.UserID = 7
+	c.send <- []byte("x") // full
+	bots.bots[7] = &botPresence{client: c, books: []botBook{{"tipsport", true}, {"betano", true}}, dryRun: true}
+	o := botOrderMsg{ArbKey: "k", Legs: []botLeg{{Bookmaker: "tipsport", SourceID: "a", Odds: 2, Stake: 1}, {Bookmaker: "betano", SourceID: "b", Odds: 2, Stake: 1}}}
+	if _, err := bots.order(7, o); !errors.Is(err, errBotOffline) {
+		t.Fatalf("full buffer: %v, want bot_offline", err)
+	}
+	if bots.view(7).Busy {
+		t.Fatal("a refused order must not set busy")
+	}
+}
+
+func TestBot_BadEventBeatsUnknownOrder(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	if s, b := postEvent(t, srv, code, `{"order_id":"0123456789abcdef","event":"exploded"}`); s != 400 || !strings.Contains(b, `"bad_event"`) {
+		t.Fatalf("bad event + unknown order: %d %s", s, b)
 	}
 }

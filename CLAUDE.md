@@ -89,6 +89,7 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 - Two `sync.RWMutex` on `Hub`: one for the client map (`mu`), one for the odds state (`stateMu`). Keep locks short.
 - `connCount` and `msgSent` are `atomic.Int64` — no lock needed.
 - `botHub.mu` guards bot presence and sent orders. An order's send to the bot socket happens under it (non-blocking); `bot`/`botEvent` sends to the app sockets happen after it is released.
+- An order queued in the microseconds between a bot socket's `writePump` exiting and its `detach` is lost, like on a TCP-dead socket; the app shows "Bot: offline".
 
 ## Production Image
 

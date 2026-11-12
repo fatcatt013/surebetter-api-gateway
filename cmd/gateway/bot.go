@@ -64,8 +64,11 @@ func newBotHub(reg *connRegistry) *botHub {
 
 func (b *botHub) view(userID int64) botView {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.bots[userID].view()
+	freed := b.pruneLocked()
+	v := b.bots[userID].view()
+	b.mu.Unlock()
+	b.notifyAll(freed)
+	return v
 }
 
 // attach makes c its user's bot socket: online, no books yet, dry run, idle. The user's older bot
@@ -196,14 +199,14 @@ var (
 	errBookNotReady = errors.New("book_not_ready")
 )
 
-// validOrder checks the shape: an arb key, exactly 2 legs at different bookmakers, each with a
+// validOrder checks the shape: an arb key (at most 256 bytes), exactly 2 legs at different bookmakers, each with a
 // selection id, odds above 1 and a positive stake.
 func validOrder(o botOrderMsg) bool {
-	if strings.TrimSpace(o.ArbKey) == "" || len(o.Legs) != 2 || o.Legs[0].Bookmaker == o.Legs[1].Bookmaker {
+	if strings.TrimSpace(o.ArbKey) == "" || len(o.ArbKey) > 256 || len(o.Legs) != 2 || o.Legs[0].Bookmaker == o.Legs[1].Bookmaker {
 		return false
 	}
 	for _, l := range o.Legs {
-		if strings.TrimSpace(l.Bookmaker) == "" || strings.TrimSpace(l.SourceID) == "" || !(l.Odds > 1) || !(l.Stake > 0) {
+		if strings.TrimSpace(l.Bookmaker) == "" || l.Bookmaker != strings.TrimSpace(l.Bookmaker) || strings.TrimSpace(l.SourceID) == "" || !(l.Odds > 1) || !(l.Stake > 0) {
 			return false
 		}
 	}
@@ -239,13 +242,29 @@ func (p *botPresence) ready(book string) bool {
 	return false
 }
 
-// pruneLocked forgets orders older than orderMemory. b.mu must be held.
-func (b *botHub) pruneLocked() {
+// pruneLocked forgets orders older than orderMemory. A bot that was busy with a forgotten order is
+// idle again; the users whose busy flag changed are returned, to be passed to notifyAll after b.mu
+// is released. b.mu must be held.
+func (b *botHub) pruneLocked() []int64 {
 	now := b.now()
+	var freed []int64
 	for id, o := range b.orders {
-		if !now.Before(o.expires) {
-			delete(b.orders, id)
+		if now.Before(o.expires) {
+			continue
 		}
+		delete(b.orders, id)
+		if p := b.bots[o.userID]; p != nil && p.busy == id {
+			p.busy = ""
+			freed = append(freed, o.userID)
+		}
+	}
+	return freed
+}
+
+// notifyAll sends {"type":"bot"} for each user in ids (call without b.mu).
+func (b *botHub) notifyAll(ids []int64) {
+	for _, id := range ids {
+		b.changed(id)
 	}
 }
 
@@ -261,35 +280,39 @@ func (b *botHub) order(userID int64, o botOrderMsg) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := b.startOrder(userID, o, payload); err != nil {
+	freed, err := b.startOrder(userID, o, payload)
+	b.notifyAll(freed)
+	if err != nil {
 		return "", err
 	}
 	b.changed(userID) // busy
 	return o.OrderID, nil
 }
 
-func (b *botHub) startOrder(userID int64, o botOrderMsg, payload []byte) error {
+// startOrder prunes forgotten orders first (a forgotten order must not keep the bot busy), then
+// checks and sends. freed lists the users whose busy flag the prune cleared.
+func (b *botHub) startOrder(userID int64, o botOrderMsg, payload []byte) (freed []int64, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	freed = b.pruneLocked()
 	p := b.bots[userID]
 	if p == nil {
-		return errBotOffline
+		return freed, errBotOffline
 	}
 	if p.busy != "" {
-		return errBotBusy
+		return freed, errBotBusy
 	}
 	for _, l := range o.Legs {
 		if !p.ready(l.Bookmaker) {
-			return errBookNotReady
+			return freed, errBookNotReady
 		}
 	}
 	if !p.client.trySend(payload) {
-		return errBotOffline // the socket is not draining its buffer
+		return freed, errBotOffline // the socket is not draining its buffer
 	}
 	p.busy = o.OrderID
-	b.pruneLocked()
 	b.orders[o.OrderID] = botOrder{userID: userID, arbKey: o.ArbKey, expires: b.now().Add(orderMemory)}
-	return nil
+	return freed, nil
 }
 
 func (b *botHub) handleOrder(w http.ResponseWriter, r *http.Request) {
@@ -347,10 +370,11 @@ type botEventMsg struct {
 func (b *botHub) event(userID int64, in botEventIn) error {
 	final := botEvents[in.Event]
 	b.mu.Lock()
-	b.pruneLocked()
+	freed := b.pruneLocked()
 	o, ok := b.orders[in.OrderID]
 	if !ok || o.userID != userID {
 		b.mu.Unlock()
+		b.notifyAll(freed)
 		return errUnknownOrder
 	}
 	cleared := false
@@ -362,6 +386,7 @@ func (b *botHub) event(userID int64, in botEventIn) error {
 		}
 	}
 	b.mu.Unlock()
+	b.notifyAll(freed)
 	payload, err := json.Marshal(botEventMsg{Type: "botEvent", OrderID: in.OrderID, ArbKey: o.arbKey,
 		Event: in.Event, Bookmaker: in.Bookmaker, Reason: in.Reason})
 	if err != nil {
