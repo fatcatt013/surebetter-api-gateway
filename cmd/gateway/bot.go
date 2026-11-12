@@ -339,8 +339,8 @@ func (b *botHub) order(userID int64, o botOrderMsg) (string, error) {
 // pickLocked chooses the agent for an order: online, idle, with both legs' bookmakers ready; of
 // those the one idle longest (lowest code id on a tie). Errors: no agent online (errBotOffline);
 // agents with both books ready exist but all are busy (errBotBusy); no agent has both books ready
-// (errBookNotReady). b.mu must be held.
-func (b *botHub) pickLocked(userID int64, o botOrderMsg) (int64, *botPresence, error) {
+// (errBookNotReady). Agents in skip are left out. b.mu must be held.
+func (b *botHub) pickLocked(userID int64, o botOrderMsg, skip map[int64]bool) (int64, *botPresence, error) {
 	agents := b.agents[userID]
 	if len(agents) == 0 {
 		return 0, nil, errBotOffline
@@ -349,7 +349,7 @@ func (b *botHub) pickLocked(userID int64, o botOrderMsg) (int64, *botPresence, e
 	var best *botPresence
 	capable := false
 	for codeID, p := range agents {
-		if !p.ready(o.Legs[0].Bookmaker) || !p.ready(o.Legs[1].Bookmaker) {
+		if skip[codeID] || !p.ready(o.Legs[0].Bookmaker) || !p.ready(o.Legs[1].Bookmaker) {
 			continue
 		}
 		capable = true
@@ -371,17 +371,31 @@ func (b *botHub) pickLocked(userID int64, o botOrderMsg) (int64, *botPresence, e
 }
 
 // startOrder prunes forgotten orders first (a forgotten order must not keep an agent busy), then
-// picks an agent and sends. freed lists the users whose busy flag the prune cleared.
+// picks an agent and sends. An agent whose socket does not take the order (its send buffer is
+// full: it is not draining) is left out and the pick repeated; when no other agent can take it,
+// the answer is errBotOffline. freed lists the users whose busy flag the prune cleared.
 func (b *botHub) startOrder(userID int64, o botOrderMsg, payload []byte) (freed []int64, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	freed = b.pruneLocked()
-	codeID, p, err := b.pickLocked(userID, o)
-	if err != nil {
-		return freed, err
-	}
-	if !p.client.trySend(payload) {
-		return freed, errBotOffline // the socket is not draining its buffer
+	var skip map[int64]bool
+	var codeID int64
+	var p *botPresence
+	for {
+		codeID, p, err = b.pickLocked(userID, o, skip)
+		if err != nil {
+			if skip != nil {
+				err = errBotOffline // the agents that could take it are not draining their sockets
+			}
+			return freed, err
+		}
+		if p.client.trySend(payload) {
+			break
+		}
+		if skip == nil {
+			skip = map[int64]bool{}
+		}
+		skip[codeID] = true
 	}
 	p.busy = o.OrderID
 	b.orders[o.OrderID] = botOrder{userID: userID, codeID: codeID, arbKey: o.ArbKey, expires: b.now().Add(orderMemory)}

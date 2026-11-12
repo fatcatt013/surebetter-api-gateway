@@ -974,3 +974,40 @@ func TestBot_EventsOnlyFromTheChosenAgent(t *testing.T) {
 		t.Fatalf("event from the chosen agent: %d %s", s, body)
 	}
 }
+
+// When the chosen agent's socket does not take the order, the next agent that can is tried.
+func TestBot_FullSendBufferTriesTheNextAgent(t *testing.T) {
+	bots := newBotHub(newConnRegistry(), nil)
+	clk := &botClock{t: time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now
+	agent := func(codeID int64, freeSince time.Time, buffered bool) *Client {
+		c := &Client{send: make(chan []byte, 1), bot: true}
+		c.principal.UserID, c.principal.CodeID = 7, codeID
+		if buffered {
+			c.send <- []byte("x") // full
+		}
+		bots.agents[7][codeID] = &botPresence{client: c, books: []botBook{{"tipsport", true}, {"betano", true}}, dryRun: true, freeSince: freeSince}
+		return c
+	}
+	bots.agents[7] = map[int64]*botPresence{}
+	stuck := agent(70, clk.now().Add(-time.Hour), true) // idle longest: chosen first
+	ok := agent(71, clk.now(), false)
+	o := botOrderMsg{ArbKey: "k", Legs: []botLeg{{Bookmaker: "tipsport", SourceID: "a", Odds: 2, Stake: 1}, {Bookmaker: "betano", SourceID: "b", Odds: 2, Stake: 1}}}
+	id, err := bots.order(7, o)
+	if err != nil {
+		t.Fatalf("order: %v", err)
+	}
+	if len(ok.send) != 1 || len(stuck.send) != 1 {
+		t.Fatalf("the order must go to the agent whose socket drains: %d %d", len(ok.send), len(stuck.send))
+	}
+	if bots.agents[7][71].busy != id || bots.agents[7][70].busy != "" || bots.orders[id].codeID != 71 {
+		t.Fatalf("busy: 70=%q 71=%q order to %d", bots.agents[7][70].busy, bots.agents[7][71].busy, bots.orders[id].codeID)
+	}
+	// Now 71 is busy and 70 still stuck: bot_offline, nothing set busy.
+	if _, err := bots.order(7, o); !errors.Is(err, errBotOffline) {
+		t.Fatalf("stuck + busy: %v, want bot_offline", err)
+	}
+	if bots.agents[7][70].busy != "" {
+		t.Fatal("a refused order must not set busy")
+	}
+}
