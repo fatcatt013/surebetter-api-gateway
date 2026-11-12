@@ -1,10 +1,17 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/rs/zerolog/log"
 	"nhooyr.io/websocket"
 
 	"github.com/surebetter/api-gateway/internal/accounts"
@@ -40,16 +47,19 @@ func (p *botPresence) view() botView {
 	return botView{Online: true, Books: append([]botBook{}, p.books...), DryRun: p.dryRun, Busy: p.busy != ""}
 }
 
-// botHub holds each user's bot presence in memory (one gateway instance: a restart means offline
-// until the bot reconnects) and tells the user's other /ws sockets when it changes.
+// botHub holds each user's bot presence and the orders sent to bots, in memory (one gateway
+// instance: a restart means offline until the bot reconnects, and forgets sent orders). It tells
+// the user's other /ws sockets when presence changes.
 type botHub struct {
-	reg  *connRegistry
-	mu   sync.Mutex
-	bots map[int64]*botPresence // user id → presence
+	reg    *connRegistry
+	now    func() time.Time
+	mu     sync.Mutex
+	bots   map[int64]*botPresence // user id → presence
+	orders map[string]botOrder    // order id → order, until its final event or orderMemory
 }
 
 func newBotHub(reg *connRegistry) *botHub {
-	return &botHub{reg: reg, bots: map[int64]*botPresence{}}
+	return &botHub{reg: reg, now: time.Now, bots: map[int64]*botPresence{}, orders: map[string]botOrder{}}
 }
 
 func (b *botHub) view(userID int64) botView {
@@ -123,6 +133,7 @@ func (b *botHub) setStatus(userID, codeID int64, books []botBook, dryRun bool) b
 func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /api/me/bot", acc.RequireSession(http.HandlerFunc(b.handleGet)))
+	mux.Handle("POST /api/me/bot/orders", acc.RequireSession(http.HandlerFunc(b.handleOrder)))
 	mux.Handle("POST /api/me/bot/status", acc.RequireBotCode(http.HandlerFunc(b.handleStatus)))
 	return accounts.CSRF(mux)
 }
@@ -146,4 +157,156 @@ func (b *botHub) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// orderMemory is how long a sent order is remembered for its events when no final event comes.
+const orderMemory = 10 * time.Minute
+
+// botLeg is one leg of an order, as the app sends it and the bot receives it.
+type botLeg struct {
+	Bookmaker       string  `json:"bookmaker"`
+	MatchURL        string  `json:"match_url"`
+	SourceID        string  `json:"source_id"`
+	SourceMarketRef string  `json:"source_market_ref"`
+	MarketName      string  `json:"market_name"`
+	Label           string  `json:"label"`
+	Odds            float64 `json:"odds"`
+	Stake           float64 `json:"stake"`
+}
+
+// botOrderMsg is an order: POST /api/me/bot/orders sends arb_key and legs (an order_id in the body is
+// ignored); the bot socket receives it with the gateway's order_id.
+type botOrderMsg struct {
+	OrderID string   `json:"order_id"`
+	ArbKey  string   `json:"arb_key"`
+	Legs    []botLeg `json:"legs"`
+}
+
+// botOrder is what the gateway remembers of a sent order, to relay its events.
+type botOrder struct {
+	userID  int64
+	arbKey  string
+	expires time.Time
+}
+
+var (
+	errBotOffline   = errors.New("bot_offline")
+	errBotBusy      = errors.New("bot_busy")
+	errBookNotReady = errors.New("book_not_ready")
+)
+
+// validOrder checks the shape: an arb key, exactly 2 legs at different bookmakers, each with a
+// selection id, odds above 1 and a positive stake.
+func validOrder(o botOrderMsg) bool {
+	if strings.TrimSpace(o.ArbKey) == "" || len(o.Legs) != 2 || o.Legs[0].Bookmaker == o.Legs[1].Bookmaker {
+		return false
+	}
+	for _, l := range o.Legs {
+		if strings.TrimSpace(l.Bookmaker) == "" || strings.TrimSpace(l.SourceID) == "" || !(l.Odds > 1) || !(l.Stake > 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// newOrderID is 8 random bytes as 16 hex characters.
+func newOrderID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
+	return hex.EncodeToString(b)
+}
+
+// trySend queues payload on c without blocking; false when its send buffer is full.
+func (c *Client) trySend(payload []byte) bool {
+	select {
+	case c.send <- payload:
+		return true
+	default:
+		return false
+	}
+}
+
+// ready reports whether the bot's last status lists book as ready.
+func (p *botPresence) ready(book string) bool {
+	for _, x := range p.books {
+		if x.Bookmaker == book && x.Ready {
+			return true
+		}
+	}
+	return false
+}
+
+// pruneLocked forgets orders older than orderMemory. b.mu must be held.
+func (b *botHub) pruneLocked() {
+	now := b.now()
+	for id, o := range b.orders {
+		if !now.Before(o.expires) {
+			delete(b.orders, id)
+		}
+	}
+}
+
+// order sends a valid order to userID's bot socket and marks the bot busy. Checks, in this order:
+// a bot is online (errBotOffline), it is idle (errBotBusy), every leg's bookmaker is ready
+// (errBookNotReady).
+func (b *botHub) order(userID int64, o botOrderMsg) (string, error) {
+	o.OrderID = newOrderID()
+	payload, err := json.Marshal(struct {
+		Type  string      `json:"type"`
+		Order botOrderMsg `json:"order"`
+	}{"order", o})
+	if err != nil {
+		return "", err
+	}
+	if err := b.startOrder(userID, o, payload); err != nil {
+		return "", err
+	}
+	b.changed(userID) // busy
+	return o.OrderID, nil
+}
+
+func (b *botHub) startOrder(userID int64, o botOrderMsg, payload []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p := b.bots[userID]
+	if p == nil {
+		return errBotOffline
+	}
+	if p.busy != "" {
+		return errBotBusy
+	}
+	for _, l := range o.Legs {
+		if !p.ready(l.Bookmaker) {
+			return errBookNotReady
+		}
+	}
+	if !p.client.trySend(payload) {
+		return errBotOffline // the socket is not draining its buffer
+	}
+	p.busy = o.OrderID
+	b.pruneLocked()
+	b.orders[o.OrderID] = botOrder{userID: userID, arbKey: o.ArbKey, expires: b.now().Add(orderMemory)}
+	return nil
+}
+
+func (b *botHub) handleOrder(w http.ResponseWriter, r *http.Request) {
+	var in botOrderMsg
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&in); err != nil || !validOrder(in) {
+		accounts.WriteError(w, http.StatusBadRequest, "bad_order")
+		return
+	}
+	userID := principalOf(r).UserID
+	id, err := b.order(userID, in)
+	switch {
+	case err == nil:
+		log.Info().Int64("user", userID).Str("order_id", id).Str("arb_key", in.ArbKey).Msg("bot order sent")
+		accounts.WriteJSON(w, http.StatusAccepted, map[string]string{"order_id": id})
+	case errors.Is(err, errBotOffline), errors.Is(err, errBotBusy), errors.Is(err, errBookNotReady):
+		accounts.WriteError(w, http.StatusConflict, err.Error())
+	default:
+		log.Error().Err(err).Msg("bot order failed")
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+	}
 }

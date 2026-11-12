@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -288,4 +290,194 @@ func TestBot_StatusRoutesNeedTheRightCredential(t *testing.T) {
 	if s, b := request(t, srv, "GET", "/api/me/bot", "", "", bearer(bot)); s != 403 || !strings.Contains(b, `"session_required"`) {
 		t.Fatalf("GET /api/me/bot with a code: %d %s", s, b)
 	}
+}
+
+func legJSON(book, sourceID string, odds, stake float64) string {
+	return fmt.Sprintf(`{"bookmaker":%q,"match_url":"https://%s.example/match","source_id":%q,"source_market_ref":"","market_name":"","label":"","odds":%v,"stake":%v}`,
+		book, book, sourceID, odds, stake)
+}
+
+func orderJSON(arbKey string, legs ...string) string {
+	return fmt.Sprintf(`{"arb_key":%q,"legs":[%s]}`, arbKey, strings.Join(legs, ","))
+}
+
+func postOrder(t *testing.T, srv *httptest.Server, token, body string) (int, string) {
+	t.Helper()
+	return request(t, srv, "POST", "/api/me/bot/orders", token, body, nil)
+}
+
+// readJSON reads the next message on conn as a JSON object.
+func readJSON(t *testing.T, conn *websocket.Conn) map[string]any {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, b, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("not a JSON object: %s", b)
+	}
+	return m
+}
+
+// startBot connects code's bot, reports tipsport and betano ready, and reads the two {"type":"bot"}
+// messages that causes on the user's app socket.
+func startBot(t *testing.T, srv *httptest.Server, code string, app *websocket.Conn) *websocket.Conn {
+	t.Helper()
+	bot := dialBot(t, srv, code)
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on bot connect: %s", got)
+	}
+	if s, b := postStatus(t, srv, code, `{"books":[{"bookmaker":"tipsport","ready":true},{"bookmaker":"betano","ready":true}],"dryRun":true}`); s != 204 {
+		t.Fatalf("status: %d %s", s, b)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on status: %s", got)
+	}
+	return bot
+}
+
+// placeOrder sends a valid tipsport/betano order with arb_key "arb-1" and returns its id, after the
+// bot socket read the order and the app socket read the busy {"type":"bot"}.
+func placeOrder(t *testing.T, srv *httptest.Server, token string, bot, app *websocket.Conn) string {
+	t.Helper()
+	s, b := postOrder(t, srv, token, orderJSON("arb-1", legJSON("tipsport", "s1", 2.1, 100), legJSON("betano", "s2", 2.05, 102)))
+	var res struct {
+		OrderID string `json:"order_id"`
+	}
+	if json.Unmarshal([]byte(b), &res); s != 202 || res.OrderID == "" {
+		t.Fatalf("order: %d %s", s, b)
+	}
+	if m := readJSON(t, bot); m["type"] != "order" {
+		t.Fatalf("bot got %v, want an order", m)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on busy: %s", got)
+	}
+	return res.OrderID
+}
+
+func TestBot_OrderValidation(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	tip := legJSON("tipsport", "s1", 2.1, 100)
+	bet := legJSON("betano", "s2", 2.05, 102)
+	bad := map[string]string{
+		"not JSON":       `{"arb_key":`,
+		"no arb_key":     orderJSON("", tip, bet),
+		"one leg":        orderJSON("k", tip),
+		"three legs":     orderJSON("k", tip, bet, legJSON("fortuna", "s3", 3, 50)),
+		"same bookmaker": orderJSON("k", tip, legJSON("tipsport", "s2", 2.05, 102)),
+		"odds 1":         orderJSON("k", legJSON("tipsport", "s1", 1, 100), bet),
+		"stake 0":        orderJSON("k", tip, legJSON("betano", "s2", 2.05, 0)),
+		"no source_id":   orderJSON("k", tip, legJSON("betano", "", 2.05, 102)),
+		"no bookmaker":   orderJSON("k", tip, legJSON("", "s2", 2.05, 102)),
+	}
+	// The shape is checked first: these are 400 although no bot is online.
+	for name, body := range bad {
+		if s, b := postOrder(t, srv, token, body); s != 400 || !strings.Contains(b, `"bad_order"`) {
+			t.Errorf("%s: %d %s, want 400 bad_order", name, s, b)
+		}
+	}
+	if s, b := postOrder(t, srv, token, orderJSON("k", tip, bet)); s != 409 || !strings.Contains(b, `"bot_offline"`) {
+		t.Fatalf("valid order, no bot: %d %s", s, b)
+	}
+}
+
+func TestBot_OrdersNeedASameSiteSession(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	body := orderJSON("k", legJSON("tipsport", "s1", 2.1, 100), legJSON("betano", "s2", 2.05, 102))
+
+	if s, b := request(t, srv, "POST", "/api/me/bot/orders", "", body, bearer(code)); s != 403 || !strings.Contains(b, `"session_required"`) {
+		t.Fatalf("order with a bot code: %d %s", s, b)
+	}
+	if s, b := request(t, srv, "POST", "/api/me/bot/orders", token, body, map[string]string{"Origin": "http://evil.example"}); s != 403 || !strings.Contains(b, `"bad_origin"`) {
+		t.Fatalf("cross-site order: %d %s", s, b)
+	}
+	if s, _ := request(t, srv, "POST", "/api/me/bot/orders", "", body, nil); s != 401 {
+		t.Fatalf("order without a credential: %d", s)
+	}
+}
+
+func TestBot_OrderForwardedToOwnBotAndBusy(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	bot := startBot(t, srv, newCode(t, srv, token, "bot"), app)
+	otherToken := newUser(t, svc, "o@example.com", accounts.RoleUser)
+	otherApp := appSocket(t, srv, otherToken)
+	otherBot := startBot(t, srv, newCode(t, srv, otherToken, "bot"), otherApp)
+
+	tip := legJSON("tipsport", "s1", 2.1, 100)
+	bet := legJSON("betano", "s2", 2.05, 102)
+	fortuna := legJSON("fortuna", "s3", 2.05, 102)
+	if s, b := postOrder(t, srv, token, orderJSON("k", tip, fortuna)); s != 409 || !strings.Contains(b, `"book_not_ready"`) {
+		t.Fatalf("leg at a book the bot does not run: %d %s", s, b)
+	}
+
+	s, b := postOrder(t, srv, token, orderJSON("football:abc:MATCH_WINNER:0.00", tip, bet))
+	var res struct {
+		OrderID string `json:"order_id"`
+	}
+	if json.Unmarshal([]byte(b), &res); s != 202 || !regexp.MustCompile(`^[0-9a-f]{16}$`).MatchString(res.OrderID) {
+		t.Fatalf("order: %d %s", s, b)
+	}
+
+	msg := readJSON(t, bot)
+	order, _ := msg["order"].(map[string]any)
+	legs, _ := order["legs"].([]any)
+	if msg["type"] != "order" || order["order_id"] != res.OrderID || order["arb_key"] != "football:abc:MATCH_WINNER:0.00" || len(legs) != 2 {
+		t.Fatalf("bot got %v", msg)
+	}
+	leg0, _ := legs[0].(map[string]any)
+	if leg0["bookmaker"] != "tipsport" || leg0["source_id"] != "s1" || leg0["match_url"] != "https://tipsport.example/match" ||
+		leg0["odds"] != 2.1 || leg0["stake"] != float64(100) {
+		t.Fatalf("leg 0: %v", leg0)
+	}
+	for _, k := range []string{"source_market_ref", "market_name", "label"} {
+		if _, ok := leg0[k]; !ok {
+			t.Fatalf("leg 0 must carry %s even when empty: %v", k, leg0)
+		}
+	}
+
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on busy: %s", got)
+	}
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":true`) {
+		t.Fatalf("after order: %s", got)
+	}
+	// Busy is checked before the books: fortuna is not ready, the answer is still bot_busy.
+	if s, b := postOrder(t, srv, token, orderJSON("k2", tip, fortuna)); s != 409 || !strings.Contains(b, `"bot_busy"`) {
+		t.Fatalf("second order: %d %s", s, b)
+	}
+	if got := getBot(t, srv, otherToken); !strings.Contains(got, `"busy":false`) {
+		t.Fatalf("another user's bot: %s", got)
+	}
+	expectNoMessage(t, otherBot, "another user's bot socket")
+}
+
+func TestBot_BusyClearsWhenBotSocketCloses(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	app := appSocket(t, srv, token)
+	bot := startBot(t, srv, code, app)
+	placeOrder(t, srv, token, bot, app)
+
+	bot.Close(websocket.StatusNormalClosure, "")
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on bot disconnect: %s", got)
+	}
+	if got := getBot(t, srv, token); got != `{"online":false,"books":[],"dryRun":true,"busy":false}` {
+		t.Fatalf("after disconnect: %s", got)
+	}
+	bot = startBot(t, srv, code, app)
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":false`) {
+		t.Fatalf("after reconnect: %s", got)
+	}
+	placeOrder(t, srv, token, bot, app)
 }
