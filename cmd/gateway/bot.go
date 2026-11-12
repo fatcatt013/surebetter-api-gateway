@@ -105,24 +105,41 @@ func (b *botHub) presenceLocked(userID, codeID int64) *botPresence {
 	return b.agents[userID][codeID]
 }
 
-// attach makes c the bot socket of its code's agent: online, no books yet, dry run, idle. That
-// code's older socket, if any, is closed, and its busy state goes with it; other codes' agents
-// stay. The agent's registry row is upserted before the app is told.
+// attach makes c the bot socket of its code's agent: online, no books yet, dry run. That code's
+// older socket, if any, is closed; other codes' agents stay. The agent starts busy with the order
+// it was sent and that is still running (no final event, not forgotten): it may have reconnected
+// mid-order, with money on a slip, and must not be given a second order. Otherwise it starts idle.
+// The agent's registry row is upserted before the app is told.
 func (b *botHub) attach(c *Client) {
 	userID, codeID := c.principal.UserID, c.principal.CodeID
 	b.mu.Lock()
+	freed := b.pruneLocked()
 	if b.agents[userID] == nil {
 		b.agents[userID] = map[int64]*botPresence{}
 	}
 	old := b.agents[userID][codeID]
-	b.agents[userID][codeID] = &botPresence{client: c, books: []botBook{}, dryRun: true, freeSince: b.now(), windowsJSON: "[]"}
+	b.agents[userID][codeID] = &botPresence{client: c, books: []botBook{}, dryRun: true, busy: b.runningLocked(userID, codeID),
+		freeSince: b.now(), windowsJSON: "[]"}
 	b.mu.Unlock()
+	b.notifyAll(freed)
 	if old != nil {
 		// Close waits for the peer's close frame; do not hold up the new socket's handler.
 		go old.client.conn.Close(websocket.StatusNormalClosure, "replaced by a newer bot socket")
 	}
 	b.touch(userID, codeID)
 	b.changed(userID)
+}
+
+// runningLocked is the id of the order sent to codeID's agent that is still remembered (the one
+// sent last if, unexpectedly, there are several), or "". b.mu must be held.
+func (b *botHub) runningLocked(userID, codeID int64) string {
+	id, latest := "", time.Time{}
+	for oid, o := range b.orders {
+		if o.userID == userID && o.codeID == codeID && (id == "" || o.expires.After(latest)) {
+			id, latest = oid, o.expires
+		}
+	}
+	return id
 }
 
 // detach takes the agent offline if c is still its code's bot socket (a replaced socket is not).

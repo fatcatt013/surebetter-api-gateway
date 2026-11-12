@@ -488,13 +488,15 @@ func TestBot_OrderForwardedToOwnBotAndBusy(t *testing.T) {
 	expectNoMessage(t, otherBot, "another user's bot socket")
 }
 
-func TestBot_BusyClearsWhenBotSocketCloses(t *testing.T) {
+// An agent that reconnects while its order runs (real money may be on a slip) is busy with that
+// order again, so it is not given a second one; busy clears on the order's final event.
+func TestBot_ReconnectMidOrderStartsBusy(t *testing.T) {
 	srv, svc, _ := newBotServer(t)
 	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
 	code := newCode(t, srv, token, "bot")
 	app := appSocket(t, srv, token)
 	bot := startBot(t, srv, code, app)
-	placeOrder(t, srv, token, bot, app)
+	id := placeOrder(t, srv, token, bot, app)
 
 	bot.Close(websocket.StatusNormalClosure, "")
 	if got := readType(t, app); got != "bot" {
@@ -504,8 +506,42 @@ func TestBot_BusyClearsWhenBotSocketCloses(t *testing.T) {
 		t.Fatalf("after disconnect: %s", got)
 	}
 	bot = startBot(t, srv, code, app)
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":true`) {
+		t.Fatalf("after reconnect mid-order: %s", got)
+	}
+	if s, b := postOrder(t, srv, token, orderJSON("arb-2", legJSON("tipsport", "s1", 2.1, 100), legJSON("betano", "s2", 2.05, 102))); s != 409 || !strings.Contains(b, `"bot_busy"`) {
+		t.Fatalf("second order while the first still runs: %d %s", s, b)
+	}
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"placed"}`); s != 204 {
+		t.Fatalf("final event: %d %s", s, b)
+	}
+	if m := readJSON(t, app); m["type"] != "botEvent" || m["order_id"] != id {
+		t.Fatalf("app got %v", m)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on busy cleared: %s", got)
+	}
+	placeOrder(t, srv, token, bot, app)
+}
+
+// A reconnect after the order was forgotten starts idle.
+func TestBot_ReconnectAfterOrderExpiredStartsIdle(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	clk := &botClock{t: time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	app := appSocket(t, srv, token)
+	bot := startBot(t, srv, code, app)
+	placeOrder(t, srv, token, bot, app)
+	bot.Close(websocket.StatusNormalClosure, "")
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on bot disconnect: %s", got)
+	}
+	clk.advance(orderMemory)
+	bot = startBot(t, srv, code, app)
 	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":false`) {
-		t.Fatalf("after reconnect: %s", got)
+		t.Fatalf("after reconnect, order forgotten: %s", got)
 	}
 	placeOrder(t, srv, token, bot, app)
 }
@@ -633,8 +669,13 @@ func TestBot_FinalEventAfterReconnectIsRelayed(t *testing.T) {
 	if m := readJSON(t, app); m["type"] != "botEvent" || m["order_id"] != id || m["arb_key"] != "arb-1" || m["event"] != "placed" {
 		t.Fatalf("app got %v", m)
 	}
-	// The new socket was never busy with this order, so its busy flag does not change.
-	expectNoMessage(t, app, "app socket after the old order's final event")
+	// The new socket took over the running order, so its final event clears busy.
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app after the order's final event: %s", got)
+	}
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":false`) {
+		t.Fatalf("after the final event: %s", got)
+	}
 }
 
 func TestBot_OrdersForgottenAfterTenMinutes(t *testing.T) {
@@ -711,12 +752,21 @@ func TestBot_ReplacementWhileBusy(t *testing.T) {
 	uid := userIDOf(t, svc, token)
 	app := appSocket(t, srv, token)
 	first := startBot(t, srv, code, app)
-	placeOrder(t, srv, token, first, app)
+	id := placeOrder(t, srv, token, first, app)
 
 	second := startBot(t, srv, code, app) // replaces the busy socket
 	expectClosedBy(t, first, websocket.StatusNormalClosure, "the older bot socket")
-	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":false`) {
-		t.Fatalf("a replacement starts idle: %s", got)
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":true`) {
+		t.Fatalf("a replacement takes over the running order: %s", got)
+	}
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"stopped"}`); s != 204 {
+		t.Fatalf("final event: %d %s", s, b)
+	}
+	if m := readJSON(t, app); m["type"] != "botEvent" {
+		t.Fatalf("app got %v", m)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on busy cleared: %s", got)
 	}
 	placeOrder(t, srv, token, second, app)
 	time.Sleep(150 * time.Millisecond) // let the old socket's cleanup run
