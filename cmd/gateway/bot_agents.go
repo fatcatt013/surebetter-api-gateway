@@ -39,9 +39,11 @@ type botStatusIn struct {
 	Version string      `json:"version"`
 	Host    *botHost    `json:"host"`
 	Windows []botWindow `json:"windows"`
+	Boot    string      `json:"boot"` // 16 lowercase hex, random per agent process; "" = not sent
 }
 
 var (
+	bootPattern     = regexp.MustCompile(`^[0-9a-f]{16}$`)
 	windowIDPattern = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
 	windowDevices   = map[string]bool{"desktop": true, "phone": true}
 	// logged_out and blocked are reserved for later agent versions, accepted and shown already.
@@ -55,9 +57,9 @@ func validPercent(p *int) bool { return p == nil || (*p >= 0 && *p <= 100) }
 // validStatus checks a status's sizes and enums: at most 64 books (bookmaker 1–40 chars), version
 // ≤ 64 chars, host name ≤ 64 chars, cpu and mem 0–100, at most 32 windows with unique ids
 // ([a-z0-9-]{1,40}), a bookmaker (1–40 chars), number ≥ 1, a known device and state, proxy ≤ 100
-// chars and reason ≤ 200 chars.
+// chars and reason ≤ 200 chars, and boot empty or 16 lowercase hex.
 func validStatus(in botStatusIn) bool {
-	if len(in.Books) > 64 || len(in.Windows) > 32 || runeLen(in.Version) > 64 {
+	if len(in.Books) > 64 || len(in.Windows) > 32 || runeLen(in.Version) > 64 || (in.Boot != "" && !bootPattern.MatchString(in.Boot)) {
 		return false
 	}
 	for _, b := range in.Books {
@@ -87,10 +89,11 @@ type botStatus struct {
 	hostName    string
 	cpu, mem    *int
 	windowsJSON string
+	boot        string
 }
 
 func statusOf(in botStatusIn) botStatus {
-	st := botStatus{books: in.Books, dryRun: in.DryRun == nil || *in.DryRun, version: in.Version} // never Live by omission
+	st := botStatus{books: in.Books, dryRun: in.DryRun == nil || *in.DryRun, version: in.Version, boot: in.Boot} // never Live by omission
 	if st.books == nil {
 		st.books = []botBook{}
 	}
@@ -107,7 +110,11 @@ func statusOf(in botStatusIn) botStatus {
 
 // setStatus stores an agent's last status in memory and its version, host name and windows in the
 // registry. The app is told ({"type":"bot"}) when books, dry run, version, host name or windows
-// changed, not for cpu/mem alone. false: codeID has no open bot socket.
+// changed, not for cpu/mem alone. A status with a boot id other than the one the agent had when
+// it was sent a still running order (or with one when that was empty) means the agent process
+// restarted and can never report that order: the order ends as outcome_unknown ("agent
+// restarted"), relayed like a posted final event, and the agent is freed. A status without a boot
+// id ends nothing. false: codeID has no open bot socket.
 func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 	b.mu.Lock()
 	p := b.presenceLocked(userID, codeID)
@@ -115,11 +122,27 @@ func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 		b.mu.Unlock()
 		return false
 	}
+	freed := b.pruneLocked()
 	changed := p.dryRun != st.dryRun || !slices.Equal(p.books, st.books) || p.version != st.version ||
 		p.hostName != st.hostName || p.windowsJSON != st.windowsJSON
 	p.books, p.dryRun, p.version, p.hostName, p.windowsJSON = st.books, st.dryRun, st.version, st.hostName, st.windowsJSON
-	p.cpu, p.mem = st.cpu, st.mem
+	p.cpu, p.mem, p.boot = st.cpu, st.mem, st.boot
+	var ended []endedOrder
+	if st.boot != "" {
+		for id, o := range b.orders {
+			if o.userID == userID && o.codeID == codeID && o.boot != st.boot {
+				delete(b.orders, id)
+				ended = append(ended, endedOrder{id: id, arbKey: o.arbKey})
+				changed = b.freeLocked(userID, codeID, id) || changed
+			}
+		}
+	}
 	b.mu.Unlock()
+	b.notifyAll(freed)
+	for _, o := range ended {
+		log.Warn().Int64("user", userID).Int64("code", codeID).Str("order_id", o.id).Msg("bot order ended: agent restarted")
+		b.relayEvent(userID, o.arbKey, botEventIn{OrderID: o.id, Event: "outcome_unknown", Reason: "agent restarted"})
+	}
 	if b.acc != nil {
 		err := b.acc.SaveBotAgentStatus(userID, codeID, accounts.BotAgentStatus{Version: st.version, HostName: st.hostName, WindowsJSON: st.windowsJSON})
 		if err != nil {

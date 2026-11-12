@@ -42,6 +42,7 @@ type botPresence struct {
 	hostName    string
 	cpu, mem    *int   // percent; nil = not reported
 	windowsJSON string // the last status's windows, as a JSON array
+	boot        string // the last status's boot id (agent process); "" = not sent
 }
 
 // viewOf aggregates a user's online agents. No agents is the offline answer. A bookmaker is ready
@@ -229,8 +230,12 @@ type botOrder struct {
 	userID  int64
 	codeID  int64 // the agent the order was sent to; only it may post the order's events
 	arbKey  string
+	boot    string // the agent's boot id when the order was sent; "" = none
 	expires time.Time
 }
+
+// endedOrder is an order the gateway ended itself, to relay after b.mu is released.
+type endedOrder struct{ id, arbKey string }
 
 var (
 	errBotOffline   = errors.New("bot_offline")
@@ -398,7 +403,7 @@ func (b *botHub) startOrder(userID int64, o botOrderMsg, payload []byte) (freed 
 		skip[codeID] = true
 	}
 	p.busy = o.OrderID
-	b.orders[o.OrderID] = botOrder{userID: userID, codeID: codeID, arbKey: o.ArbKey, expires: b.now().Add(orderMemory)}
+	b.orders[o.OrderID] = botOrder{userID: userID, codeID: codeID, arbKey: o.ArbKey, boot: p.boot, expires: b.now().Add(orderMemory)}
 	return freed, nil
 }
 
@@ -472,15 +477,24 @@ func (b *botHub) event(userID, codeID int64, in botEventIn) error {
 	}
 	b.mu.Unlock()
 	b.notifyAll(freed)
-	payload, err := json.Marshal(botEventMsg{Type: "botEvent", OrderID: in.OrderID, ArbKey: o.arbKey,
+	if err := b.relayEvent(userID, o.arbKey, in); err != nil {
+		return err
+	}
+	if cleared {
+		b.changed(userID) // after the botEvent: same goroutine, same send channels, so in order
+	}
+	return nil
+}
+
+// relayEvent sends an order event as {"type":"botEvent"} to the user's non-bot /ws sockets (call
+// without b.mu).
+func (b *botHub) relayEvent(userID int64, arbKey string, in botEventIn) error {
+	payload, err := json.Marshal(botEventMsg{Type: "botEvent", OrderID: in.OrderID, ArbKey: arbKey,
 		Event: in.Event, Bookmaker: in.Bookmaker, Reason: in.Reason})
 	if err != nil {
 		return err
 	}
 	b.reg.sendUser(userID, payload)
-	if cleared {
-		b.changed(userID) // after the botEvent: same goroutine, same send channels, so in order
-	}
 	return nil
 }
 

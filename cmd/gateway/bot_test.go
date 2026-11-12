@@ -1011,3 +1011,127 @@ func TestBot_FullSendBufferTriesTheNextAgent(t *testing.T) {
 		t.Fatal("a refused order must not set busy")
 	}
 }
+
+const (
+	bootA = "0123456789abcdef"
+	bootB = "fedcba9876543210"
+)
+
+// bootStatus is a status with tipsport and betano ready and boot ("" = no boot key).
+func bootStatus(boot string) string {
+	if boot == "" {
+		return `{"books":[{"bookmaker":"tipsport","ready":true},{"bookmaker":"betano","ready":true}],"dryRun":true}`
+	}
+	return `{"books":[{"bookmaker":"tipsport","ready":true},{"bookmaker":"betano","ready":true}],"dryRun":true,"boot":"` + boot + `"}`
+}
+
+func TestBot_StatusBootValidation(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	dialBot(t, srv, code)
+	for _, boot := range []string{"0123456789ABCDEF", "0123456789abcde", "0123456789abcdef0", "0123456789abcdeg", " 123456789abcdef"} {
+		if s, b := postStatus(t, srv, code, bootStatus(boot)); s != 400 || !strings.Contains(b, `"bad_status"`) {
+			t.Errorf("boot %q: %d %s, want 400 bad_status", boot, s, b)
+		}
+	}
+	if s, b := postStatus(t, srv, code, `{"books":[],"boot":7}`); s != 400 || !strings.Contains(b, `"bad_status"`) {
+		t.Errorf("boot a number: %d %s", s, b)
+	}
+	for _, body := range []string{bootStatus(bootA), bootStatus(""), `{"books":[],"boot":""}`} {
+		if s, b := postStatus(t, srv, code, body); s != 204 {
+			t.Errorf("%s: %d %s", body, s, b)
+		}
+	}
+}
+
+// startBootBot connects code's agent with a status carrying boot and reads the two {"type":"bot"}.
+func startBootBot(t *testing.T, srv *httptest.Server, code, boot string, app *websocket.Conn) *websocket.Conn {
+	t.Helper()
+	bot := dialBot(t, srv, code)
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on bot connect: %s", got)
+	}
+	if s, b := postStatus(t, srv, code, bootStatus(boot)); s != 204 {
+		t.Fatalf("status: %d %s", s, b)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on status: %s", got)
+	}
+	return bot
+}
+
+// The same process (same boot) or a status without a boot id keeps the agent busy with its order.
+func TestBot_SameOrMissingBootKeepsBusy(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	app := appSocket(t, srv, token)
+	bot := startBootBot(t, srv, code, bootA, app)
+	id := placeOrder(t, srv, token, bot, app)
+
+	bot.Close(websocket.StatusNormalClosure, "")
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on bot disconnect: %s", got)
+	}
+	startBootBot(t, srv, code, bootA, app) // same process, socket reconnected
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":true`) {
+		t.Fatalf("same boot: %s", got)
+	}
+	if s, b := postStatus(t, srv, code, bootStatus("")); s != 204 {
+		t.Fatalf("status without boot: %d %s", s, b)
+	}
+	expectNoMessage(t, app, "app after statuses that keep the order")
+	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":true`) {
+		t.Fatalf("missing boot: %s", got)
+	}
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"accepted"}`); s != 204 {
+		t.Fatalf("the order is still known: %d %s", s, b)
+	}
+}
+
+// A different boot id means the agent process restarted: it can never report the order, so the
+// gateway ends it as outcome_unknown, relays that like a posted final event and frees the agent.
+func TestBot_NewBootEndsTheOrder(t *testing.T) {
+	for name, firstBoot := range map[string]string{"recorded boot": bootA, "no recorded boot": ""} {
+		t.Run(name, func(t *testing.T) {
+			srv, svc, _ := newBotServer(t)
+			token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+			code := newCode(t, srv, token, "bot")
+			app := appSocket(t, srv, token)
+			bot := startBootBot(t, srv, code, firstBoot, app)
+			id := placeOrder(t, srv, token, bot, app)
+
+			bot.Close(websocket.StatusNormalClosure, "")
+			if got := readType(t, app); got != "bot" {
+				t.Fatalf("app on bot disconnect: %s", got)
+			}
+			bot = dialBot(t, srv, code)
+			if got := readType(t, app); got != "bot" {
+				t.Fatalf("app on reconnect: %s", got)
+			}
+			if got := getBot(t, srv, token); !strings.Contains(got, `"busy":true`) {
+				t.Fatalf("before the new process's status: %s", got)
+			}
+			if s, b := postStatus(t, srv, code, bootStatus(bootB)); s != 204 {
+				t.Fatalf("status from the restarted process: %d %s", s, b)
+			}
+			m := readJSON(t, app)
+			if m["type"] != "botEvent" || m["order_id"] != id || m["arb_key"] != "arb-1" || m["event"] != "outcome_unknown" ||
+				m["reason"] != "agent restarted" {
+				t.Fatalf("app got %v", m)
+			}
+			if got := readType(t, app); got != "bot" {
+				t.Fatalf("app after the ended order: %s", got)
+			}
+			if got := getBot(t, srv, token); !strings.Contains(got, `"busy":false`) {
+				t.Fatalf("after the new boot: %s", got)
+			}
+			if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"placed"}`); s != 404 || !strings.Contains(b, `"unknown_order"`) {
+				t.Fatalf("the ended order: %d %s", s, b)
+			}
+			placeOrder(t, srv, token, bot, app)
+			expectNoMessage(t, app, "app after one bot message per change") // an extra bot message would still be queued
+		})
+	}
+}
