@@ -788,6 +788,9 @@ func main() {
 	}
 	log.Info().Str("url", cfg.RedisURL).Msg("Connected to Redis")
 
+	// Bot log lines and screenshots: 7 days, pruned at start and hourly
+	go bots.runPrune(ctx)
+
 	// Telegram bot: hook the arb hub before the bridge starts feeding it
 	tg := setupTelegram(ctx, cfg, hub, rdb)
 
