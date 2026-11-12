@@ -145,3 +145,77 @@ func (b *botHub) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// agentView is one agent in the GET /api/me/bot/agents body.
+type agentView struct {
+	ID       int64       `json:"id"`
+	Name     string      `json:"name"`
+	Online   bool        `json:"online"`
+	Version  string      `json:"version"`
+	Host     botHost     `json:"host"`
+	LastSeen int64       `json:"lastSeen"`
+	DryRun   bool        `json:"dryRun"`
+	Busy     bool        `json:"busy"`
+	Windows  []botWindow `json:"windows"`
+}
+
+// windowsOf decodes a stored windows array; anything unreadable is no windows.
+func windowsOf(js string) []botWindow {
+	var ws []botWindow
+	if err := json.Unmarshal([]byte(js), &ws); err != nil || ws == nil {
+		return []botWindow{}
+	}
+	return ws
+}
+
+// fleet lists userID's agents for the Fleet: every non-revoked bot code with a registry row,
+// online first, then by name. An online agent shows its last status from memory; an offline one
+// its stored version, host name and windows, each window down ("Agent offline"), cpu/mem null,
+// dry run, not busy.
+func (b *botHub) fleet(userID int64) ([]agentView, error) {
+	rows, err := b.acc.ListBotAgents(userID) // by name
+	if err != nil {
+		return nil, err
+	}
+	out := make([]agentView, 0, len(rows))
+	b.mu.Lock()
+	freed := b.pruneLocked()
+	for _, row := range rows {
+		v := agentView{ID: row.CodeID, Name: row.Name, LastSeen: row.LastSeenAt}
+		if p := b.presenceLocked(userID, row.CodeID); p != nil {
+			v.Online, v.DryRun, v.Busy, v.Version = true, p.dryRun, p.busy != "", p.version
+			v.Host = botHost{Name: p.hostName, CPU: p.cpu, Mem: p.mem}
+			v.Windows = windowsOf(p.windowsJSON)
+		} else {
+			v.DryRun, v.Version, v.Host = true, row.Version, botHost{Name: row.HostName}
+			v.Windows = windowsOf(row.WindowsJSON)
+			for i := range v.Windows {
+				v.Windows[i].State, v.Windows[i].Reason = "down", "Agent offline"
+			}
+		}
+		out = append(out, v)
+	}
+	b.mu.Unlock()
+	b.notifyAll(freed)
+	slices.SortStableFunc(out, func(x, y agentView) int {
+		switch {
+		case x.Online == y.Online:
+			return 0
+		case x.Online:
+			return -1
+		default:
+			return 1
+		}
+	})
+	return out, nil
+}
+
+func (b *botHub) handleAgents(w http.ResponseWriter, r *http.Request) {
+	list, err := b.fleet(principalOf(r).UserID)
+	if err != nil {
+		log.Error().Err(err).Msg("bot agents list failed")
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	accounts.WriteJSON(w, http.StatusOK, map[string][]agentView{"agents": list})
+}

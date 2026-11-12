@@ -1,9 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+
+	"nhooyr.io/websocket"
 
 	"github.com/surebetter/api-gateway/internal/accounts"
 )
@@ -126,4 +131,107 @@ func TestBotStatus_NotifiesOnChangesButNotForCPUAndMemory(t *testing.T) {
 		t.Fatalf("cpu/mem status: %d %s", s, b)
 	}
 	expectNoMessage(t, app, "app socket after a cpu/mem-only status")
+}
+
+// getFleet returns the GET /api/me/bot/agents list for a session.
+func getFleet(t *testing.T, srv *httptest.Server, token string) []agentView {
+	t.Helper()
+	s, body := request(t, srv, "GET", "/api/me/bot/agents", token, "", nil)
+	var res struct {
+		Agents []agentView `json:"agents"`
+	}
+	if err := json.Unmarshal([]byte(body), &res); s != 200 || err != nil || res.Agents == nil {
+		t.Fatalf("GET /api/me/bot/agents: %d %s", s, body)
+	}
+	return res.Agents
+}
+
+func intp(n int) *int { return &n }
+
+func TestBotAgents_Fleet(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+
+	vps, vpsID := newBotCode(t, srv, token, "VPS Praha")
+	home, homeID := newBotCode(t, srv, token, "Home PC")
+	attic, atticID := newBotCode(t, srv, token, "attic")
+	newBotCode(t, srv, token, "Never connected")
+	otherToken := newUser(t, svc, "o@example.com", accounts.RoleUser)
+	otherCode, _ := newBotCode(t, srv, otherToken, "Other")
+	dialBot(t, srv, otherCode)
+
+	// VPS Praha: connected, reported two windows, went offline.
+	vpsSock := dialBot(t, srv, vps)
+	readType(t, app)
+	if s, b := postStatus(t, srv, vps, fullStatus("0.8.0", 5, 6, "idle")); s != 204 {
+		t.Fatalf("vps status: %d %s", s, b)
+	}
+	readType(t, app)
+	vpsSock.Close(websocket.StatusNormalClosure, "")
+	readType(t, app)
+	// attic: online, no status yet. Home PC: online, live, busy-free, with host numbers.
+	dialBot(t, srv, attic)
+	readType(t, app)
+	homeSock := dialBot(t, srv, home)
+	readType(t, app)
+	live := strings.Replace(fullStatus("0.9.0+e9ed9d2", 23, 41, "idle"), `"dryRun":true`, `"dryRun":false`, 1)
+	if s, b := postStatus(t, srv, home, live); s != 204 {
+		t.Fatalf("home status: %d %s", s, b)
+	}
+	readType(t, app)
+
+	got := getFleet(t, srv, token)
+	for i := range got {
+		if got[i].LastSeen <= 0 {
+			t.Fatalf("agent %d lastSeen = %d", got[i].ID, got[i].LastSeen)
+		}
+		got[i].LastSeen = 0
+	}
+	down := windowsOf(fullWindowsJSON)
+	for i := range down {
+		down[i].State, down[i].Reason = "down", "Agent offline"
+	}
+	want := []agentView{
+		// Online first, then by name ignoring case: attic, Home PC; then the offline VPS Praha.
+		{ID: atticID, Name: "attic", Online: true, Host: botHost{}, DryRun: true, Windows: []botWindow{}},
+		{ID: homeID, Name: "Home PC", Online: true, Version: "0.9.0+e9ed9d2", Host: botHost{Name: "home-pc", CPU: intp(23), Mem: intp(41)},
+			DryRun: false, Windows: windowsOf(fullWindowsJSON)},
+		{ID: vpsID, Name: "VPS Praha", Online: false, Version: "0.8.0", Host: botHost{Name: "home-pc"}, DryRun: true, Windows: down},
+	}
+	if !reflect.DeepEqual(got, want) {
+		gj, _ := json.Marshal(got)
+		wj, _ := json.Marshal(want)
+		t.Fatalf("fleet:\n got %s\nwant %s", gj, wj)
+	}
+	// Offline cpu/mem are null on the wire.
+	if _, body := request(t, srv, "GET", "/api/me/bot/agents", token, "", nil); !strings.Contains(body, `"host":{"name":"home-pc","cpu":null,"mem":null}`) {
+		t.Fatalf("offline host: %s", body)
+	}
+
+	// Revoking a code closes its agent's socket and drops it from the Fleet.
+	if s, b := request(t, srv, "DELETE", fmt.Sprintf("/api/me/extension-codes/%d", homeID), token, "", nil); s != 204 {
+		t.Fatalf("revoke: %d %s", s, b)
+	}
+	expectClosedBy(t, homeSock, websocket.StatusPolicyViolation, "the revoked agent's socket")
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on revoke: %s", got)
+	}
+	for _, a := range getFleet(t, srv, token) {
+		if a.ID == homeID {
+			t.Fatalf("revoked agent still listed: %+v", a)
+		}
+	}
+}
+
+func TestBotAgents_SessionOnly(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	if s, b := request(t, srv, "GET", "/api/me/bot/agents", "", "", bearer(code)); s != 403 || !strings.Contains(b, `"session_required"`) {
+		t.Fatalf("agents with a bot code: %d %s", s, b)
+	}
+	if s, b := request(t, srv, "GET", "/api/me/bot/agents", token, "", nil); s != 200 || strings.TrimSpace(b) != `{"agents":[]}` {
+		t.Fatalf("no agents: %d %s", s, b)
+	}
 }
