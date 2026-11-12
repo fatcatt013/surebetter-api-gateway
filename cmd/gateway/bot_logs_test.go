@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -120,5 +124,136 @@ func TestBotLogs_RateLimitPerCode(t *testing.T) {
 	clk.advance(time.Second)
 	if s, b := postLogs(t, srv, code, infoLines(200)); s != 204 {
 		t.Fatalf("next minute: %d %s", s, b)
+	}
+}
+
+// getLogs returns the GET /api/me/bot/logs lines for a session and query string.
+func getLogs(t *testing.T, srv *httptest.Server, token, query string) []accounts.BotLog {
+	t.Helper()
+	s, body := request(t, srv, "GET", "/api/me/bot/logs"+query, token, "", nil)
+	var res struct {
+		Lines []accounts.BotLog `json:"lines"`
+	}
+	if err := json.Unmarshal([]byte(body), &res); s != 200 || err != nil || res.Lines == nil {
+		t.Fatalf("GET logs%s: %d %s", query, s, body)
+	}
+	return res.Lines
+}
+
+func msgs(lines []accounts.BotLog) []string {
+	out := []string{}
+	for _, l := range lines {
+		out = append(out, l.Msg)
+	}
+	return out
+}
+
+func TestBotLogs_GetFilters(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	home, homeID := newBotCode(t, srv, token, "Home PC")
+	vps, _ := newBotCode(t, srv, token, "VPS Praha")
+	otherToken := newUser(t, svc, "o@example.com", accounts.RoleUser)
+	otherCode, _ := newBotCode(t, srv, otherToken, "Other")
+
+	post := func(code string, lines ...string) {
+		t.Helper()
+		if s, b := postLogs(t, srv, code, `{"lines":[`+strings.Join(lines, ",")+`]}`); s != 204 {
+			t.Fatalf("post: %d %s", s, b)
+		}
+	}
+	post(home,
+		logLine(1000, "info", "", "", "agent", "agent connected"),
+		logLine(2000, "info", "fortuna-1", "c81e55a0deadbeef", "navigate", "leg started"),
+		logLine(3000, "warn", "fortuna-1", "c81e55a0deadbeef", "checkOdds", "Odds dropped"))
+	post(vps, logLine(4000, "error", "tipsport-1", "", "placeBet", "outcome unknown"))
+	post(otherCode, logLine(5000, "error", "", "", "", "not yours"))
+
+	all := getLogs(t, srv, token, "")
+	if got := msgs(all); !slices.Equal(got, []string{"outcome unknown", "Odds dropped", "leg started", "agent connected"}) {
+		t.Fatalf("all, newest first: %v", got)
+	}
+	if l := all[1]; l.AgentID != homeID || l.Agent != "Home PC" || l.TS != 3000 || l.Level != "warn" || l.WindowID != "fortuna-1" ||
+		l.OrderID != "c81e55a0deadbeef" || l.Step != "checkOdds" {
+		t.Fatalf("line fields: %+v", l)
+	}
+	first, third := all[3].ID, all[1].ID
+	cases := map[string][]string{
+		fmt.Sprintf("?agent=%d", homeID):        {"Odds dropped", "leg started", "agent connected"},
+		"?window=fortuna-1":                     {"Odds dropped", "leg started"},
+		"?order=c81e55a0deadbeef":               {"Odds dropped", "leg started"},
+		"?problems=1":                           {"outcome unknown", "Odds dropped"},
+		"?q=odds%20DROPPED":                     {"Odds dropped"},
+		"?q=placebet":                           {"outcome unknown"},
+		fmt.Sprintf("?after=%d", first):         {"leg started", "Odds dropped", "outcome unknown"},
+		fmt.Sprintf("?after=%d&limit=1", first): {"leg started"},
+		fmt.Sprintf("?before=%d", third):        {"leg started", "agent connected"},
+		"?limit=2":                              {"outcome unknown", "Odds dropped"},
+		"?problems=1&window=fortuna-1":          {"Odds dropped"},
+	}
+	for q, want := range cases {
+		if got := msgs(getLogs(t, srv, token, q)); !slices.Equal(got, want) {
+			t.Errorf("%s: %v, want %v", q, got, want)
+		}
+	}
+	for _, q := range []string{"?agent=x", "?agent=0", "?after=-1", "?before=abc", "?after=1&before=9", "?limit=0", "?limit=501",
+		"?q=" + strings.Repeat("q", 101), "?window=" + strings.Repeat("w", 41), "?order=" + strings.Repeat("o", 33)} {
+		if s, b := request(t, srv, "GET", "/api/me/bot/logs"+q, token, "", nil); s != 400 || !strings.Contains(b, `"bad_query"`) {
+			t.Errorf("%s: %d %s, want 400 bad_query", q, s, b)
+		}
+	}
+	if s, b := request(t, srv, "GET", "/api/me/bot/logs", "", "", bearer(home)); s != 403 || !strings.Contains(b, `"session_required"`) {
+		t.Fatalf("logs with a bot code: %d %s", s, b)
+	}
+	if _, raw := request(t, srv, "GET", "/api/me/bot/logs", token, "", nil); strings.Contains(raw, `"detail"`) {
+		t.Fatalf("lines without detail must not carry the key: %s", raw)
+	}
+	if got := msgs(getLogs(t, srv, otherToken, "")); !slices.Equal(got, []string{"not yours"}) {
+		t.Fatalf("other user sees: %v", got)
+	}
+}
+
+func TestBotLogs_Text(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	home, _ := newBotCode(t, srv, token, "Home PC")
+	ts := time.Date(2026, 11, 12, 18, 4, 5, 123_000_000, time.UTC).UnixMilli()
+	body := `{"lines":[` +
+		logLine(ts, "info", "", "", "agent", "agent connected") + "," +
+		logLine(ts+1, "warn", "fortuna-1", "c81e55a0deadbeef", "checkOdds", "odds dropped\nsecond line") + "]}"
+	if s, b := postLogs(t, srv, home, body); s != 204 {
+		t.Fatalf("post: %d %s", s, b)
+	}
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/me/bot/logs.txt?problems=0&limit=1", nil)
+	req.Header.Set("Cookie", accounts.CookieName+"="+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	text, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" ||
+		resp.Header.Get("Content-Disposition") != `attachment; filename="surebetter-bot-logs.txt"` {
+		t.Fatalf("logs.txt: %d %v", resp.StatusCode, resp.Header)
+	}
+	// Oldest first, limit ignored.
+	want := "2026-11-12T18:04:05.123Z  Home PC  -  agent  info  agent connected\n" +
+		"2026-11-12T18:04:05.124Z  Home PC · fortuna-1  c81e55a0deadbeef  checkOdds  warn  odds dropped second line\n"
+	if string(text) != want {
+		t.Fatalf("logs.txt:\n%s\nwant:\n%s", text, want)
+	}
+	// Paged reads give the same file.
+	defer func(n int) { logsTextPage = n }(logsTextPage)
+	logsTextPage = 1
+	if s, b := request(t, srv, "GET", "/api/me/bot/logs.txt", token, "", nil); s != 200 || b != want {
+		t.Fatalf("logs.txt read one row per query: %d %q", s, b)
+	}
+	if s, b := request(t, srv, "GET", "/api/me/bot/logs.txt?problems=1", token, "", nil); s != 200 ||
+		b != "2026-11-12T18:04:05.124Z  Home PC · fortuna-1  c81e55a0deadbeef  checkOdds  warn  odds dropped second line\n" {
+		t.Fatalf("logs.txt?problems=1: %d %q", s, b)
+	}
+	if s, b := request(t, srv, "GET", "/api/me/bot/logs.txt?agent=x", token, "", nil); s != 400 || !strings.Contains(b, `"bad_query"`) {
+		t.Fatalf("bad query: %d %s", s, b)
 	}
 }

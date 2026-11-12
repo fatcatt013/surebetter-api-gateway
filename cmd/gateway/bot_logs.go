@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,4 +139,121 @@ func (b *botHub) handlePostLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// logsTextPage is how many rows logs.txt reads per query (a var so a test can page by 1).
+var logsTextPage = 5000
+
+// positiveInt parses a query value that must be an integer above 0.
+func positiveInt(v string) (int64, bool) {
+	n, err := strconv.ParseInt(v, 10, 64)
+	return n, err == nil && n > 0
+}
+
+// logFilterOf reads the GET /api/me/bot/logs query: agent (code id), window (≤ 40 chars), order
+// (≤ 32), problems=1, q (≤ 100 chars), after or before (log ids, not both), limit (1–500, default
+// 200). With after the lines come oldest first, else newest first. false: bad_query.
+func logFilterOf(q url.Values) (accounts.BotLogFilter, bool) {
+	f := accounts.BotLogFilter{WindowID: q.Get("window"), OrderID: q.Get("order"), Problems: q.Get("problems") == "1",
+		Query: q.Get("q"), Limit: 200}
+	if runeLen(f.WindowID) > 40 || runeLen(f.OrderID) > 32 || runeLen(f.Query) > 100 {
+		return f, false
+	}
+	var ok bool
+	if v := q.Get("agent"); v != "" {
+		if f.AgentID, ok = positiveInt(v); !ok {
+			return f, false
+		}
+	}
+	if v := q.Get("after"); v != "" {
+		if f.After, ok = positiveInt(v); !ok {
+			return f, false
+		}
+		f.Ascending = true
+	}
+	if v := q.Get("before"); v != "" {
+		if f.Before, ok = positiveInt(v); !ok || f.After != 0 {
+			return f, false
+		}
+	}
+	if v := q.Get("limit"); v != "" {
+		n, ok := positiveInt(v)
+		if !ok || n > 500 {
+			return f, false
+		}
+		f.Limit = int(n)
+	}
+	return f, true
+}
+
+func (b *botHub) handleGetLogs(w http.ResponseWriter, r *http.Request) {
+	f, ok := logFilterOf(r.URL.Query())
+	if !ok {
+		accounts.WriteError(w, http.StatusBadRequest, "bad_query")
+		return
+	}
+	lines, err := b.acc.QueryBotLogs(principalOf(r).UserID, f)
+	if err != nil {
+		log.Error().Err(err).Msg("bot logs query failed")
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	accounts.WriteJSON(w, http.StatusOK, map[string][]accounts.BotLog{"lines": lines})
+}
+
+var lineBreaks = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ")
+
+// logText is one logs.txt line: `<ISO time>  <agent> · <window>  <order>  <step>  <level>  <msg>`,
+// time in UTC with milliseconds, an agent-wide line shows just the agent, an empty order or step is "-".
+func logText(l accounts.BotLog) string {
+	where := l.Agent
+	if l.WindowID != "" {
+		where += " · " + l.WindowID
+	}
+	dash := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		return s
+	}
+	return fmt.Sprintf("%s  %s  %s  %s  %s  %s", time.UnixMilli(l.TS).UTC().Format("2006-01-02T15:04:05.000Z07:00"),
+		where, dash(l.OrderID), dash(l.Step), l.Level, lineBreaks.Replace(l.Msg))
+}
+
+// handleLogsText serves every line matching the filters (after, before and limit are ignored), oldest
+// first, as a text download. It reads logsTextPage rows per query so the database is never held
+// while a slow client downloads.
+func (b *botHub) handleLogsText(w http.ResponseWriter, r *http.Request) {
+	f, ok := logFilterOf(r.URL.Query())
+	if !ok {
+		accounts.WriteError(w, http.StatusBadRequest, "bad_query")
+		return
+	}
+	f.After, f.Before, f.Limit, f.Ascending = 0, 0, logsTextPage, true
+	userID := principalOf(r).UserID
+	page, err := b.acc.QueryBotLogs(userID, f)
+	if err != nil {
+		log.Error().Err(err).Msg("bot logs query failed")
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="surebetter-bot-logs.txt"`)
+	w.Header().Set("Cache-Control", "no-store")
+	out := bufio.NewWriter(w)
+	defer out.Flush()
+	for {
+		for _, l := range page {
+			out.WriteString(logText(l))
+			out.WriteByte('\n')
+		}
+		if len(page) < logsTextPage {
+			return
+		}
+		f.After = page[len(page)-1].ID
+		if page, err = b.acc.QueryBotLogs(userID, f); err != nil {
+			log.Error().Err(err).Msg("bot logs query failed mid-download")
+			return
+		}
+	}
 }
