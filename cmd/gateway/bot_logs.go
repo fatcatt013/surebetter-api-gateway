@@ -46,16 +46,20 @@ const (
 	logsPerMinute  = 2000 // lines per code per minute
 )
 
-// logLinesOf validates a posted batch (1–200 lines; ts > 0; level info|warn|error; msg 1–500 chars;
-// step ≤ 40, windowId ≤ 40, orderId ≤ 32 chars; detail JSON ≤ 2000 bytes) and converts it for
-// storage. An empty detail is stored as none. false: bad_logs.
-func logLinesOf(in []logLineIn) ([]accounts.BotLogLine, bool) {
+// logFuture is how far ahead of the gateway's clock a line's ts may be (agent clock skew).
+const logFuture = time.Hour
+
+// logLinesOf validates a posted batch (1–200 lines; ts within [now − 7 days, now + 1 h]; level
+// info|warn|error; msg 1–500 chars; step ≤ 40, windowId ≤ 40, orderId ≤ 32 chars; detail JSON
+// ≤ 2000 bytes) and converts it for storage. An empty detail is stored as none. false: bad_logs.
+func logLinesOf(in []logLineIn, now time.Time) ([]accounts.BotLogLine, bool) {
 	if len(in) < 1 || len(in) > maxLogBatch {
 		return nil, false
 	}
+	minTS, maxTS := now.Add(-botRetention).UnixMilli(), now.Add(logFuture).UnixMilli()
 	out := make([]accounts.BotLogLine, 0, len(in))
 	for _, l := range in {
-		if l.TS <= 0 || !logLevels[l.Level] || l.Msg == "" || runeLen(l.Msg) > 500 || runeLen(l.Step) > 40 ||
+		if l.TS < minTS || l.TS > maxTS || !logLevels[l.Level] || l.Msg == "" || runeLen(l.Msg) > 500 || runeLen(l.Step) > 40 ||
 			runeLen(l.WindowID) > 40 || runeLen(l.OrderID) > 32 {
 			return nil, false
 		}
@@ -123,7 +127,7 @@ func (b *botHub) handlePostLogs(w http.ResponseWriter, r *http.Request) {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_logs")
 		return
 	}
-	lines, ok := logLinesOf(in.Lines)
+	lines, ok := logLinesOf(in.Lines, b.now())
 	if !ok {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_logs")
 		return

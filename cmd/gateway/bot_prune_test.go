@@ -18,14 +18,15 @@ func TestBotPrune_DropsLogsAndScreenshotsOlderThanSevenDays(t *testing.T) {
 	clk := &botClock{t: time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)}
 	bots.now = clk.now
 	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
-	code := newCode(t, srv, token, "bot")
+	_, codeID := newBotCode(t, srv, token, "Home PC")
 
 	old := clk.now().Add(-botRetention - time.Minute)
 	fresh := clk.now().Add(-botRetention + time.Minute)
-	body := `{"lines":[` + logLine(old.UnixMilli(), "info", "", "", "", "old line") + "," +
-		logLine(fresh.UnixMilli(), "info", "", "", "", "fresh line") + "]}"
-	if s, b := postLogs(t, srv, code, body); s != 204 {
-		t.Fatalf("post: %d %s", s, b)
+	// Stored directly: POST /api/me/bot/logs refuses a ts over 7 days old.
+	if err := svc.AddBotLogs(userIDOf(t, svc, token), codeID, []accounts.BotLogLine{
+		{TS: old.UnixMilli(), Level: "info", Msg: "old line"}, {TS: fresh.UnixMilli(), Level: "info", Msg: "fresh line"},
+	}); err != nil {
+		t.Fatal(err)
 	}
 	dir := filepath.Join(bots.shotsDir, fmt.Sprint(userIDOf(t, svc, token)))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
