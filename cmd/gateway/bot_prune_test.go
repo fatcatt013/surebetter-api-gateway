@@ -67,3 +67,39 @@ func TestBotPrune_NoScreenshotsDirYet(t *testing.T) {
 		t.Fatalf("prune created %s: %v", bots.shotsDir, err)
 	}
 }
+
+// A .tmp file a failed or interrupted screenshot write left behind is removed by the next prune once
+// it is older than shotTmpMaxAge; a write in progress (a fresh .tmp) is not touched.
+func TestBotPrune_RemovesLeftoverTmpFiles(t *testing.T) {
+	bots := newBotHub(newConnRegistry(), nil)
+	clk := &botClock{t: time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now
+	bots.shotsDir = t.TempDir()
+	dir := filepath.Join(bots.shotsDir, "7")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, age := range map[string]time.Duration{
+		"aaaaaaaaaaaaaaaa.jpg.tmp": shotTmpMaxAge + time.Minute,
+		"bbbbbbbbbbbbbbbb.jpg.tmp": time.Second,
+		"cccccccccccccccc.jpg":     shotTmpMaxAge + time.Minute,
+	} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, jpeg(10), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := clk.now().Add(-age)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bots.prune()
+	left, _ := os.ReadDir(dir)
+	names := []string{}
+	for _, e := range left {
+		names = append(names, e.Name())
+	}
+	if strings.Join(names, ",") != "bbbbbbbbbbbbbbbb.jpg.tmp,cccccccccccccccc.jpg" {
+		t.Fatalf("after prune: %v", names)
+	}
+}

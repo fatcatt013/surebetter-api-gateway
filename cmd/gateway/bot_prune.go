@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -13,6 +14,9 @@ import (
 
 // botRetention is how long bot log lines and screenshots are kept.
 const botRetention = 7 * 24 * time.Hour
+
+// shotTmpMaxAge is how old a screenshot's temporary file must be for prune to treat it as left over.
+const shotTmpMaxAge = 10 * time.Minute
 
 // prune deletes log lines (by their ts) and screenshot files (by modification time) older than
 // botRetention, and forgets ended rate windows.
@@ -29,7 +33,7 @@ func (b *botHub) prune() {
 		}
 	}
 	if b.shotsDir != "" {
-		if n, err := pruneFiles(b.shotsDir, cutoff); err != nil {
+		if n, err := pruneFiles(b.shotsDir, cutoff, now.Add(-shotTmpMaxAge)); err != nil {
 			log.Error().Err(err).Msg("bot screenshots prune failed")
 		} else if n > 0 {
 			log.Info().Int("deleted", n).Msg("old bot screenshots pruned")
@@ -37,8 +41,9 @@ func (b *botHub) prune() {
 	}
 }
 
-// pruneFiles removes the regular files under dir modified before cutoff. A missing dir is nothing to do.
-func pruneFiles(dir string, cutoff time.Time) (int, error) {
+// pruneFiles removes the regular files under dir modified before cutoff, and the .tmp files (left
+// by a write that failed or was interrupted) modified before tmpCutoff. A missing dir is nothing to do.
+func pruneFiles(dir string, cutoff, tmpCutoff time.Time) (int, error) {
 	n := 0
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -54,7 +59,11 @@ func pruneFiles(dir string, cutoff time.Time) (int, error) {
 		if err != nil {
 			return nil // removed meanwhile
 		}
-		if info.ModTime().Before(cutoff) && os.Remove(path) == nil {
+		limit := cutoff
+		if strings.HasSuffix(path, ".tmp") {
+			limit = tmpCutoff
+		}
+		if info.ModTime().Before(limit) && os.Remove(path) == nil {
 			n++
 		}
 		return nil

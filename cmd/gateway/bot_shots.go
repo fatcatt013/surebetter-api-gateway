@@ -37,16 +37,21 @@ func (b *botHub) shotPath(userID int64, id string) string {
 	return filepath.Join(b.shotsDir, strconv.FormatInt(userID, 10), id+".jpg")
 }
 
-// writeShot writes data to path through a temporary file, so a reader never sees half a JPEG.
+// writeShot writes data to path through a temporary file, so a reader never sees half a JPEG. On
+// failure the temporary file is removed (one a crash leaves behind is removed by prune).
 func writeShot(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
+	err := os.WriteFile(tmp, data, 0o600)
+	if err == nil {
+		err = os.Rename(tmp, path)
 	}
-	return os.Rename(tmp, path)
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
 }
 
 // dirUsage counts the regular files directly in dir and their bytes. A missing dir is empty.

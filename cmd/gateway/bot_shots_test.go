@@ -183,3 +183,17 @@ func TestBotShots_FailedWriteIsNotCounted(t *testing.T) {
 		}
 	}
 }
+
+// A write that fails after its temporary file was created removes that file.
+func TestBotShots_FailedWriteRemovesTmp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "0123456789abcdef.jpg")
+	if err := os.MkdirAll(filepath.Join(path, "x"), 0o700); err != nil { // the rename target is a non-empty directory
+		t.Fatal(err)
+	}
+	if err := writeShot(path, jpeg(10)); err == nil {
+		t.Fatal("writeShot over a directory must fail")
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("the temporary file is left: %v", err)
+	}
+}
