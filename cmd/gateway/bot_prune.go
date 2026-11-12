@@ -15,11 +15,12 @@ import (
 const botRetention = 7 * 24 * time.Hour
 
 // prune deletes log lines (by their ts) and screenshot files (by modification time) older than
-// botRetention, and forgets ended log-rate windows.
+// botRetention, and forgets ended rate windows.
 func (b *botHub) prune() {
 	now := b.now()
 	cutoff := now.Add(-botRetention)
 	b.logs.prune(now)
+	b.shots.prune(now)
 	if b.acc != nil {
 		if n, err := b.acc.PruneBotLogs(cutoff.UnixMilli()); err != nil {
 			log.Error().Err(err).Msg("bot logs prune failed")

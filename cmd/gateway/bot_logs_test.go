@@ -123,15 +123,20 @@ func TestBotLogs_DetailKeepsOnlyKnownKeys(t *testing.T) {
 	}
 }
 
-func TestBotLogs_RateLimitPerCode(t *testing.T) {
+func TestBotLogs_RateLimitPerUser(t *testing.T) {
 	srv, svc, bots := newBotServer(t)
 	clk := fixClock(bots)
 	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
 	code := newCode(t, srv, token, "bot")
-	other := newCode(t, srv, token, "bot")
+	sameUser := newCode(t, srv, token, "bot")
+	otherUser := newCode(t, srv, newUser(t, svc, "o@example.com", accounts.RoleUser), "bot")
 
-	for i := 0; i < 10; i++ { // 2 000 lines in the minute
-		if s, b := postLogs(t, srv, code, infoLines(200)); s != 204 {
+	for i := 0; i < 10; i++ { // 2 000 lines in the minute, over two codes of one user
+		c := code
+		if i%2 == 1 {
+			c = sameUser
+		}
+		if s, b := postLogs(t, srv, c, infoLines(200)); s != 204 {
 			t.Fatalf("batch %d: %d %s", i, s, b)
 		}
 	}
@@ -139,12 +144,39 @@ func TestBotLogs_RateLimitPerCode(t *testing.T) {
 	if s, b := postLogs(t, srv, code, infoLines(1)); s != 429 || !strings.Contains(b, `"too_many_logs"`) {
 		t.Fatalf("line 2 001: %d %s", s, b)
 	}
-	if s, b := postLogs(t, srv, other, infoLines(1)); s != 204 {
-		t.Fatalf("another code has its own budget: %d %s", s, b)
+	if s, b := postLogs(t, srv, newCode(t, srv, token, "bot"), infoLines(1)); s != 429 || !strings.Contains(b, `"too_many_logs"`) {
+		t.Fatalf("a new code of the same user shares its budget: %d %s", s, b)
+	}
+	if s, b := postLogs(t, srv, otherUser, infoLines(1)); s != 204 {
+		t.Fatalf("another user has its own budget: %d %s", s, b)
 	}
 	clk.advance(time.Second)
 	if s, b := postLogs(t, srv, code, infoLines(200)); s != 204 {
 		t.Fatalf("next minute: %d %s", s, b)
+	}
+}
+
+// Lines that were not stored do not count against the minute's budget.
+func TestBotLogs_FailedInsertIsNotCounted(t *testing.T) {
+	srv, svc, bots, db := newBotServerDB(t)
+	fixClock(bots)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	if _, err := db.Exec(`CREATE TRIGGER fail_logs BEFORE INSERT ON bot_logs BEGIN SELECT RAISE(ABORT, 'test'); END`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if s, b := postLogs(t, srv, code, infoLines(200)); s != 500 {
+			t.Fatalf("failing insert %d: %d %s", i, s, b)
+		}
+	}
+	if _, err := db.Exec(`DROP TRIGGER fail_logs`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if s, b := postLogs(t, srv, code, infoLines(200)); s != 204 {
+			t.Fatalf("batch %d after the failures: %d %s", i, s, b)
+		}
 	}
 }
 

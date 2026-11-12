@@ -44,7 +44,7 @@ const (
 	maxLogBody     = 2 << 20 // POST body bytes: 200 lines of escaped 500-char messages and details can pass 1 MiB
 	maxLogBatch    = 200     // lines per POST
 	maxDetailBytes = 2000    // stored detail JSON
-	logsPerMinute  = 2000    // lines per code per minute
+	logsPerMinute  = 2000    // lines per user per minute (all its codes together)
 )
 
 // logFuture is how far ahead of the gateway's clock a line's ts may be (agent clock skew).
@@ -78,10 +78,11 @@ func logLinesOf(in []logLineIn, now time.Time) ([]accounts.BotLogLine, bool) {
 	return out, true
 }
 
-// logLimiter allows each code logsPerMinute lines per fixed one-minute window.
-type logLimiter struct {
+// minuteLimiter allows each key (a user id) limit units per fixed one-minute window.
+type minuteLimiter struct {
+	limit   int
 	mu      sync.Mutex
-	windows map[int64]logWindow // code id → its current window
+	windows map[int64]logWindow // key → its current window
 }
 
 type logWindow struct {
@@ -89,28 +90,40 @@ type logWindow struct {
 	n     int
 }
 
-// allow counts n lines for codeID at now; false (nothing counted) when that would exceed the limit.
-func (l *logLimiter) allow(codeID int64, n int, now time.Time) bool {
+// allow counts n units for key at now; false (nothing counted) when that would exceed the limit.
+// start identifies the window counted in, for refund.
+func (l *minuteLimiter) allow(key int64, n int, now time.Time) (start time.Time, ok bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.windows == nil {
 		l.windows = map[int64]logWindow{}
 	}
-	w := l.windows[codeID]
+	w := l.windows[key]
 	if now.Sub(w.start) >= time.Minute {
 		w = logWindow{start: now}
 	}
-	if w.n+n > logsPerMinute {
-		l.windows[codeID] = w
-		return false
+	if w.n+n > l.limit {
+		l.windows[key] = w
+		return w.start, false
 	}
 	w.n += n
-	l.windows[codeID] = w
-	return true
+	l.windows[key] = w
+	return w.start, true
+}
+
+// refund takes back n units allow counted in the window that began at start, if that window is
+// still key's current one (units that were not used: nothing was stored).
+func (l *minuteLimiter) refund(key int64, n int, start time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if w, ok := l.windows[key]; ok && w.start.Equal(start) {
+		w.n = max(w.n-n, 0)
+		l.windows[key] = w
+	}
 }
 
 // prune forgets windows that ended before now.
-func (l *logLimiter) prune(now time.Time) {
+func (l *minuteLimiter) prune(now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for id, w := range l.windows {
@@ -134,11 +147,13 @@ func (b *botHub) handlePostLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := principalOf(r)
-	if !b.logs.allow(p.CodeID, len(lines), b.now()) {
+	window, ok := b.logs.allow(p.UserID, len(lines), b.now())
+	if !ok {
 		accounts.WriteError(w, http.StatusTooManyRequests, "too_many_logs")
 		return
 	}
 	if err := b.acc.AddBotLogs(p.UserID, p.CodeID, lines); err != nil {
+		b.logs.refund(p.UserID, len(lines), window) // not stored: not counted
 		log.Error().Err(err).Msg("bot logs insert failed")
 		accounts.WriteError(w, http.StatusInternalServerError, "internal")
 		return

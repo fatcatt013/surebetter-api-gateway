@@ -79,13 +79,16 @@ type botHub struct {
 	mu     sync.Mutex
 	agents map[int64]map[int64]*botPresence // user id → code id → presence
 	orders map[string]botOrder              // order id → order, until its final event or orderMemory
-	logs   logLimiter                       // POST /api/me/bot/logs lines per code per minute
+	logs   *minuteLimiter                   // POST /api/me/bot/logs lines per user per minute
+	shots  *minuteLimiter                   // POST /api/me/bot/screenshots per user per minute
 	// shotsDir holds screenshots as <user id>/<id>.jpg (<data dir>/bot-screenshots); "" = none.
 	shotsDir string
+	shotsMu  sync.Mutex // held from a user directory's size check to the write, so uploads cannot overrun the cap
 }
 
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
-	return &botHub{reg: reg, acc: acc, now: time.Now, agents: map[int64]map[int64]*botPresence{}, orders: map[string]botOrder{}}
+	return &botHub{reg: reg, acc: acc, now: time.Now, agents: map[int64]map[int64]*botPresence{}, orders: map[string]botOrder{},
+		logs: &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}}
 }
 
 func (b *botHub) view(userID int64) botView {

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/surebetter/api-gateway/internal/accounts"
 )
@@ -97,5 +98,88 @@ func TestBotShots_UploadErrors(t *testing.T) {
 	}
 	if s, b := request(t, srv, "POST", "/api/me/bot/screenshots", token, string(jpeg(10)), nil); s != 403 || !strings.Contains(b, `"bot_code_required"`) {
 		t.Fatalf("upload with a session: %d %s", s, b)
+	}
+}
+
+func TestBotShots_RateLimitPerUser(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	clk := fixClock(bots)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	sameUser := newCode(t, srv, token, "bot")
+	otherUser := newCode(t, srv, newUser(t, svc, "o@example.com", accounts.RoleUser), "bot")
+
+	for i := 0; i < 30; i++ {
+		c := code
+		if i%2 == 1 {
+			c = sameUser
+		}
+		if s, b := postShot(t, srv, c, jpeg(100)); s != 201 {
+			t.Fatalf("shot %d: %d %s", i, s, b)
+		}
+	}
+	clk.advance(59 * time.Second)
+	if s, b := postShot(t, srv, sameUser, jpeg(100)); s != 429 || !strings.Contains(b, `"too_many_shots"`) {
+		t.Fatalf("shot 31: %d %s", s, b)
+	}
+	if s, b := postShot(t, srv, otherUser, jpeg(100)); s != 201 {
+		t.Fatalf("another user has its own budget: %d %s", s, b)
+	}
+	clk.advance(time.Second)
+	if s, b := postShot(t, srv, code, jpeg(100)); s != 201 {
+		t.Fatalf("next minute: %d %s", s, b)
+	}
+}
+
+func TestBotShots_UserDirCap(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	other := newCode(t, srv, newUser(t, svc, "o@example.com", accounts.RoleUser), "bot")
+	defer func(n int, b int64) { maxShotFiles, maxShotDirBytes = n, b }(maxShotFiles, maxShotDirBytes)
+
+	maxShotFiles, maxShotDirBytes = 3, 1<<30
+	for i := 0; i < 3; i++ {
+		if s, b := postShot(t, srv, code, jpeg(100)); s != 201 {
+			t.Fatalf("file %d: %d %s", i+1, s, b)
+		}
+	}
+	if s, b := postShot(t, srv, code, jpeg(100)); s != 429 || !strings.Contains(b, `"shots_full"`) {
+		t.Fatalf("file 4: %d %s", s, b)
+	}
+	if s, b := postShot(t, srv, other, jpeg(100)); s != 201 {
+		t.Fatalf("another user's directory: %d %s", s, b)
+	}
+
+	maxShotFiles, maxShotDirBytes = 100, 300+250 // 3 × 100 bytes stored
+	if s, b := postShot(t, srv, code, jpeg(251)); s != 429 || !strings.Contains(b, `"shots_full"`) {
+		t.Fatalf("over the byte cap: %d %s", s, b)
+	}
+	if s, b := postShot(t, srv, code, jpeg(250)); s != 201 {
+		t.Fatalf("up to the byte cap: %d %s", s, b)
+	}
+}
+
+// A screenshot that could not be stored does not count against the minute's budget.
+func TestBotShots_FailedWriteIsNotCounted(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	fixClock(bots)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	if err := os.WriteFile(bots.shotsDir, nil, 0o600); err != nil { // a file where the directory goes
+		t.Fatal(err)
+	}
+	for i := 0; i < 30; i++ {
+		if s, b := postShot(t, srv, code, jpeg(100)); s != 500 {
+			t.Fatalf("failing write %d: %d %s", i, s, b)
+		}
+	}
+	if err := os.Remove(bots.shotsDir); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 30; i++ {
+		if s, b := postShot(t, srv, code, jpeg(100)); s != 201 {
+			t.Fatalf("shot %d after the failures: %d %s", i, s, b)
+		}
 	}
 }

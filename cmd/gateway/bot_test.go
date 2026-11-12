@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,13 @@ import (
 // newBotServer is newAuthServer (AUTH_REQUIRED on) that also returns the bot hub.
 func newBotServer(t *testing.T) (*httptest.Server, *accounts.Service, *botHub) {
 	t.Helper()
+	srv, svc, bots, _ := newBotServerDB(t)
+	return srv, svc, bots
+}
+
+// newBotServerDB is newBotServer that also returns the accounts database.
+func newBotServerDB(t *testing.T) (*httptest.Server, *accounts.Service, *botHub, *sql.DB) {
+	t.Helper()
 	db, err := accounts.OpenDB(filepath.Join(t.TempDir(), "accounts.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -35,7 +43,7 @@ func newBotServer(t *testing.T) (*httptest.Server, *accounts.Service, *botHub) {
 	cfg := Config{SnapshotCacheMs: 500, MaxClients: 10}
 	srv := httptest.NewServer(newMux(NewHub(cfg), NewValueHub(cfg), nil, &wsGate{acc: svc, reg: reg, required: true, bots: bots}))
 	t.Cleanup(srv.Close)
-	return srv, svc, bots
+	return srv, svc, bots, db
 }
 
 // newCode creates a code of kind ("extension" or "bot") for the session token's user.

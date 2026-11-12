@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +17,18 @@ import (
 
 // maxShotBytes is the largest screenshot an agent may upload.
 const maxShotBytes = 1_500_000
+
+// shotsPerMinute is how many screenshots a user's agents may upload per minute, all codes together.
+const shotsPerMinute = 30
+
+// A user's screenshot directory holds at most maxShotFiles files and maxShotDirBytes bytes (the data
+// volume also holds accounts.db). Vars so a test can lower them.
+var (
+	maxShotFiles          = 500
+	maxShotDirBytes int64 = 300_000_000
+)
+
+var errShotsFull = errors.New("shots_full")
 
 var shotIDPattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
@@ -36,8 +49,48 @@ func writeShot(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
+// dirUsage counts the regular files directly in dir and their bytes. A missing dir is empty.
+func dirUsage(dir string) (files int, bytes int64, err error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue // removed meanwhile
+		}
+		files++
+		bytes += info.Size()
+	}
+	return files, bytes, nil
+}
+
+// storeShot writes userID's screenshot id unless that would put the user's directory over
+// maxShotFiles files or maxShotDirBytes bytes (errShotsFull). At most 500 files: a scan is cheap.
+func (b *botHub) storeShot(userID int64, id string, data []byte) error {
+	path := b.shotPath(userID, id)
+	b.shotsMu.Lock()
+	defer b.shotsMu.Unlock()
+	files, bytes, err := dirUsage(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	if files+1 > maxShotFiles || bytes+int64(len(data)) > maxShotDirBytes {
+		return errShotsFull
+	}
+	return writeShot(path, data)
+}
+
 // handlePostShot stores a JPEG (raw body, ≤ maxShotBytes, starting FF D8 FF) for the agent's user
-// and answers its id. ?window= and ?order= are only logged.
+// and answers its id: at most shotsPerMinute per user (a failed write is not counted; a full
+// directory is), within the directory caps. ?window= and ?order= are only logged.
 func (b *botHub) handlePostShot(w http.ResponseWriter, r *http.Request) {
 	if b.shotsDir == "" {
 		log.Error().Msg("bot screenshot upload without a screenshots directory")
@@ -55,8 +108,18 @@ func (b *botHub) handlePostShot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := principalOf(r)
+	window, ok := b.shots.allow(p.UserID, 1, b.now())
+	if !ok {
+		accounts.WriteError(w, http.StatusTooManyRequests, "too_many_shots")
+		return
+	}
 	id := newOrderID() // 16 random hex characters
-	if err := writeShot(b.shotPath(p.UserID, id), data); err != nil {
+	switch err := b.storeShot(p.UserID, id, data); {
+	case errors.Is(err, errShotsFull):
+		accounts.WriteError(w, http.StatusTooManyRequests, "shots_full")
+		return
+	case err != nil:
+		b.shots.refund(p.UserID, 1, window) // not stored: not counted
 		log.Error().Err(err).Msg("bot screenshot write failed")
 		accounts.WriteError(w, http.StatusInternalServerError, "internal")
 		return
