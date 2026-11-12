@@ -37,6 +37,7 @@ type BotLogFilter struct {
 	OrderID   string // exact
 	Problems  bool   // warn and error only
 	Query     string // substring of msg or step, case-insensitive (ASCII letters)
+	Since     int64  // ts at or after (Unix ms); 0 = no bound
 	After     int64  // ids above
 	Before    int64  // ids below
 	Ascending bool   // oldest first; default newest first
@@ -64,8 +65,8 @@ func (s *Service) AddBotLogs(userID, codeID int64, lines []BotLogLine) error {
 	return tx.Commit()
 }
 
-// QueryBotLogs returns userID's log lines matching f, each with its agent's (code's) name.
-func (s *Service) QueryBotLogs(userID int64, f BotLogFilter) ([]BotLog, error) {
+// botLogsQuery builds the QueryBotLogs SQL and its arguments.
+func botLogsQuery(userID int64, f BotLogFilter) (string, []any) {
 	q := `SELECT l.id, l.ts, l.code_id, COALESCE(c.name, ''), l.level, l.window_id, l.order_id, l.step, l.msg, l.detail
 		FROM bot_logs l LEFT JOIN extension_codes c ON c.id = l.code_id WHERE l.user_id = ?`
 	args := []any{userID}
@@ -82,12 +83,16 @@ func (s *Service) QueryBotLogs(userID int64, f BotLogFilter) ([]BotLog, error) {
 		args = append(args, f.OrderID)
 	}
 	if f.Problems {
-		q += ` AND l.level IN ('warn', 'error')`
+		q += ` AND l.level <> 'info'` // the exact term of the partial index bot_logs_problems
 	}
 	if f.Query != "" {
 		lq := strings.ToLower(f.Query)
 		q += ` AND (instr(lower(l.msg), ?) > 0 OR instr(lower(l.step), ?) > 0)`
 		args = append(args, lq, lq)
+	}
+	if f.Since > 0 {
+		q += ` AND l.ts >= ?`
+		args = append(args, f.Since)
 	}
 	if f.After > 0 {
 		q += ` AND l.id > ?`
@@ -106,6 +111,12 @@ func (s *Service) QueryBotLogs(userID int64, f BotLogFilter) ([]BotLog, error) {
 		q += ` LIMIT ?`
 		args = append(args, f.Limit)
 	}
+	return q, args
+}
+
+// QueryBotLogs returns userID's log lines matching f, each with its agent's (code's) name.
+func (s *Service) QueryBotLogs(userID int64, f BotLogFilter) ([]BotLog, error) {
+	q, args := botLogsQuery(userID, f)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -126,11 +137,25 @@ func (s *Service) QueryBotLogs(userID int64, f BotLogFilter) ([]BotLog, error) {
 	return out, rows.Err()
 }
 
-// PruneBotLogs deletes every user's log lines with ts before beforeMs and returns how many.
+// pruneBatch is how many log lines PruneBotLogs deletes per statement (a var so a test can lower it).
+var pruneBatch = 5000
+
+// PruneBotLogs deletes every user's log lines with ts before beforeMs and returns how many. It
+// deletes pruneBatch lines per statement, so other queries get the single connection in between.
 func (s *Service) PruneBotLogs(beforeMs int64) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM bot_logs WHERE ts < ?`, beforeMs)
-	if err != nil {
-		return 0, err
+	var total int64
+	for {
+		res, err := s.db.Exec(`DELETE FROM bot_logs WHERE id IN (SELECT id FROM bot_logs WHERE ts < ? LIMIT ?)`, beforeMs, pruneBatch)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < int64(pruneBatch) {
+			return total, nil
+		}
 	}
-	return res.RowsAffected()
 }

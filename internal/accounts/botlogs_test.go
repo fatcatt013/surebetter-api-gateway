@@ -2,6 +2,7 @@ package accounts
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -79,6 +80,72 @@ func TestBotLogs_AddQueryPrune(t *testing.T) {
 		t.Fatalf("prune: %d %v", n, err)
 	}
 	if got, _ := s.QueryBotLogs(user.UserID, BotLogFilter{}); !slices.Equal(logIDs(got), []int64{4, 3}) {
+		t.Fatalf("after prune: %v", logIDs(got))
+	}
+}
+
+// queryPlan is SQLite's EXPLAIN QUERY PLAN for q, its detail column joined.
+func queryPlan(t *testing.T, s *Service, q string, args []any) string {
+	t.Helper()
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN `+q, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, detail)
+	}
+	return strings.Join(out, "; ")
+}
+
+// The problems filter reads the partial index of warn and error lines, not every line of the user.
+func TestBotLogs_ProblemsUseThePartialIndex(t *testing.T) {
+	s, _, _ := newTestService(t)
+	for _, f := range []BotLogFilter{{Problems: true, Limit: 10}, {Problems: true, Before: 99, Limit: 10}, {Problems: true, After: 5, Ascending: true}} {
+		q, args := botLogsQuery(7, f)
+		if plan := queryPlan(t, s, q, args); !strings.Contains(plan, "bot_logs_problems") {
+			t.Errorf("%+v: plan %q does not use bot_logs_problems", f, plan)
+		}
+	}
+}
+
+func TestBotLogs_SinceFilter(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	home, _ := s.CreateCode(user.UserID, "Home PC", KindBot)
+	if err := s.AddBotLogs(user.UserID, home.ID, []BotLogLine{
+		{TS: 1000, Level: "info", Msg: "odds old"}, {TS: 2000, Level: "info", Msg: "odds edge"}, {TS: 3000, Level: "info", Msg: "odds new"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.QueryBotLogs(user.UserID, BotLogFilter{Query: "odds", Since: 2000}); err != nil || !slices.Equal(logIDs(got), []int64{3, 2}) {
+		t.Fatalf("since 2000: %v %v", logIDs(got), err)
+	}
+}
+
+func TestBotLogs_PruneInBatches(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	home, _ := s.CreateCode(user.UserID, "Home PC", KindBot)
+	lines := []BotLogLine{}
+	for ts := int64(1); ts <= 7; ts++ {
+		lines = append(lines, BotLogLine{TS: ts * 1000, Level: "info", Msg: "x"})
+	}
+	if err := s.AddBotLogs(user.UserID, home.ID, lines); err != nil {
+		t.Fatal(err)
+	}
+	defer func(n int) { pruneBatch = n }(pruneBatch)
+	pruneBatch = 2
+	if n, err := s.PruneBotLogs(6000); err != nil || n != 5 {
+		t.Fatalf("prune: %d %v, want 5 across batches", n, err)
+	}
+	if got, _ := s.QueryBotLogs(user.UserID, BotLogFilter{}); !slices.Equal(logIDs(got), []int64{7, 6}) {
 		t.Fatalf("after prune: %v", logIDs(got))
 	}
 }

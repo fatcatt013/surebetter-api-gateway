@@ -99,6 +99,8 @@ var migrations = []string{
 	);
 	CREATE INDEX bot_logs_user_id ON bot_logs (user_id, id);
 	CREATE INDEX bot_logs_ts ON bot_logs (ts);`,
+	// 4: the problems filter (warn and error lines) reads only those lines.
+	`CREATE INDEX bot_logs_problems ON bot_logs (user_id, id) WHERE level <> 'info';`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

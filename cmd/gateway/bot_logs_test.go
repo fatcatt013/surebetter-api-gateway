@@ -162,18 +162,19 @@ func TestBotLogs_GetFilters(t *testing.T) {
 			t.Fatalf("post: %d %s", s, b)
 		}
 	}
+	base := time.Now().Add(-time.Hour).UnixMilli()
 	post(home,
-		logLine(1000, "info", "", "", "agent", "agent connected"),
-		logLine(2000, "info", "fortuna-1", "c81e55a0deadbeef", "navigate", "leg started"),
-		logLine(3000, "warn", "fortuna-1", "c81e55a0deadbeef", "checkOdds", "Odds dropped"))
-	post(vps, logLine(4000, "error", "tipsport-1", "", "placeBet", "outcome unknown"))
-	post(otherCode, logLine(5000, "error", "", "", "", "not yours"))
+		logLine(base+1000, "info", "", "", "agent", "agent connected"),
+		logLine(base+2000, "info", "fortuna-1", "c81e55a0deadbeef", "navigate", "leg started"),
+		logLine(base+3000, "warn", "fortuna-1", "c81e55a0deadbeef", "checkOdds", "Odds dropped"))
+	post(vps, logLine(base+4000, "error", "tipsport-1", "", "placeBet", "outcome unknown"))
+	post(otherCode, logLine(base+5000, "error", "", "", "", "not yours"))
 
 	all := getLogs(t, srv, token, "")
 	if got := msgs(all); !slices.Equal(got, []string{"outcome unknown", "Odds dropped", "leg started", "agent connected"}) {
 		t.Fatalf("all, newest first: %v", got)
 	}
-	if l := all[1]; l.AgentID != homeID || l.Agent != "Home PC" || l.TS != 3000 || l.Level != "warn" || l.WindowID != "fortuna-1" ||
+	if l := all[1]; l.AgentID != homeID || l.Agent != "Home PC" || l.TS != base+3000 || l.Level != "warn" || l.WindowID != "fortuna-1" ||
 		l.OrderID != "c81e55a0deadbeef" || l.Step != "checkOdds" {
 		t.Fatalf("line fields: %+v", l)
 	}
@@ -255,5 +256,30 @@ func TestBotLogs_Text(t *testing.T) {
 	}
 	if s, b := request(t, srv, "GET", "/api/me/bot/logs.txt?agent=x", token, "", nil); s != 400 || !strings.Contains(b, `"bad_query"`) {
 		t.Fatalf("bad query: %d %s", s, b)
+	}
+}
+
+// A q search reads only the last 7 days, so lines the hourly prune has not reached yet are not scanned.
+func TestBotLogs_QueryReadsOnlySevenDays(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	clk := &botClock{t: time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	_, codeID := newBotCode(t, srv, token, "Home PC")
+	uid := userIDOf(t, svc, token)
+	if err := svc.AddBotLogs(uid, codeID, []accounts.BotLogLine{
+		{TS: clk.now().Add(-botRetention - time.Minute).UnixMilli(), Level: "info", Msg: "odds old"},
+		{TS: clk.now().Add(-botRetention + time.Minute).UnixMilli(), Level: "info", Msg: "odds fresh"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := msgs(getLogs(t, srv, token, "?q=odds")); !slices.Equal(got, []string{"odds fresh"}) {
+		t.Fatalf("q: %v", got)
+	}
+	if s, b := request(t, srv, "GET", "/api/me/bot/logs.txt?q=odds", token, "", nil); s != 200 || strings.Contains(b, "odds old") || !strings.Contains(b, "odds fresh") {
+		t.Fatalf("logs.txt?q: %d %q", s, b)
+	}
+	if got := msgs(getLogs(t, srv, token, "")); len(got) != 2 {
+		t.Fatalf("without q every stored line is listed: %v", got)
 	}
 }

@@ -186,8 +186,18 @@ func logFilterOf(q url.Values) (accounts.BotLogFilter, bool) {
 	return f, true
 }
 
+// logFilter is logFilterOf; a q search also reads only the last botRetention (lines the hourly prune
+// has not reached yet are not scanned).
+func (b *botHub) logFilter(q url.Values) (accounts.BotLogFilter, bool) {
+	f, ok := logFilterOf(q)
+	if ok && f.Query != "" {
+		f.Since = b.now().Add(-botRetention).UnixMilli()
+	}
+	return f, ok
+}
+
 func (b *botHub) handleGetLogs(w http.ResponseWriter, r *http.Request) {
-	f, ok := logFilterOf(r.URL.Query())
+	f, ok := b.logFilter(r.URL.Query())
 	if !ok {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_query")
 		return
@@ -224,7 +234,7 @@ func logText(l accounts.BotLog) string {
 // first, as a text download. It reads logsTextPage rows per query so the database is never held
 // while a slow client downloads.
 func (b *botHub) handleLogsText(w http.ResponseWriter, r *http.Request) {
-	f, ok := logFilterOf(r.URL.Query())
+	f, ok := b.logFilter(r.URL.Query())
 	if !ok {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_query")
 		return
