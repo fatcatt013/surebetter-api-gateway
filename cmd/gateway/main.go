@@ -692,7 +692,7 @@ func metricsHandler(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier) http.Ha
 func newMux(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier, gate *wsGate) *http.ServeMux {
 	mux := http.NewServeMux()
 	if gate != nil && gate.acc != nil && gate.bots == nil {
-		gate.bots = newBotHub(gate.reg) // tests build wsGate literals without one
+		gate.bots = newBotHub(gate.reg, gate.acc) // tests build wsGate literals without one
 	}
 	mux.HandleFunc("/ws", wsHandler(hub, gate, true))
 	mux.HandleFunc("/ws/value", wsHandler(valueHub, gate, false))
@@ -758,7 +758,7 @@ func main() {
 	if !cfg.AuthRequired {
 		log.Warn().Msg("AUTH_REQUIRED=false: the feed, the snapshots and the Telegram settings are open to anyone")
 	}
-	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired, bots: newBotHub(reg)}
+	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired, bots: newBotHub(reg, acc)}
 
 	hub := NewHub(cfg)
 	valueHub := NewValueHub(cfg)

@@ -17,13 +17,13 @@ import (
 	"github.com/surebetter/api-gateway/internal/accounts"
 )
 
-// botBook is one bookmaker the bot runs, as its last status reported it.
+// botBook is one bookmaker an agent runs, as its last status reported it.
 type botBook struct {
 	Bookmaker string `json:"bookmaker"`
 	Ready     bool   `json:"ready"`
 }
 
-// botView is the GET /api/me/bot body.
+// botView is the GET /api/me/bot body: all of the user's online agents together.
 type botView struct {
 	Online bool      `json:"online"`
 	Books  []botBook `json:"books"`
@@ -31,73 +31,116 @@ type botView struct {
 	Busy   bool      `json:"busy"`
 }
 
-// botPresence is one user's open bot socket and the bot's last status.
+// botPresence is one agent's open bot socket (one per bot code) and its last status.
 type botPresence struct {
-	client *Client
-	books  []botBook
-	dryRun bool
-	busy   string // id of the order the bot is running; "" = idle
+	client    *Client
+	books     []botBook
+	dryRun    bool
+	busy      string    // id of the order the agent is running; "" = idle
+	freeSince time.Time // when the agent last became idle (socket open or busy cleared)
 }
 
-// view of a presence; a nil presence is the offline answer.
-func (p *botPresence) view() botView {
-	if p == nil {
+// viewOf aggregates a user's online agents. No agents is the offline answer. A bookmaker is ready
+// when it is ready on an agent that is not busy; dry run when any agent is in dry run; busy when
+// every agent is busy.
+func viewOf(agents map[int64]*botPresence) botView {
+	if len(agents) == 0 {
 		return botView{Books: []botBook{}, DryRun: true}
 	}
-	return botView{Online: true, Books: append([]botBook{}, p.books...), DryRun: p.dryRun, Busy: p.busy != ""}
+	ready := map[string]bool{}
+	v := botView{Online: true, Busy: true}
+	for _, p := range agents {
+		v.DryRun = v.DryRun || p.dryRun
+		v.Busy = v.Busy && p.busy != ""
+		for _, b := range p.books {
+			ready[b.Bookmaker] = ready[b.Bookmaker] || (b.Ready && p.busy == "")
+		}
+	}
+	v.Books = make([]botBook, 0, len(ready))
+	for book, ok := range ready {
+		v.Books = append(v.Books, botBook{Bookmaker: book, Ready: ok})
+	}
+	slices.SortFunc(v.Books, func(a, b botBook) int { return strings.Compare(a.Bookmaker, b.Bookmaker) })
+	return v
 }
 
-// botHub holds each user's bot presence and the orders sent to bots, in memory (one gateway
-// instance: a restart means offline until the bot reconnects, and forgets sent orders). It tells
-// the user's other /ws sockets when presence changes.
+// botHub holds each user's agents (bot sockets, one per bot code) and the orders sent to them, in
+// memory (one gateway instance: a restart means offline until the agents reconnect, and forgets
+// sent orders). It records agents in the accounts DB and tells the user's other /ws sockets when
+// presence changes.
 type botHub struct {
 	reg    *connRegistry
+	acc    *accounts.Service // agent registry; nil in unit tests that need no DB
 	now    func() time.Time
 	mu     sync.Mutex
-	bots   map[int64]*botPresence // user id → presence
-	orders map[string]botOrder    // order id → order, until its final event or orderMemory
+	agents map[int64]map[int64]*botPresence // user id → code id → presence
+	orders map[string]botOrder              // order id → order, until its final event or orderMemory
 }
 
-func newBotHub(reg *connRegistry) *botHub {
-	return &botHub{reg: reg, now: time.Now, bots: map[int64]*botPresence{}, orders: map[string]botOrder{}}
+func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
+	return &botHub{reg: reg, acc: acc, now: time.Now, agents: map[int64]map[int64]*botPresence{}, orders: map[string]botOrder{}}
 }
 
 func (b *botHub) view(userID int64) botView {
 	b.mu.Lock()
 	freed := b.pruneLocked()
-	v := b.bots[userID].view()
+	v := viewOf(b.agents[userID])
 	b.mu.Unlock()
 	b.notifyAll(freed)
 	return v
 }
 
-// attach makes c its user's bot socket: online, no books yet, dry run, idle. The user's older bot
-// socket, if any, is closed, and its busy state goes with it.
+// presenceLocked returns userID's agent for codeID, or nil. b.mu must be held.
+func (b *botHub) presenceLocked(userID, codeID int64) *botPresence {
+	return b.agents[userID][codeID]
+}
+
+// attach makes c the bot socket of its code's agent: online, no books yet, dry run, idle. That
+// code's older socket, if any, is closed, and its busy state goes with it; other codes' agents
+// stay. The agent's registry row is upserted before the app is told.
 func (b *botHub) attach(c *Client) {
-	userID := c.principal.UserID
+	userID, codeID := c.principal.UserID, c.principal.CodeID
 	b.mu.Lock()
-	old := b.bots[userID]
-	b.bots[userID] = &botPresence{client: c, books: []botBook{}, dryRun: true}
+	if b.agents[userID] == nil {
+		b.agents[userID] = map[int64]*botPresence{}
+	}
+	old := b.agents[userID][codeID]
+	b.agents[userID][codeID] = &botPresence{client: c, books: []botBook{}, dryRun: true, freeSince: b.now()}
 	b.mu.Unlock()
 	if old != nil {
 		// Close waits for the peer's close frame; do not hold up the new socket's handler.
 		go old.client.conn.Close(websocket.StatusNormalClosure, "replaced by a newer bot socket")
 	}
+	b.touch(userID, codeID)
 	b.changed(userID)
 }
 
-// detach takes the user's bot offline if c is still its bot socket (a replaced socket is not).
+// detach takes the agent offline if c is still its code's bot socket (a replaced socket is not).
 func (b *botHub) detach(c *Client) {
-	userID := c.principal.UserID
+	userID, codeID := c.principal.UserID, c.principal.CodeID
 	b.mu.Lock()
-	p := b.bots[userID]
+	p := b.agents[userID][codeID]
 	if p == nil || p.client != c {
 		b.mu.Unlock()
 		return
 	}
-	delete(b.bots, userID)
+	delete(b.agents[userID], codeID)
+	if len(b.agents[userID]) == 0 {
+		delete(b.agents, userID)
+	}
 	b.mu.Unlock()
+	b.touch(userID, codeID)
 	b.changed(userID)
+}
+
+// touch moves the agent's last seen in the registry (inserting its row on first connect).
+func (b *botHub) touch(userID, codeID int64) {
+	if b.acc == nil {
+		return
+	}
+	if err := b.acc.TouchBotAgent(userID, codeID); err != nil {
+		log.Error().Err(err).Int64("code", codeID).Msg("bot agent touch failed")
+	}
 }
 
 var botChangedMsg = []byte(`{"type":"bot"}`)
@@ -111,15 +154,15 @@ func principalOf(r *http.Request) accounts.Principal {
 	return p
 }
 
-// setStatus stores the bot's last status. false: codeID has no open bot socket for userID (never
-// connected, closed, or replaced by another code's socket).
+// setStatus stores an agent's last status. false: codeID has no open bot socket (never connected,
+// closed, or replaced).
 func (b *botHub) setStatus(userID, codeID int64, books []botBook, dryRun bool) bool {
 	if books == nil {
 		books = []botBook{}
 	}
 	b.mu.Lock()
-	p := b.bots[userID]
-	if p == nil || p.client.principal.CodeID != codeID {
+	p := b.presenceLocked(userID, codeID)
+	if p == nil {
 		b.mu.Unlock()
 		return false
 	}
@@ -166,7 +209,7 @@ func (b *botHub) handleStatus(w http.ResponseWriter, r *http.Request) {
 // orderMemory is how long a sent order is remembered for its events when no final event comes.
 const orderMemory = 10 * time.Minute
 
-// botLeg is one leg of an order, as the app sends it and the bot receives it.
+// botLeg is one leg of an order, as the app sends it and the agent receives it.
 type botLeg struct {
 	Bookmaker       string  `json:"bookmaker"`
 	MatchURL        string  `json:"match_url"`
@@ -179,7 +222,7 @@ type botLeg struct {
 }
 
 // botOrderMsg is an order: POST /api/me/bot/orders sends arb_key and legs (an order_id in the body is
-// ignored); the bot socket receives it with the gateway's order_id.
+// ignored); the agent's bot socket receives it with the gateway's order_id.
 type botOrderMsg struct {
 	OrderID string   `json:"order_id"`
 	ArbKey  string   `json:"arb_key"`
@@ -189,6 +232,7 @@ type botOrderMsg struct {
 // botOrder is what the gateway remembers of a sent order, to relay its events.
 type botOrder struct {
 	userID  int64
+	codeID  int64 // the agent the order was sent to; only it may post the order's events
 	arbKey  string
 	expires time.Time
 }
@@ -232,7 +276,7 @@ func (c *Client) trySend(payload []byte) bool {
 	}
 }
 
-// ready reports whether the bot's last status lists book as ready.
+// ready reports whether the agent's last status lists book as ready.
 func (p *botPresence) ready(book string) bool {
 	for _, x := range p.books {
 		if x.Bookmaker == book && x.Ready {
@@ -242,9 +286,20 @@ func (p *botPresence) ready(book string) bool {
 	return false
 }
 
-// pruneLocked forgets orders older than orderMemory. A bot that was busy with a forgotten order is
-// idle again; the users whose busy flag changed are returned, to be passed to notifyAll after b.mu
-// is released. b.mu must be held.
+// freeLocked clears the agent's busy flag if it is busy with orderID; true if it was. b.mu must be held.
+func (b *botHub) freeLocked(userID, codeID int64, orderID string) bool {
+	p := b.presenceLocked(userID, codeID)
+	if p == nil || p.busy != orderID {
+		return false
+	}
+	p.busy = ""
+	p.freeSince = b.now()
+	return true
+}
+
+// pruneLocked forgets orders older than orderMemory. An agent that was busy with a forgotten order
+// is idle again; the users whose busy flag changed are returned, to be passed to notifyAll after
+// b.mu is released. b.mu must be held.
 func (b *botHub) pruneLocked() []int64 {
 	now := b.now()
 	var freed []int64
@@ -253,8 +308,7 @@ func (b *botHub) pruneLocked() []int64 {
 			continue
 		}
 		delete(b.orders, id)
-		if p := b.bots[o.userID]; p != nil && p.busy == id {
-			p.busy = ""
+		if b.freeLocked(o.userID, o.codeID, id) {
 			freed = append(freed, o.userID)
 		}
 	}
@@ -268,9 +322,7 @@ func (b *botHub) notifyAll(ids []int64) {
 	}
 }
 
-// order sends a valid order to userID's bot socket and marks the bot busy. Checks, in this order:
-// a bot is online (errBotOffline), it is idle (errBotBusy), every leg's bookmaker is ready
-// (errBookNotReady).
+// order sends a valid order to one of userID's agents and marks that agent busy.
 func (b *botHub) order(userID int64, o botOrderMsg) (string, error) {
 	o.OrderID = newOrderID()
 	payload, err := json.Marshal(struct {
@@ -289,29 +341,55 @@ func (b *botHub) order(userID int64, o botOrderMsg) (string, error) {
 	return o.OrderID, nil
 }
 
-// startOrder prunes forgotten orders first (a forgotten order must not keep the bot busy), then
-// checks and sends. freed lists the users whose busy flag the prune cleared.
+// pickLocked chooses the agent for an order: online, idle, with both legs' bookmakers ready; of
+// those the one idle longest (lowest code id on a tie). Errors: no agent online (errBotOffline);
+// agents with both books ready exist but all are busy (errBotBusy); no agent has both books ready
+// (errBookNotReady). b.mu must be held.
+func (b *botHub) pickLocked(userID int64, o botOrderMsg) (int64, *botPresence, error) {
+	agents := b.agents[userID]
+	if len(agents) == 0 {
+		return 0, nil, errBotOffline
+	}
+	var bestID int64
+	var best *botPresence
+	capable := false
+	for codeID, p := range agents {
+		if !p.ready(o.Legs[0].Bookmaker) || !p.ready(o.Legs[1].Bookmaker) {
+			continue
+		}
+		capable = true
+		if p.busy != "" {
+			continue
+		}
+		if best == nil || p.freeSince.Before(best.freeSince) || (p.freeSince.Equal(best.freeSince) && codeID < bestID) {
+			bestID, best = codeID, p
+		}
+	}
+	switch {
+	case best != nil:
+		return bestID, best, nil
+	case capable:
+		return 0, nil, errBotBusy
+	default:
+		return 0, nil, errBookNotReady
+	}
+}
+
+// startOrder prunes forgotten orders first (a forgotten order must not keep an agent busy), then
+// picks an agent and sends. freed lists the users whose busy flag the prune cleared.
 func (b *botHub) startOrder(userID int64, o botOrderMsg, payload []byte) (freed []int64, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	freed = b.pruneLocked()
-	p := b.bots[userID]
-	if p == nil {
-		return freed, errBotOffline
-	}
-	if p.busy != "" {
-		return freed, errBotBusy
-	}
-	for _, l := range o.Legs {
-		if !p.ready(l.Bookmaker) {
-			return freed, errBookNotReady
-		}
+	codeID, p, err := b.pickLocked(userID, o)
+	if err != nil {
+		return freed, err
 	}
 	if !p.client.trySend(payload) {
 		return freed, errBotOffline // the socket is not draining its buffer
 	}
 	p.busy = o.OrderID
-	b.orders[o.OrderID] = botOrder{userID: userID, arbKey: o.ArbKey, expires: b.now().Add(orderMemory)}
+	b.orders[o.OrderID] = botOrder{userID: userID, codeID: codeID, arbKey: o.ArbKey, expires: b.now().Add(orderMemory)}
 	return freed, nil
 }
 
@@ -335,7 +413,7 @@ func (b *botHub) handleOrder(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// botEvents lists the events a bot may post; true = final (the order is over).
+// botEvents lists the events an agent may post; true = final (the order is over).
 var botEvents = map[string]bool{
 	"accepted":        false,
 	"leg_ready":       false,
@@ -364,15 +442,16 @@ type botEventMsg struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
-// event relays one of userID's order events to the user's non-bot /ws sockets. A final event
-// forgets the order and, if the bot is still busy with it, clears busy. errUnknownOrder: the order
-// is unknown, finished, older than orderMemory, or another user's.
-func (b *botHub) event(userID int64, in botEventIn) error {
+// event relays one order event, posted by codeID's agent, to the user's non-bot /ws sockets. A
+// final event forgets the order and, if that agent is still busy with it, clears busy.
+// errUnknownOrder: the order is unknown, finished, older than orderMemory, another user's, or was
+// sent to another agent.
+func (b *botHub) event(userID, codeID int64, in botEventIn) error {
 	final := botEvents[in.Event]
 	b.mu.Lock()
 	freed := b.pruneLocked()
 	o, ok := b.orders[in.OrderID]
-	if !ok || o.userID != userID {
+	if !ok || o.userID != userID || o.codeID != codeID {
 		b.mu.Unlock()
 		b.notifyAll(freed)
 		return errUnknownOrder
@@ -380,10 +459,7 @@ func (b *botHub) event(userID int64, in botEventIn) error {
 	cleared := false
 	if final {
 		delete(b.orders, in.OrderID)
-		if p := b.bots[userID]; p != nil && p.busy == in.OrderID {
-			p.busy = ""
-			cleared = true
-		}
+		cleared = b.freeLocked(userID, codeID, in.OrderID)
 	}
 	b.mu.Unlock()
 	b.notifyAll(freed)
@@ -409,7 +485,8 @@ func (b *botHub) handleEvent(w http.ResponseWriter, r *http.Request) {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_event")
 		return
 	}
-	switch err := b.event(principalOf(r).UserID, in); {
+	p := principalOf(r)
+	switch err := b.event(p.UserID, p.CodeID, in); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, errUnknownOrder):

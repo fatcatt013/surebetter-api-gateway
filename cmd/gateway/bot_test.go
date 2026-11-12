@@ -30,7 +30,7 @@ func newBotServer(t *testing.T) (*httptest.Server, *accounts.Service, *botHub) {
 	svc := accounts.NewService(db, nil)
 	reg := newConnRegistry()
 	svc.SetConnections(reg)
-	bots := newBotHub(reg)
+	bots := newBotHub(reg, svc)
 	cfg := Config{SnapshotCacheMs: 500, MaxClients: 10}
 	srv := httptest.NewServer(newMux(NewHub(cfg), NewValueHub(cfg), nil, &wsGate{acc: svc, reg: reg, required: true, bots: bots}))
 	t.Cleanup(srv.Close)
@@ -246,7 +246,7 @@ func TestBot_StatusAndPresence(t *testing.T) {
 	if got := readType(t, app); got != "bot" {
 		t.Fatalf("app on status change: %s", got)
 	}
-	if got := getBot(t, srv, token); got != `{"online":true,"books":[{"bookmaker":"tipsport","ready":true},{"bookmaker":"betano","ready":false}],"dryRun":false,"busy":false}` {
+	if got := getBot(t, srv, token); got != `{"online":true,"books":[{"bookmaker":"betano","ready":false},{"bookmaker":"tipsport","ready":true}],"dryRun":false,"busy":false}` {
 		t.Fatalf("after status: %s", got)
 	}
 
@@ -466,9 +466,12 @@ func TestBot_OrderForwardedToOwnBotAndBusy(t *testing.T) {
 	if got := getBot(t, srv, token); !strings.Contains(got, `"busy":true`) {
 		t.Fatalf("after order: %s", got)
 	}
-	// Busy is checked before the books: fortuna is not ready, the answer is still bot_busy.
-	if s, b := postOrder(t, srv, token, orderJSON("k2", tip, fortuna)); s != 409 || !strings.Contains(b, `"bot_busy"`) {
+	if s, b := postOrder(t, srv, token, orderJSON("k2", tip, bet)); s != 409 || !strings.Contains(b, `"bot_busy"`) {
 		t.Fatalf("second order: %d %s", s, b)
+	}
+	// No agent has fortuna ready, busy or not: book_not_ready.
+	if s, b := postOrder(t, srv, token, orderJSON("k3", tip, fortuna)); s != 409 || !strings.Contains(b, `"book_not_ready"`) {
+		t.Fatalf("order no agent can take: %d %s", s, b)
 	}
 	if got := getBot(t, srv, otherToken); !strings.Contains(got, `"busy":false`) {
 		t.Fatalf("another user's bot: %s", got)
@@ -714,11 +717,11 @@ func TestBot_ReplacementWhileBusy(t *testing.T) {
 }
 
 func TestBot_FullSendBufferIsOfflineNotBusy(t *testing.T) {
-	bots := newBotHub(newConnRegistry())
+	bots := newBotHub(newConnRegistry(), nil)
 	c := &Client{send: make(chan []byte, 1), bot: true}
-	c.principal.UserID = 7
+	c.principal.UserID, c.principal.CodeID = 7, 70
 	c.send <- []byte("x") // full
-	bots.bots[7] = &botPresence{client: c, books: []botBook{{"tipsport", true}, {"betano", true}}, dryRun: true}
+	bots.agents[7] = map[int64]*botPresence{70: {client: c, books: []botBook{{"tipsport", true}, {"betano", true}}, dryRun: true}}
 	o := botOrderMsg{ArbKey: "k", Legs: []botLeg{{Bookmaker: "tipsport", SourceID: "a", Odds: 2, Stake: 1}, {Bookmaker: "betano", SourceID: "b", Odds: 2, Stake: 1}}}
 	if _, err := bots.order(7, o); !errors.Is(err, errBotOffline) {
 		t.Fatalf("full buffer: %v, want bot_offline", err)
@@ -734,5 +737,181 @@ func TestBot_BadEventBeatsUnknownOrder(t *testing.T) {
 	code := newCode(t, srv, token, "bot")
 	if s, b := postEvent(t, srv, code, `{"order_id":"0123456789abcdef","event":"exploded"}`); s != 400 || !strings.Contains(b, `"bad_event"`) {
 		t.Fatalf("bad event + unknown order: %d %s", s, b)
+	}
+}
+
+// newBotCode creates a bot code named name for the session token's user and returns the code and its id.
+func newBotCode(t *testing.T, srv *httptest.Server, token, name string) (string, int64) {
+	t.Helper()
+	status, body := request(t, srv, "POST", "/api/me/extension-codes", token, `{"name":"`+name+`","kind":"bot"}`, nil)
+	var c struct {
+		ID   int64  `json:"id"`
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(body), &c); status != 201 || c.Code == "" {
+		t.Fatalf("create bot code %s: %d %s", name, status, body)
+	}
+	return c.Code, c.ID
+}
+
+// startAgent connects code's agent, posts books (a status JSON "books" array) with dryRun, and reads
+// the two {"type":"bot"} messages that causes on the user's app socket.
+func startAgent(t *testing.T, srv *httptest.Server, code, books string, dryRun bool, app *websocket.Conn) *websocket.Conn {
+	t.Helper()
+	bot := dialBot(t, srv, code)
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on agent connect: %s", got)
+	}
+	if s, b := postStatus(t, srv, code, fmt.Sprintf(`{"books":%s,"dryRun":%v}`, books, dryRun)); s != 204 {
+		t.Fatalf("status: %d %s", s, b)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on status: %s", got)
+	}
+	return bot
+}
+
+const (
+	booksTipBet = `[{"bookmaker":"tipsport","ready":true},{"bookmaker":"betano","ready":true}]`
+	booksTipFor = `[{"bookmaker":"tipsport","ready":true},{"bookmaker":"fortuna","ready":true}]`
+)
+
+func TestBot_SeveralAgentsOnline(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	app := appSocket(t, srv, token)
+	home, homeID := newBotCode(t, srv, token, "Home PC")
+	vps, vpsID := newBotCode(t, srv, token, "VPS Praha")
+
+	homeSock := dialBot(t, srv, home)
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on first agent: %s", got)
+	}
+	vpsSock := dialBot(t, srv, vps)
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on second agent: %s", got)
+	}
+	// Both agents have a registry row once the app has been told.
+	rows, err := svc.ListBotAgents(uid)
+	if err != nil || len(rows) != 2 || rows[0].CodeID != homeID || rows[1].CodeID != vpsID {
+		t.Fatalf("registry: %+v %v", rows, err)
+	}
+	// Another code's socket does not close the first agent's.
+	if s, _ := postStatus(t, srv, home, `{"books":[],"dryRun":true}`); s != 204 {
+		t.Fatalf("first agent's status after the second connected: %d", s)
+	}
+	vpsSock.Close(websocket.StatusNormalClosure, "")
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on second agent leaving: %s", got)
+	}
+	if !bots.view(uid).Online {
+		t.Fatal("one agent left, the user's bot must stay online")
+	}
+	homeSock.Close(websocket.StatusNormalClosure, "")
+	waitBot(t, bots, uid, false)
+}
+
+func TestBot_AggregateView(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	a, _ := newBotCode(t, srv, token, "A")
+	b, _ := newBotCode(t, srv, token, "B")
+	aSock := startAgent(t, srv, a, booksTipBet, false, app)
+	startAgent(t, srv, b, booksTipFor, true, app)
+
+	if got := getBot(t, srv, token); got != `{"online":true,"books":[{"bookmaker":"betano","ready":true},{"bookmaker":"fortuna","ready":true},{"bookmaker":"tipsport","ready":true}],"dryRun":true,"busy":false}` {
+		t.Fatalf("two idle agents: %s", got)
+	}
+	// A takes a tipsport/betano order: its books stop counting; betano is known only on a busy agent.
+	placeOrder(t, srv, token, aSock, app)
+	if got := getBot(t, srv, token); got != `{"online":true,"books":[{"bookmaker":"betano","ready":false},{"bookmaker":"fortuna","ready":true},{"bookmaker":"tipsport","ready":true}],"dryRun":true,"busy":false}` {
+		t.Fatalf("one agent busy: %s", got)
+	}
+	s, body := postOrder(t, srv, token, orderJSON("arb-2", legJSON("tipsport", "s1", 2.1, 100), legJSON("fortuna", "s3", 2.05, 102)))
+	if s != 202 {
+		t.Fatalf("order for B: %d %s", s, body)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on B busy: %s", got)
+	}
+	if got := getBot(t, srv, token); got != `{"online":true,"books":[{"bookmaker":"betano","ready":false},{"bookmaker":"fortuna","ready":false},{"bookmaker":"tipsport","ready":false}],"dryRun":true,"busy":true}` {
+		t.Fatalf("both agents busy: %s", got)
+	}
+}
+
+func TestBot_OrderGoesToTheAgentIdleLongest(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	clk := &botClock{t: time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	a, _ := newBotCode(t, srv, token, "A")
+	b, _ := newBotCode(t, srv, token, "B")
+	aSock := startAgent(t, srv, a, booksTipBet, true, app)
+	clk.advance(time.Second)
+	bSock := startAgent(t, srv, b, booksTipBet, true, app)
+
+	first := placeOrder(t, srv, token, aSock, app) // A has been idle longer
+	second := placeOrder(t, srv, token, bSock, app)
+	if s, body := postOrder(t, srv, token, orderJSON("arb-3", legJSON("tipsport", "s1", 2.1, 100), legJSON("betano", "s2", 2.05, 102))); s != 409 || !strings.Contains(body, `"bot_busy"`) {
+		t.Fatalf("both busy: %d %s", s, body)
+	}
+
+	clk.advance(time.Second)
+	if s, body := postEvent(t, srv, b, `{"order_id":"`+second+`","event":"placed"}`); s != 204 {
+		t.Fatalf("B's final event: %d %s", s, body)
+	}
+	readType(t, app) // botEvent
+	readType(t, app) // bot (B idle)
+	clk.advance(time.Second)
+	if s, body := postEvent(t, srv, a, `{"order_id":"`+first+`","event":"placed"}`); s != 204 {
+		t.Fatalf("A's final event: %d %s", s, body)
+	}
+	readType(t, app) // botEvent
+	readType(t, app) // bot (A idle)
+	// B became idle first, so B gets the next order.
+	placeOrder(t, srv, token, bSock, app)
+	expectNoMessage(t, aSock, "agent A (B has been idle longer)")
+}
+
+func TestBot_OrderErrorsWithSeveralAgents(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	a, _ := newBotCode(t, srv, token, "A")
+	b, _ := newBotCode(t, srv, token, "B")
+	aSock := startAgent(t, srv, a, booksTipBet, true, app)
+	startAgent(t, srv, b, booksTipFor, true, app)
+	placeOrder(t, srv, token, aSock, app) // A busy; B is idle but has no betano
+
+	tip := legJSON("tipsport", "s1", 2.1, 100)
+	if s, body := postOrder(t, srv, token, orderJSON("k", tip, legJSON("betano", "s2", 2.05, 102))); s != 409 || !strings.Contains(body, `"bot_busy"`) {
+		t.Fatalf("only the busy agent has both books: %d %s", s, body)
+	}
+	if s, body := postOrder(t, srv, token, orderJSON("k", tip, legJSON("sazkabet", "s4", 2.05, 102))); s != 409 || !strings.Contains(body, `"book_not_ready"`) {
+		t.Fatalf("no agent has both books: %d %s", s, body)
+	}
+}
+
+func TestBot_EventsOnlyFromTheChosenAgent(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	a, _ := newBotCode(t, srv, token, "A")
+	b, _ := newBotCode(t, srv, token, "B")
+	aSock := startAgent(t, srv, a, booksTipBet, true, app)
+	startAgent(t, srv, b, booksTipFor, true, app)
+	id := placeOrder(t, srv, token, aSock, app)
+
+	if s, body := postEvent(t, srv, b, `{"order_id":"`+id+`","event":"placed"}`); s != 404 || !strings.Contains(body, `"unknown_order"`) {
+		t.Fatalf("event from another agent of the same user: %d %s", s, body)
+	}
+	if got := getBot(t, srv, token); !strings.Contains(got, `"betano","ready":false`) {
+		t.Fatalf("a rejected event must not free agent A: %s", got)
+	}
+	if s, body := postEvent(t, srv, a, `{"order_id":"`+id+`","event":"placed"}`); s != 204 {
+		t.Fatalf("event from the chosen agent: %d %s", s, body)
 	}
 }
