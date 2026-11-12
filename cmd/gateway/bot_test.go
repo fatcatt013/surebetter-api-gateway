@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -1133,5 +1134,67 @@ func TestBot_NewBootEndsTheOrder(t *testing.T) {
 			placeOrder(t, srv, token, bot, app)
 			expectNoMessage(t, app, "app after one bot message per change") // an extra bot message would still be queued
 		})
+	}
+}
+
+// The owner's read routes take a session only: a bot code (which may post logs and screenshots)
+// cannot read them back.
+func TestBot_ReadRoutesRefuseABotCode(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	for _, path := range []string{"/api/me/bot/logs", "/api/me/bot/logs.txt", "/api/me/bot/screenshots/0123456789abcdef"} {
+		if s, b := request(t, srv, "GET", path, "", "", bearer(code)); s != 403 || !strings.Contains(b, `"session_required"`) {
+			t.Errorf("GET %s with a bot code: %d %s, want 403 session_required", path, s, b)
+		}
+	}
+}
+
+// Two orders at once for one free agent: exactly one is sent, the other is bot_busy.
+func TestBot_ConcurrentOrdersOneFreeAgent(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	startBot(t, srv, newCode(t, srv, token, "bot"), app)
+	body := orderJSON("arb-1", legJSON("tipsport", "s1", 2.1, 100), legJSON("betano", "s2", 2.05, 102))
+
+	type answer struct {
+		status int
+		body   string
+	}
+	answers := make(chan answer, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			req, _ := http.NewRequest("POST", srv.URL+"/api/me/bot/orders", strings.NewReader(body))
+			req.Header.Set("Cookie", accounts.CookieName+"="+token)
+			req.Header.Set("Origin", srv.URL)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				answers <- answer{0, err.Error()}
+				return
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			answers <- answer{resp.StatusCode, string(b)}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(answers)
+	got := map[int]int{}
+	for a := range answers {
+		got[a.status]++
+		if a.status == 409 && !strings.Contains(a.body, `"bot_busy"`) {
+			t.Fatalf("the refused order: %s, want bot_busy", a.body)
+		}
+	}
+	if got[202] != 1 || got[409] != 1 {
+		t.Fatalf("answers: %v, want one 202 and one 409", got)
 	}
 }
