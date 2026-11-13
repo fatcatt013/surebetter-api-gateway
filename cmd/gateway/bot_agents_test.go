@@ -287,3 +287,58 @@ func TestBotStatus_ProtoAndWindowMode(t *testing.T) {
 		t.Fatalf("older agent: %s", body)
 	}
 }
+
+func TestBotAgents_ReservedWindowsShowTheirOrder(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code, codeID := newBotCode(t, srv, token, "Home PC")
+	// The agent cannot set the overlay itself: orderId and step in a status are dropped.
+	status := p2Status("", strings.Replace(win("tipsport", 1, "idle"), `"reason":""`, `"reason":"","orderId":"x","step":"y"`, 1),
+		win("betano", 1, "idle"), win("betano", 2, "idle"))
+	bot := startAgentWith(t, srv, code, status, app)
+	if a := getFleet(t, srv, token); a[0].Busy || a[0].Windows[0].OrderID != "" || a[0].Windows[0].Step != "" {
+		t.Fatalf("before an order: %+v", a[0])
+	}
+	o := placeOrder(t, srv, token, "arb-1", bot, app)
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+o.OrderID+`","event":"leg_step","bookmaker":"betano","step":"enterStake"}`); s != 204 {
+		t.Fatalf("leg_step: %d %s", s, b)
+	}
+	a := getFleet(t, srv, token)
+	if len(a) != 1 || a[0].ID != codeID || !a[0].Busy || a[0].Update {
+		t.Fatalf("agent: %+v", a)
+	}
+	ws := a[0].Windows
+	// The agent's status still says idle; the gateway shows the reserved windows busy.
+	if ws[0].State != "busy" || ws[0].OrderID != o.OrderID || ws[0].Step != "" ||
+		ws[1].State != "busy" || ws[1].OrderID != o.OrderID || ws[1].Step != "enterStake" ||
+		ws[2].State != "idle" || ws[2].OrderID != "" || ws[2].Mode != "bot" {
+		t.Fatalf("windows: %+v", ws)
+	}
+	_, body := request(t, srv, "GET", "/api/me/bot/agents", token, "", nil)
+	if !strings.Contains(body, `"orderId":"`+o.OrderID+`","step":"enterStake"`) || strings.Count(body, `"orderId"`) != 2 {
+		t.Fatalf("wire: %s", body)
+	}
+}
+
+func TestBotAgents_FlowsAt(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code, codeID := newBotCode(t, srv, token, "Home PC")
+	dialBot(t, srv, code)
+	waitBot(t, bots, userIDOf(t, svc, token), true)
+	if a := getFleet(t, srv, token); len(a) != 1 || a[0].FlowsAt != 0 {
+		t.Fatalf("before any Flows: %+v", a)
+	}
+	if s, b := request(t, srv, "PUT", "/api/me/bot/flows", "", `{"steps":[],"cases":[],"playbooks":[],"rules":[]}`, bearer(code)); s != 204 {
+		t.Fatalf("upload: %d %s", s, b)
+	}
+	var flows struct {
+		UpdatedAt int64 `json:"updatedAt"`
+	}
+	_, body := request(t, srv, "GET", fmt.Sprintf("/api/me/bot/flows?agent=%d", codeID), token, "", nil)
+	json.Unmarshal([]byte(body), &flows)
+	if a := getFleet(t, srv, token); a[0].FlowsAt <= 0 || a[0].FlowsAt != flows.UpdatedAt {
+		t.Fatalf("flowsAt %d, flows updatedAt %d", a[0].FlowsAt, flows.UpdatedAt)
+	}
+}

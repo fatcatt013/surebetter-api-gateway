@@ -24,6 +24,9 @@ type botWindow struct {
 	Proxy     *string `json:"proxy"`
 	Reason    string  `json:"reason"`
 	Mode      string  `json:"mode,omitempty"` // bot, login or stopped (protocol 2); absent for older agents
+	// Set by the gateway on the Fleet for a window reserved for an order (never taken from a status).
+	OrderID string `json:"orderId,omitempty"`
+	Step    string `json:"step,omitempty"` // that leg's last step
 }
 
 // botHost is the agent's machine. cpu and mem (percent) are kept in memory only.
@@ -115,6 +118,9 @@ func statusOf(in botStatusIn) botStatus {
 	if in.Windows == nil {
 		in.Windows = []botWindow{}
 	}
+	for i := range in.Windows {
+		in.Windows[i].OrderID, in.Windows[i].Step = "", "" // the gateway's overlay, not the agent's
+	}
 	st.windows = in.Windows
 	js, _ := json.Marshal(in.Windows) // plain structs: cannot fail
 	st.windowsJSON = string(js)
@@ -189,7 +195,8 @@ type agentView struct {
 	LastSeen int64       `json:"lastSeen"`
 	DryRun   bool        `json:"dryRun"`
 	Busy     bool        `json:"busy"`
-	Update   bool        `json:"update"` // online with an agent older than protocol 2: never sent orders or commands
+	Update   bool        `json:"update"`  // online with an agent older than protocol 2: never sent orders or commands
+	FlowsAt  int64       `json:"flowsAt"` // when its Flows last changed (Unix ms); 0 = no Flows
 	Windows  []botWindow `json:"windows"`
 }
 
@@ -206,7 +213,8 @@ func windowsOf(js string) []botWindow {
 // online first, then by name. An online agent shows its last status from memory; an offline one
 // its stored version, host name and windows, each window down ("Agent offline"), cpu/mem null,
 // dry run, not busy. busy: it runs an order (has reserved windows). update: online and its last
-// status (or none yet) is older than protocol 2.
+// status (or none yet) is older than protocol 2. A window reserved for an order shows state busy,
+// the order's id and that leg's last step. flowsAt: when its Flows last changed (0 = none).
 func (b *botHub) fleet(userID int64) ([]agentView, error) {
 	rows, err := b.acc.ListBotAgents(userID) // by name
 	if err != nil {
@@ -218,11 +226,21 @@ func (b *botHub) fleet(userID int64) ([]agentView, error) {
 	b.expireLocked(fx)
 	reserved := b.reservedLocked(userID)
 	for _, row := range rows {
-		v := agentView{ID: row.CodeID, Name: row.Name, LastSeen: row.LastSeenAt}
+		v := agentView{ID: row.CodeID, Name: row.Name, LastSeen: row.LastSeenAt, FlowsAt: row.FlowsAt}
 		if p := b.presenceLocked(userID, row.CodeID); p != nil {
 			v.Online, v.DryRun, v.Busy, v.Version, v.Update = true, p.dryRun, len(reserved[row.CodeID]) > 0, p.version, p.proto < botProto
 			v.Host = botHost{Name: p.hostName, CPU: p.cpu, Mem: p.mem}
 			v.Windows = windowsOf(p.windowsJSON)
+			for i := range v.Windows {
+				if o := b.orders[reserved[row.CodeID][v.Windows[i].ID]]; o != nil {
+					v.Windows[i].State, v.Windows[i].OrderID = "busy", o.id
+					for _, l := range o.legs {
+						if l.WindowID == v.Windows[i].ID {
+							v.Windows[i].Step = l.Step
+						}
+					}
+				}
+			}
 		} else {
 			v.DryRun, v.Version, v.Host = true, row.Version, botHost{Name: row.HostName}
 			v.Windows = windowsOf(row.WindowsJSON)
