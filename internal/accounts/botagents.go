@@ -1,5 +1,10 @@
 package accounts
 
+import (
+	"database/sql"
+	"errors"
+)
+
 // BotAgentStatus is what an agent's status post stores on its registry row.
 type BotAgentStatus struct {
 	Version     string
@@ -14,6 +19,8 @@ type BotAgentRow struct {
 	BotAgentStatus
 	FirstSeenAt int64
 	LastSeenAt  int64
+	HasFlows    bool  // the agent has uploaded its Flows
+	FlowsAt     int64 // when its Flows last changed; 0 = never
 }
 
 // TouchBotAgent records that codeID's agent is connected (or just disconnected): it inserts the
@@ -42,7 +49,8 @@ func (s *Service) SaveBotAgentStatus(userID, codeID int64, st BotAgentStatus) er
 
 // ListBotAgents returns userID's agents: its non-revoked bot codes that have an agent row, by name.
 func (s *Service) ListBotAgents(userID int64) ([]BotAgentRow, error) {
-	rows, err := s.db.Query(`SELECT a.code_id, c.name, a.version, a.host_name, a.windows_json, a.first_seen_at, a.last_seen_at
+	rows, err := s.db.Query(`SELECT a.code_id, c.name, a.version, a.host_name, a.windows_json, a.first_seen_at, a.last_seen_at,
+			a.flows_json <> '', a.flows_at
 		FROM bot_agents a JOIN extension_codes c ON c.id = a.code_id
 		WHERE a.user_id = ? AND c.user_id = a.user_id AND c.kind = 'bot' AND c.revoked_at IS NULL
 		ORDER BY c.name COLLATE NOCASE, a.code_id`, userID)
@@ -53,10 +61,37 @@ func (s *Service) ListBotAgents(userID int64) ([]BotAgentRow, error) {
 	out := []BotAgentRow{}
 	for rows.Next() {
 		var a BotAgentRow
-		if err := rows.Scan(&a.CodeID, &a.Name, &a.Version, &a.HostName, &a.WindowsJSON, &a.FirstSeenAt, &a.LastSeenAt); err != nil {
+		if err := rows.Scan(&a.CodeID, &a.Name, &a.Version, &a.HostName, &a.WindowsJSON, &a.FirstSeenAt, &a.LastSeenAt, &a.HasFlows, &a.FlowsAt); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// SaveBotAgentFlows stores codeID's Flows upload (inserting the agent's row if it has none yet).
+// flows_at moves only when the JSON differs from the stored one; changed reports that.
+func (s *Service) SaveBotAgentFlows(userID, codeID int64, flowsJSON string) (changed bool, err error) {
+	now := s.nowMs()
+	res, err := s.db.Exec(`INSERT INTO bot_agents (code_id, user_id, first_seen_at, last_seen_at, flows_json, flows_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (code_id) DO UPDATE SET flows_json = excluded.flows_json, flows_at = excluded.flows_at
+			WHERE bot_agents.flows_json <> excluded.flows_json`, codeID, userID, now, now, flowsJSON, now)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// BotAgentFlows returns codeID's stored Flows and when they last changed; "" and 0 when it has
+// none or is not userID's agent.
+func (s *Service) BotAgentFlows(userID, codeID int64) (string, int64, error) {
+	var flows string
+	var at int64
+	err := s.db.QueryRow(`SELECT flows_json, flows_at FROM bot_agents WHERE code_id = ? AND user_id = ?`, codeID, userID).Scan(&flows, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, nil
+	}
+	return flows, at, err
 }
