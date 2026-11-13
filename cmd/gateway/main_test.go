@@ -73,6 +73,28 @@ func TestStakeAllocation_SourceIDRelayed(t *testing.T) {
 	}
 }
 
+// fair_odds (the leg's consensus fair odds, bots rule 2) must survive the gateway's
+// unmarshal → re-marshal: a number stays that number, null or absent becomes null.
+func TestStakeAllocation_FairOddsRelayed(t *testing.T) {
+	for in, want := range map[string]any{
+		`{"bookmaker":"tipsport","outcome_id":"OVER","decimal_odds":2.3,"stake_pct":45.9,"fair_odds":1.9741}`: 1.9741,
+		`{"bookmaker":"tipsport","outcome_id":"OVER","decimal_odds":2.3,"stake_pct":45.9,"fair_odds":null}`:   nil,
+		`{"bookmaker":"tipsport","outcome_id":"OVER","decimal_odds":2.3,"stake_pct":45.9}`:                    nil,
+	} {
+		var s StakeAllocation
+		if err := json.Unmarshal([]byte(in), &s); err != nil {
+			t.Fatalf("unmarshal %s: %v", in, err)
+		}
+		out, _ := json.Marshal(s)
+		var back map[string]any
+		_ = json.Unmarshal(out, &back)
+		got, present := back["fair_odds"]
+		if !present || got != want {
+			t.Errorf("%s → fair_odds = %v (present %v), want %v (re-marshalled: %s)", in, got, present, want, out)
+		}
+	}
+}
+
 // ── oppStateKey ───────────────────────────────────────────────────────────────
 
 func TestOppStateKey_NoLine(t *testing.T) {

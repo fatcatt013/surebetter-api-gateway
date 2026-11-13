@@ -164,6 +164,10 @@ type StakeAllocation struct {
 	// SourceMarketRef is the bookmaker's own id for this leg's market container on its
 	// page (Fortuna: the card's market-type-id). Relayed verbatim for the browser extension.
 	SourceMarketRef string `json:"source_market_ref,omitempty"`
+	// FairOdds is the consensus fair odds for this leg's outcome at this leg's bookmaker
+	// (the value-bet consensus, leave-one-out); nil = no consensus. Relayed verbatim —
+	// always present, null when unknown — for bots rule 2 ("outlier first").
+	FairOdds *float64 `json:"fair_odds"`
 }
 
 // ── ValueBet (mirrors the arb-engine's value.rs ValueBet) ──────────────────
