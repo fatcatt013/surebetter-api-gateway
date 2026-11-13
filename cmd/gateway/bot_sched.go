@@ -620,13 +620,22 @@ func (b *botHub) pauseLocked(userID int64, reason string, fx *effects) {
 	for _, o := range b.ordersLocked(userID, orderWaiting) {
 		b.endLocked(o, "stopped", "Paused", true, fx)
 	}
-	for _, p := range b.agents[userID] {
+	for codeID, p := range b.agents[userID] {
 		if p.proto >= botProto {
-			p.client.trySend(pauseMsg)
+			sendPauseLocked(userID, codeID, p)
 		}
 	}
 	fx.notify(userID)
 	log.Warn().Int64("user", userID).Str("reason", reason).Msg("bots paused")
+}
+
+// sendPauseLocked sends {"type":"pause"} to the agent's socket; a socket that does not take it
+// (send buffer full) is logged. An agent that misses it still gets it with its next socket's first
+// protocol-2 status (setStatus). b.mu must be held.
+func sendPauseLocked(userID, codeID int64, p *botPresence) {
+	if !p.client.trySend(pauseMsg) {
+		log.Warn().Int64("user", userID).Int64("code", codeID).Msg("bot pause not sent: socket does not take it")
+	}
 }
 
 // expireLocked ends waiting orders older than waitExpiry (stopped · "Expired · <wait reason>") and

@@ -146,6 +146,11 @@ func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 	b.expireLocked(fx)
 	changed := p.dryRun != st.dryRun || !slices.Equal(p.books, st.books) || p.version != st.version ||
 		p.hostName != st.hostName || p.windowsJSON != st.windowsJSON || p.proto != st.proto
+	// While the user is paused, a socket's first protocol-2 status gets {"type":"pause"}: the agent may
+	// have been disconnected when the pause was sent, with pairs still before their barrier.
+	if p.proto < botProto && st.proto >= botProto && b.settingsLocked(userID).Paused {
+		sendPauseLocked(userID, codeID, p)
+	}
 	p.books, p.dryRun, p.version, p.hostName, p.windowsJSON = st.books, st.dryRun, st.version, st.hostName, st.windowsJSON
 	p.windows, p.proto, p.cpu, p.mem, p.boot = st.windows, st.proto, st.cpu, st.mem, st.boot
 	if st.boot != "" {

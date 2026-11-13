@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"nhooyr.io/websocket"
+
 	"github.com/surebetter/api-gateway/internal/accounts"
 )
 
@@ -143,4 +145,31 @@ func TestBotSettings_ChangeRetriesWaitingOrders(t *testing.T) {
 	if o := readOrder(t, bot); o.OrderID != waiting.OrderID || o.Legs[0].WindowID != "tipsport-2" {
 		t.Fatalf("agent got %+v", o)
 	}
+}
+
+// An agent that was disconnected when the user paused learns of it from its first protocol-2
+// status on the new socket (its running order may still be before the barrier), and only once.
+func TestBotSettings_PauseReachesAnAgentThatReconnects(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	app := appSocket(t, srv, token)
+	withBoot := p2Status(bootA, win("tipsport", 1, "idle"), win("betano", 1, "idle"))
+	bot := startAgentWith(t, srv, code, withBoot, app)
+	placeOrder(t, srv, token, "arb-1", bot, app)
+
+	bot.Close(websocket.StatusNormalClosure, "")
+	expectBot(t, app, "on agent disconnect")
+	if s, b := putSettings(t, srv, token, `{"paused":true}`); s != 200 {
+		t.Fatalf("pause: %d %s", s, b)
+	}
+	expectBot(t, app, "on pause")
+	bot = startAgentWith(t, srv, code, withBoot, app) // same process, the order still runs
+	if m := readJSON(t, bot); m["type"] != "pause" {
+		t.Fatalf("agent got %v, want pause", m)
+	}
+	if s, b := postStatus(t, srv, code, withBoot); s != 204 {
+		t.Fatalf("second status: %d %s", s, b)
+	}
+	expectNoMessage(t, bot, "the agent on its second status")
 }
