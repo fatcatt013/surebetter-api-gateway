@@ -207,3 +207,55 @@ func TestBotCommands_TimeoutAndAckValidation(t *testing.T) {
 		t.Fatalf("app answer: %+v", a)
 	}
 }
+
+// The scheduler does not pick a window while a command for it waits for the agent's answer.
+func TestBotCommands_PendingCommandKeepsTheWindowFromOrders(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code, id := newBotCode(t, srv, token, "Home PC")
+	bot := startAgentWith(t, srv, code, p2Status("", win("tipsport", 1, "idle"), win("tipsport", 2, "idle"), win("betano", 1, "idle")), app)
+
+	// tipsport-1 (idle as long, lowest number) would be picked; its pending restart leaves tipsport-2.
+	done := commandAsync(t, srv, token, fmt.Sprintf("/api/me/bot/agents/%d/windows/tipsport-1/restart", id), ``)
+	cmd := readCommand(t, bot)
+	a := postOrderOK(t, srv, token, tipBetOrder("arb-1"))
+	if o := readOrder(t, bot); a.State != "sent" || o.Legs[0].WindowID != "tipsport-2" {
+		t.Fatalf("order %+v went to %+v, want tipsport-2", a, o.Legs)
+	}
+	expectEvent(t, app, a.OrderID, "sent", "")
+	expectBot(t, app, "on the sent order")
+	postAck(t, srv, code, `{"id":"`+cmd.ID+`","ok":true,"windowId":"tipsport-1"}`)
+	if r := <-done; r.status != 200 {
+		t.Fatalf("command: %+v", r)
+	}
+
+}
+
+// With the only Tipsport window under a pending command, an order waits; once the command is
+// answered, the next trigger sends it there.
+func TestBotCommands_PendingCommandMakesAnOrderWait(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code, id := newBotCode(t, srv, token, "Home PC")
+	bot := startBot(t, srv, code, app)
+	done := commandAsync(t, srv, token, fmt.Sprintf("/api/me/bot/agents/%d/windows/tipsport-1/login", id), ``)
+	cmd := readCommand(t, bot)
+	a := postOrderOK(t, srv, token, tipBetOrder("arb-1"))
+	if a.State != "waiting" || a.Reason != "Needs a free Tipsport window" {
+		t.Fatalf("order: %+v, want waiting for Tipsport", a)
+	}
+	expectEvent(t, app, a.OrderID, "waiting", "Needs a free Tipsport window")
+	expectBot(t, app, "on the waiting order")
+	postAck(t, srv, code, `{"id":"`+cmd.ID+`","ok":true,"windowId":"tipsport-1"}`)
+	if r := <-done; r.status != 200 {
+		t.Fatalf("command: %+v", r)
+	}
+	if s, b := postStatus(t, srv, code, tipBetIdle); s != 204 {
+		t.Fatalf("status: %d %s", s, b)
+	}
+	if o := readOrder(t, bot); o.OrderID != a.OrderID || o.Legs[0].WindowID != "tipsport-1" {
+		t.Fatalf("agent got %+v", o)
+	}
+}

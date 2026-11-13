@@ -385,6 +385,22 @@ func (b *botHub) reservedLocked(userID int64) map[int64]map[string]string {
 	return out
 }
 
+// commandWindowsLocked maps userID's agents to the windows that have a window command waiting for
+// the agent's answer: code id → window ids. The scheduler leaves them alone meanwhile. b.mu must be held.
+func (b *botHub) commandWindowsLocked(userID int64) map[int64]map[string]bool {
+	out := map[int64]map[string]bool{}
+	for _, pc := range b.commands {
+		if pc.userID != userID || pc.windowID == "" {
+			continue
+		}
+		if out[pc.codeID] == nil {
+			out[pc.codeID] = map[string]bool{}
+		}
+		out[pc.codeID][pc.windowID] = true
+	}
+	return out
+}
+
 // ordersLocked is userID's orders in state, oldest first (by creation, then id). b.mu must be held.
 func (b *botHub) ordersLocked(userID int64, state string) []*botOrder {
 	var out []*botOrder
@@ -402,15 +418,15 @@ func (b *botHub) ordersLocked(userID int64, state string) []*botOrder {
 	return out
 }
 
-// freeWindowLocked is the agent's window of book to use: idle, not reserved, the one idle longest
-// (gateway time of the first status that showed it idle and unreserved), then the lowest number.
-// "" = none. b.mu must be held.
-func (b *botHub) freeWindowLocked(p *botPresence, book string, reserved map[string]string) string {
+// freeWindowLocked is the agent's window of book to use: idle, not reserved, no window command
+// pending for it, the one idle longest (gateway time of the first status that showed it idle and
+// unreserved), then the lowest number. "" = none. b.mu must be held.
+func (b *botHub) freeWindowLocked(p *botPresence, book string, reserved map[string]string, commanded map[string]bool) string {
 	var pick *botWindow
 	var pickSince time.Time
 	for i := range p.windows {
 		w := &p.windows[i]
-		if w.Bookmaker != book || w.State != "idle" || reserved[w.ID] != "" {
+		if w.Bookmaker != book || w.State != "idle" || reserved[w.ID] != "" || commanded[w.ID] {
 			continue
 		}
 		since, ok := p.idleSince[w.ID]
@@ -431,6 +447,7 @@ func (b *botHub) freeWindowLocked(p *botPresence, book string, reserved map[stri
 // that have a free window of both legs' bookmakers: fewest reserved windows, then the one whose
 // reserved count changed longest ago, then the lowest code id. nil: none. b.mu must be held.
 func (b *botHub) pickLocked(o *botOrder, reserved map[int64]map[string]string, skip map[int64]bool) (int64, *botPresence, [2]string) {
+	commanded := b.commandWindowsLocked(o.userID)
 	var bestID int64
 	var best *botPresence
 	var bestWins [2]string
@@ -438,8 +455,8 @@ func (b *botHub) pickLocked(o *botOrder, reserved map[int64]map[string]string, s
 		if skip[codeID] || p.proto < botProto {
 			continue
 		}
-		w0 := b.freeWindowLocked(p, o.legs[0].Bookmaker, reserved[codeID])
-		w1 := b.freeWindowLocked(p, o.legs[1].Bookmaker, reserved[codeID])
+		w0 := b.freeWindowLocked(p, o.legs[0].Bookmaker, reserved[codeID], commanded[codeID])
+		w1 := b.freeWindowLocked(p, o.legs[1].Bookmaker, reserved[codeID], commanded[codeID])
 		if w0 == "" || w1 == "" {
 			continue
 		}
@@ -568,6 +585,7 @@ func (b *botHub) waitReasonLocked(o *botOrder) string {
 		return fmt.Sprintf("Orders at once: %d running", n)
 	}
 	reserved := b.reservedLocked(o.userID)
+	commanded := b.commandWindowsLocked(o.userID)
 	codes := make([]int64, 0, len(b.agents[o.userID]))
 	for codeID := range b.agents[o.userID] {
 		codes = append(codes, codeID)
@@ -582,7 +600,7 @@ func (b *botHub) waitReasonLocked(o *botOrder) string {
 		}
 		var m []string
 		for _, l := range o.legs {
-			if b.freeWindowLocked(p, l.Bookmaker, reserved[codeID]) == "" {
+			if b.freeWindowLocked(p, l.Bookmaker, reserved[codeID], commanded[codeID]) == "" {
 				m = append(m, l.Bookmaker)
 			}
 		}

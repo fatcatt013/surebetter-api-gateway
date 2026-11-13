@@ -35,6 +35,7 @@ type commandResult struct {
 // pendingCommand is a command sent to an agent whose answer an app request is waiting for.
 type pendingCommand struct {
 	userID, codeID int64
+	windowID       string             // "" for add; the scheduler does not pick this window meanwhile
 	done           chan commandResult // buffered (1): the answer never blocks
 }
 
@@ -87,7 +88,7 @@ func (b *botHub) runCommand(w http.ResponseWriter, r *http.Request, codeID int64
 		Type    string     `json:"type"`
 		Command botCommand `json:"command"`
 	}{"command", cmd})
-	pc := &pendingCommand{userID: userID, codeID: codeID, done: make(chan commandResult, 1)}
+	pc := &pendingCommand{userID: userID, codeID: codeID, windowID: cmd.WindowID, done: make(chan commandResult, 1)}
 	b.mu.Lock()
 	p := b.presenceLocked(userID, codeID)
 	switch {
