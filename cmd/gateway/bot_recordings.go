@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -16,10 +17,11 @@ import (
 // maxRecordingBody is the largest recording upload (1 MiB).
 const maxRecordingBody = 1 << 20
 
-// mouseRecording is a raw mouse recording: paths of [x, y, tMs] points.
+// mouseRecording is a raw mouse recording: paths of [x, y, tMs] points (pointers, so a JSON null
+// is told apart from 0 and refused).
 type mouseRecording struct {
 	Paths []struct {
-		Points [][]float64 `json:"points"`
+		Points [][]*float64 `json:"points"`
 	} `json:"paths"`
 }
 
@@ -40,7 +42,7 @@ type typingRecording struct {
 
 // recordingOf validates a raw recording of kind and returns it re-encoded (only the known keys) with
 // its path or session count. false: bad_recording. Mouse: 1–200 paths of 1–5 000 points of three
-// numbers. Typing: 1–200 sessions with a focusAt and 1–500 events (type down|up, key 1–20 chars, t).
+// finite numbers (null refused). Typing: 1–200 sessions with a focusAt and 1–500 events (type down|up, key 1–20 chars, t).
 func recordingOf(kind string, body []byte) (string, int, bool) {
 	var v any
 	n := 0
@@ -57,6 +59,11 @@ func recordingOf(kind string, body []byte) (string, int, bool) {
 			for _, pt := range p.Points {
 				if len(pt) != 3 {
 					return "", 0, false
+				}
+				for _, v := range pt {
+					if v == nil || math.IsNaN(*v) || math.IsInf(*v, 0) {
+						return "", 0, false
+					}
 				}
 			}
 		}
