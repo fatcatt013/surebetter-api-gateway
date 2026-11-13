@@ -455,8 +455,10 @@ func (b *botHub) pickLocked(o *botOrder, reserved map[int64]map[string]string, s
 // startLocked sends waiting order o if it can go now: fewer running orders than ordersAtOnce and an
 // agent that can take it. Its two windows are reserved at once; the order becomes running (row,
 // botEvent "sent", {"type":"bot"}). An agent whose socket does not take the order (send buffer
-// full: not draining) is left out and the pick repeated. Sent live, it must still fit the day
-// limit (overDayLocked); otherwise it ends stopped · "Over the day limit". false: not sent (it
+// full: not draining) is left out and the pick repeated. Before it is sent the settings are checked
+// again (they may have changed while it waited): paused → it ends stopped · "Paused"; a leg over
+// maxLeg or the legs over maxOrder → "Over the leg limit" / "Over the order limit"; sent live, it
+// must still fit the day limit (overDayLocked), else "Over the day limit". false: not sent (it
 // waits, or it ended). b.mu must be held.
 func (b *botHub) startLocked(o *botOrder, fx *effects) bool {
 	st := b.settingsLocked(o.userID)
@@ -468,6 +470,10 @@ func (b *botHub) startLocked(o *botOrder, fx *effects) bool {
 	for {
 		codeID, p, wins := b.pickLocked(o, reserved, skip)
 		if p == nil {
+			return false
+		}
+		if reason := overSettings(o, st); reason != "" {
+			b.endLocked(o, "stopped", reason, true, fx)
 			return false
 		}
 		if !st.DryRun && st.PerDay > 0 && !o.dayChecked {
@@ -510,6 +516,19 @@ func (b *botHub) startLocked(o *botOrder, fx *effects) bool {
 			Strs("windows", wins[:]).Bool("dry_run", o.dryRun).Msg("bot order sent")
 		return true
 	}
+}
+
+// overSettings is why o may not be sent under st ("" = it may): paused, or over the leg or order limit.
+func overSettings(o *botOrder, st accounts.BotSettings) string {
+	switch {
+	case st.Paused:
+		return "Paused"
+	case st.MaxLeg > 0 && (o.legs[0].Stake > float64(st.MaxLeg) || o.legs[1].Stake > float64(st.MaxLeg)):
+		return "Over the leg limit"
+	case st.MaxOrder > 0 && o.legs[0].Stake+o.legs[1].Stake > float64(st.MaxOrder):
+		return "Over the order limit"
+	}
+	return ""
 }
 
 // overDayLocked reports whether sending o live now would take its Prague day's live stake over

@@ -954,3 +954,37 @@ func TestBotSched_LegStakeCapKeepsTheDayLimitSound(t *testing.T) {
 		t.Fatalf("order that fits: %+v", a)
 	}
 }
+
+// A waiting order is checked again when it is sent: paused, the leg limit and the order limit (set
+// while it waited) end it stopped with the reason instead of sending it.
+func TestBotSched_PauseAndLimitsAgainWhenAWaitingOrderIsSent(t *testing.T) {
+	for _, c := range []struct {
+		name, reason string
+		change       func(*accounts.BotSettings)
+	}{
+		{"paused", "Paused", func(st *accounts.BotSettings) { st.Paused, st.PausedReason = true, "Paused" }},
+		{"leg limit", "Over the leg limit", func(st *accounts.BotSettings) { st.MaxLeg = 101 }},
+		{"order limit", "Over the order limit", func(st *accounts.BotSettings) { st.MaxOrder = 201 }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			srv, svc, bots, db := newBotServerDB(t)
+			token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+			uid := userIDOf(t, svc, token)
+			app := appSocket(t, srv, token)
+			code := newCode(t, srv, token, "bot")
+			bot := startAgentWith(t, srv, code, p2Status("", win("tipsport", 1, "idle"), win("betano", 1, "busy")), app)
+			a := postOrderOK(t, srv, token, tipBetOrder("arb-1")) // legs 100 + 102
+			expectEvent(t, app, a.OrderID, "waiting", "Needs a free Betano window")
+			expectBot(t, app, "on the waiting order")
+			setSettings(t, svc, bots, uid, c.change)
+			if s, b := postStatus(t, srv, code, tipBetIdle); s != 204 {
+				t.Fatalf("status: %d %s", s, b)
+			}
+			expectEvent(t, app, a.OrderID, "stopped", c.reason)
+			if state, reason, _, _, _ := orderRow(t, db, a.OrderID); state != "stopped" || reason != c.reason {
+				t.Fatalf("row: %s %s", state, reason)
+			}
+			expectNoMessage(t, bot, "the agent (the order was never sent)")
+		})
+	}
+}
