@@ -74,7 +74,7 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 | `SNAPSHOT_CACHE_MS` | `500` | Snapshot JSON cached to avoid re-marshaling |
 | `BROADCAST_BATCH_MS` | `50` | Delta batching window |
 | `JWT_SECRET` | `""` | Unused by the gateway (accounts use opaque session tokens, not JWTs); compose still requires it |
-| `ACCOUNTS_DB` | `/data/accounts.db` | SQLite file for users, invites, sessions, reset codes, extension codes, per-user state, bot agents (with their Flows), bot logs, bot settings, bot orders and the agents' recordings. Bot screenshots go in `bot-screenshots/` in the same directory (kept 7 days). Compose mounts the `surebetter-gateway-data` volume at `/data`. Back it up (see `docs/DEPLOY.md`) |
+| `ACCOUNTS_DB` | `/data/accounts.db` | SQLite file for users, invites, sessions, reset codes, extension codes, per-user state, bot agents (with their Flows), bot logs, bot settings (with the rules switched on), bot orders (with each order's last flow) and the agents' recordings. Bot screenshots go in `bot-screenshots/` in the same directory (kept 7 days). Compose mounts the `surebetter-gateway-data` volume at `/data`. Back it up (see `docs/DEPLOY.md`) |
 | `AUTH_REQUIRED` | `true` (compose: `false` until the frontend has login) | `true`: `/ws`, `/ws/value` and both snapshots need a session cookie or an extension code (both sockets also accept a `?ticket=`); `/api/telegram/*` needs an admin session. Only the exact value `false` (trimmed, case-insensitive) turns it off; anything else, typos included, means required. `false`: those stay open; the account API works either way |
 | `LOG_LEVEL` | `info` | zerolog levels: debug/info/warn/error |
 | `EVICTION_TTL_S` | `120` | Seconds since last update before an entry is evicted |

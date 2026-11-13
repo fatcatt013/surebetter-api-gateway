@@ -142,6 +142,33 @@ var migrations = []string{
 	);
 	ALTER TABLE bot_agents ADD COLUMN flows_json TEXT NOT NULL DEFAULT '';
 	ALTER TABLE bot_agents ADD COLUMN flows_at INTEGER NOT NULL DEFAULT 0;`,
+	// 6: bots controller Phase 3: the rules each user switched on, each order's last flow, and the
+	// final state cashed_out. SQLite cannot change a CHECK in place, so bot_orders is rebuilt: a copy
+	// with the new CHECK and column, every row copied, the old table dropped, the copy renamed and its
+	// index created again (nothing references bot_orders, so foreign keys stay as they are). It runs
+	// in migrate's transaction: it is all or nothing.
+	`ALTER TABLE bot_settings ADD COLUMN rules_on TEXT NOT NULL DEFAULT '[]';
+	CREATE TABLE bot_orders_v6 (
+		id          TEXT    PRIMARY KEY,
+		user_id     INTEGER NOT NULL REFERENCES users (id),
+		arb_key     TEXT    NOT NULL,
+		code_id     INTEGER NOT NULL DEFAULT 0,
+		state       TEXT    NOT NULL CHECK (state IN ('waiting', 'running', 'placed', 'stopped', 'outcome_unknown', 'cashed_out')),
+		reason      TEXT    NOT NULL DEFAULT '',
+		dry_run     INTEGER NOT NULL,
+		stake       INTEGER NOT NULL,
+		info_json   TEXT    NOT NULL DEFAULT '{}',
+		legs_json   TEXT    NOT NULL,
+		created_at  INTEGER NOT NULL,
+		sent_at     INTEGER NOT NULL DEFAULT 0,
+		ended_at    INTEGER NOT NULL DEFAULT 0,
+		flow_json   TEXT    NOT NULL DEFAULT ''
+	);
+	INSERT INTO bot_orders_v6 (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json, created_at, sent_at, ended_at)
+		SELECT id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json, created_at, sent_at, ended_at FROM bot_orders;
+	DROP TABLE bot_orders;
+	ALTER TABLE bot_orders_v6 RENAME TO bot_orders;
+	CREATE INDEX bot_orders_user_created ON bot_orders (user_id, created_at);`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)
