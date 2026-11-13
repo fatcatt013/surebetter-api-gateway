@@ -194,9 +194,10 @@ func TestBotAgents_Fleet(t *testing.T) {
 	}
 	want := []agentView{
 		// Online first, then by name ignoring case: attic, Home PC; then the offline VPS Praha.
-		{ID: atticID, Name: "attic", Online: true, Host: botHost{}, DryRun: true, Windows: []botWindow{}},
+		// Both online agents speak protocol 1 (no "proto" in their status): they need an update.
+		{ID: atticID, Name: "attic", Online: true, Host: botHost{}, DryRun: true, Update: true, Windows: []botWindow{}},
 		{ID: homeID, Name: "Home PC", Online: true, Version: "0.9.0+e9ed9d2", Host: botHost{Name: "home-pc", CPU: intp(23), Mem: intp(41)},
-			DryRun: false, Windows: windowsOf(fullWindowsJSON)},
+			DryRun: false, Update: true, Windows: windowsOf(fullWindowsJSON)},
 		{ID: vpsID, Name: "VPS Praha", Online: false, Version: "0.8.0", Host: botHost{Name: "home-pc"}, DryRun: true, Windows: down},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -233,5 +234,56 @@ func TestBotAgents_SessionOnly(t *testing.T) {
 	}
 	if s, b := request(t, srv, "GET", "/api/me/bot/agents", token, "", nil); s != 200 || strings.TrimSpace(b) != `{"agents":[]}` {
 		t.Fatalf("no agents: %d %s", s, b)
+	}
+}
+
+func TestBotStatus_ProtoAndWindowMode(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code, codeID := newBotCode(t, srv, token, "Home PC")
+	win := `{"id":"tipsport-1","bookmaker":"tipsport","number":1,"device":"desktop","state":"down","reason":"Stopped","mode":%q}`
+	bad := map[string]string{
+		"proto -1":       `{"proto":-1}`,
+		"proto 100":      `{"proto":100}`,
+		"proto a string": `{"proto":"2"}`,
+		"proto 2.5":      `{"proto":2.5}`,
+		"mode sleeping":  `{"windows":[` + fmt.Sprintf(win, "sleeping") + `]}`,
+	}
+	for name, body := range bad {
+		if s, b := postStatus(t, srv, code, body); s != 400 || !strings.Contains(b, `"bad_status"`) {
+			t.Errorf("%s: %d %s, want 400 bad_status", name, s, b)
+		}
+	}
+	dialBot(t, srv, code)
+	readType(t, app)
+	waitBot(t, bots, userIDOf(t, svc, token), true)
+
+	// Before any status (proto 0): the Fleet says the agent needs an update.
+	if a := getFleet(t, srv, token); len(a) != 1 || a[0].ID != codeID || !a[0].Update {
+		t.Fatalf("before a status: %+v", a)
+	}
+	for _, mode := range []string{"bot", "login", "stopped"} {
+		if s, b := postStatus(t, srv, code, `{"proto":2,"windows":[`+fmt.Sprintf(win, mode)+`]}`); s != 204 {
+			t.Fatalf("mode %s: %d %s", mode, s, b)
+		}
+		if got := readType(t, app); got != "bot" {
+			t.Fatalf("app on mode %s: %s", mode, got)
+		}
+		a := getFleet(t, srv, token)
+		if a[0].Update || len(a[0].Windows) != 1 || a[0].Windows[0].Mode != mode {
+			t.Fatalf("mode %s: %+v", mode, a[0])
+		}
+	}
+	// Going back to an older agent (no proto) is a change and needs an update; no mode → no "mode" key.
+	if s, b := postStatus(t, srv, code, `{"windows":[{"id":"tipsport-1","bookmaker":"tipsport","number":1,"device":"desktop","state":"down","reason":"Stopped"}]}`); s != 204 {
+		t.Fatalf("older status: %d %s", s, b)
+	}
+	if got := readType(t, app); got != "bot" {
+		t.Fatalf("app on proto change: %s", got)
+	}
+	_, body := request(t, srv, "GET", "/api/me/bot/agents", token, "", nil)
+	if !strings.Contains(body, `"update":true`) || strings.Contains(body, `"mode"`) {
+		t.Fatalf("older agent: %s", body)
 	}
 }

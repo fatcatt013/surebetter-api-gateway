@@ -40,9 +40,11 @@ type botPresence struct {
 	freeSince   time.Time // when the agent last became idle (socket open or busy cleared)
 	version     string
 	hostName    string
-	cpu, mem    *int   // percent; nil = not reported
-	windowsJSON string // the last status's windows, as a JSON array
-	boot        string // the last status's boot id (agent process); "" = not sent
+	cpu, mem    *int        // percent; nil = not reported
+	windowsJSON string      // the last status's windows, as a JSON array
+	windows     []botWindow // the same, decoded
+	boot        string      // the last status's boot id (agent process); "" = not sent
+	proto       int         // the last status's protocol; 0 = none yet or a Phase 1 agent
 }
 
 // viewOf aggregates a user's online agents. No agents is the offline answer. A bookmaker is ready

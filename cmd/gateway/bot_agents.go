@@ -23,6 +23,7 @@ type botWindow struct {
 	LoggedIn  *bool   `json:"loggedIn"`
 	Proxy     *string `json:"proxy"`
 	Reason    string  `json:"reason"`
+	Mode      string  `json:"mode,omitempty"` // bot, login or stopped (protocol 2); absent for older agents
 }
 
 // botHost is the agent's machine. cpu and mem (percent) are kept in memory only.
@@ -39,8 +40,12 @@ type botStatusIn struct {
 	Version string      `json:"version"`
 	Host    *botHost    `json:"host"`
 	Windows []botWindow `json:"windows"`
-	Boot    string      `json:"boot"` // 16 lowercase hex, random per agent process; "" = not sent
+	Boot    string      `json:"boot"`  // 16 lowercase hex, random per agent process; "" = not sent
+	Proto   int         `json:"proto"` // agent protocol: 2 takes orders with window ids and commands; 0 = not sent (Phase 1)
 }
+
+// botProto is the agent protocol the gateway sends orders and window commands to (and above).
+const botProto = 2
 
 var (
 	bootPattern     = regexp.MustCompile(`^[0-9a-f]{16}$`)
@@ -48,6 +53,8 @@ var (
 	windowDevices   = map[string]bool{"desktop": true, "phone": true}
 	// logged_out and blocked are reserved for later agent versions, accepted and shown already.
 	windowStates = map[string]bool{"idle": true, "busy": true, "down": true, "logged_out": true, "blocked": true}
+	// "" = an older agent that does not report modes.
+	windowModes = map[string]bool{"": true, "bot": true, "login": true, "stopped": true}
 )
 
 func runeLen(s string) int { return utf8.RuneCountInString(s) }
@@ -57,9 +64,11 @@ func validPercent(p *int) bool { return p == nil || (*p >= 0 && *p <= 100) }
 // validStatus checks a status's sizes and enums: at most 64 books (bookmaker 1–40 chars), version
 // ≤ 64 chars, host name ≤ 64 chars, cpu and mem 0–100, at most 32 windows with unique ids
 // ([a-z0-9-]{1,40}), a bookmaker (1–40 chars), number ≥ 1, a known device and state, proxy ≤ 100
-// chars and reason ≤ 200 chars, and boot empty or 16 lowercase hex.
+// chars, reason ≤ 200 chars and mode empty, bot, login or stopped, boot empty or 16 lowercase hex,
+// and proto 0–99.
 func validStatus(in botStatusIn) bool {
-	if len(in.Books) > 64 || len(in.Windows) > 32 || runeLen(in.Version) > 64 || (in.Boot != "" && !bootPattern.MatchString(in.Boot)) {
+	if len(in.Books) > 64 || len(in.Windows) > 32 || runeLen(in.Version) > 64 || (in.Boot != "" && !bootPattern.MatchString(in.Boot)) ||
+		in.Proto < 0 || in.Proto > 99 {
 		return false
 	}
 	for _, b := range in.Books {
@@ -73,7 +82,8 @@ func validStatus(in botStatusIn) bool {
 	seen := map[string]bool{}
 	for _, w := range in.Windows {
 		if !windowIDPattern.MatchString(w.ID) || seen[w.ID] || w.Bookmaker == "" || runeLen(w.Bookmaker) > 40 || w.Number < 1 ||
-			!windowDevices[w.Device] || !windowStates[w.State] || runeLen(w.Reason) > 200 || (w.Proxy != nil && runeLen(*w.Proxy) > 100) {
+			!windowDevices[w.Device] || !windowStates[w.State] || runeLen(w.Reason) > 200 || (w.Proxy != nil && runeLen(*w.Proxy) > 100) ||
+			!windowModes[w.Mode] {
 			return false
 		}
 		seen[w.ID] = true
@@ -89,11 +99,13 @@ type botStatus struct {
 	hostName    string
 	cpu, mem    *int
 	windowsJSON string
+	windows     []botWindow
 	boot        string
+	proto       int
 }
 
 func statusOf(in botStatusIn) botStatus {
-	st := botStatus{books: in.Books, dryRun: in.DryRun == nil || *in.DryRun, version: in.Version, boot: in.Boot} // never Live by omission
+	st := botStatus{books: in.Books, dryRun: in.DryRun == nil || *in.DryRun, version: in.Version, boot: in.Boot, proto: in.Proto} // never Live by omission
 	if st.books == nil {
 		st.books = []botBook{}
 	}
@@ -103,14 +115,15 @@ func statusOf(in botStatusIn) botStatus {
 	if in.Windows == nil {
 		in.Windows = []botWindow{}
 	}
+	st.windows = in.Windows
 	js, _ := json.Marshal(in.Windows) // plain structs: cannot fail
 	st.windowsJSON = string(js)
 	return st
 }
 
 // setStatus stores an agent's last status in memory and its version, host name and windows in the
-// registry. The app is told ({"type":"bot"}) when books, dry run, version, host name or windows
-// changed, not for cpu/mem alone. A status with a boot id other than the one the agent had when
+// registry. The app is told ({"type":"bot"}) when books, dry run, version, host name, windows or
+// the protocol changed, not for cpu/mem alone. A status with a boot id other than the one the agent had when
 // it was sent a still running order (or with one when that was empty) means the agent process
 // restarted and can never report that order: the order ends as outcome_unknown ("agent
 // restarted"), relayed like a posted final event, and the agent is freed. A status without a boot
@@ -124,8 +137,9 @@ func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 	}
 	freed := b.pruneLocked()
 	changed := p.dryRun != st.dryRun || !slices.Equal(p.books, st.books) || p.version != st.version ||
-		p.hostName != st.hostName || p.windowsJSON != st.windowsJSON
+		p.hostName != st.hostName || p.windowsJSON != st.windowsJSON || p.proto != st.proto
 	p.books, p.dryRun, p.version, p.hostName, p.windowsJSON = st.books, st.dryRun, st.version, st.hostName, st.windowsJSON
+	p.windows, p.proto = st.windows, st.proto
 	p.cpu, p.mem, p.boot = st.cpu, st.mem, st.boot
 	var ended []endedOrder
 	if st.boot != "" {
@@ -179,6 +193,7 @@ type agentView struct {
 	LastSeen int64       `json:"lastSeen"`
 	DryRun   bool        `json:"dryRun"`
 	Busy     bool        `json:"busy"`
+	Update   bool        `json:"update"` // online with an agent older than protocol 2: never sent orders or commands
 	Windows  []botWindow `json:"windows"`
 }
 
@@ -194,7 +209,7 @@ func windowsOf(js string) []botWindow {
 // fleet lists userID's agents for the Fleet: every non-revoked bot code with a registry row,
 // online first, then by name. An online agent shows its last status from memory; an offline one
 // its stored version, host name and windows, each window down ("Agent offline"), cpu/mem null,
-// dry run, not busy.
+// dry run, not busy. update: online and its last status (or none yet) is older than protocol 2.
 func (b *botHub) fleet(userID int64) ([]agentView, error) {
 	rows, err := b.acc.ListBotAgents(userID) // by name
 	if err != nil {
@@ -206,7 +221,7 @@ func (b *botHub) fleet(userID int64) ([]agentView, error) {
 	for _, row := range rows {
 		v := agentView{ID: row.CodeID, Name: row.Name, LastSeen: row.LastSeenAt}
 		if p := b.presenceLocked(userID, row.CodeID); p != nil {
-			v.Online, v.DryRun, v.Busy, v.Version = true, p.dryRun, p.busy != "", p.version
+			v.Online, v.DryRun, v.Busy, v.Version, v.Update = true, p.dryRun, p.busy != "", p.version, p.proto < botProto
 			v.Host = botHost{Name: p.hostName, CPU: p.cpu, Mem: p.mem}
 			v.Windows = windowsOf(p.windowsJSON)
 		} else {
