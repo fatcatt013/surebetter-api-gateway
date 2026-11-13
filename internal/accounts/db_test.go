@@ -120,3 +120,74 @@ func TestMigrate_BotTables(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrate_BotSettingsOrdersRecordingsAndFlows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The schema as shipped with Phase 1 of the bots controller (version 4), with one agent in it.
+	for _, q := range []string{
+		migrations[0], migrations[1], migrations[2], migrations[3],
+		`PRAGMA user_version = 4`,
+		`INSERT INTO users (id, email, password_hash, role, created_at) VALUES (1, 'u@example.com', 'x', 'user', 0)`,
+		`INSERT INTO extension_codes (id, user_id, name, kind, code_hash, hint, created_at) VALUES (5, 1, 'Home PC', 'bot', 'h', 'ABCD', 0)`,
+		`INSERT INTO bot_agents (code_id, user_id, first_seen_at, last_seen_at) VALUES (5, 1, 10, 10)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%.40s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	defer db.Close()
+	var flows string
+	var flowsAt int64
+	if err := db.QueryRow(`SELECT flows_json, flows_at FROM bot_agents WHERE code_id = 5`).Scan(&flows, &flowsAt); err != nil || flows != "" || flowsAt != 0 {
+		t.Fatalf("existing agent flows: %q %d (err %v)", flows, flowsAt, err)
+	}
+	if _, err := db.Exec(`INSERT INTO bot_settings (user_id, updated_at) VALUES (1, 10)`); err != nil {
+		t.Fatalf("insert settings: %v", err)
+	}
+	var dryRun, paused, maxOrder, maxLeg, perDay, atOnce, onUnknown int
+	var reason string
+	if err := db.QueryRow(`SELECT dry_run, paused, paused_reason, max_order, max_leg, per_day, orders_at_once, pause_on_unknown
+		FROM bot_settings WHERE user_id = 1`).Scan(&dryRun, &paused, &reason, &maxOrder, &maxLeg, &perDay, &atOnce, &onUnknown); err != nil ||
+		dryRun != 1 || paused != 0 || reason != "" || maxOrder != 0 || maxLeg != 0 || perDay != 0 || atOnce != 1 || onUnknown != 1 {
+		t.Fatalf("settings defaults: %d %d %q %d %d %d %d %d (err %v)", dryRun, paused, reason, maxOrder, maxLeg, perDay, atOnce, onUnknown, err)
+	}
+	if _, err := db.Exec(`INSERT INTO bot_orders (id, user_id, arb_key, state, dry_run, stake, legs_json, created_at)
+		VALUES ('0123456789abcdef', 1, 'k', 'waiting', 1, 202, '[]', 10)`); err != nil {
+		t.Fatalf("insert order: %v", err)
+	}
+	var codeID, sentAt, endedAt int64
+	var info string
+	if err := db.QueryRow(`SELECT code_id, reason, info_json, sent_at, ended_at FROM bot_orders WHERE id = '0123456789abcdef'`).
+		Scan(&codeID, &reason, &info, &sentAt, &endedAt); err != nil || codeID != 0 || reason != "" || info != "{}" || sentAt != 0 || endedAt != 0 {
+		t.Fatalf("order defaults: %d %q %q %d %d (err %v)", codeID, reason, info, sentAt, endedAt, err)
+	}
+	if _, err := db.Exec(`UPDATE bot_orders SET state = 'lost'`); err == nil {
+		t.Fatal("state must be waiting, running, placed, stopped or outcome_unknown")
+	}
+	if _, err := db.Exec(`INSERT INTO bot_recordings (code_id, user_id, kind, body_json, count, updated_at) VALUES (5, 1, 'mouse', '{}', 1, 10)`); err != nil {
+		t.Fatalf("insert recording: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO bot_recordings (code_id, user_id, kind, body_json, count, updated_at) VALUES (5, 1, 'mouse', '{}', 2, 11)`); err == nil {
+		t.Fatal("one recording per agent and kind")
+	}
+	if _, err := db.Exec(`INSERT INTO bot_recordings (code_id, user_id, kind, body_json, count, updated_at) VALUES (5, 1, 'voice', '{}', 1, 10)`); err == nil {
+		t.Fatal("kind must be mouse or typing")
+	}
+	if _, err := db.Exec(`INSERT INTO bot_recordings (code_id, user_id, kind, body_json, count, updated_at) VALUES (99, 1, 'typing', '{}', 1, 10)`); err == nil {
+		t.Fatal("a recording needs an existing code")
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'bot_orders_user_created'`).Scan(&n); err != nil || n != 1 {
+		t.Errorf("index bot_orders_user_created missing (n=%d, err=%v)", n, err)
+	}
+}

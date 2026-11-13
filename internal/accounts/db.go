@@ -101,6 +101,47 @@ var migrations = []string{
 	CREATE INDEX bot_logs_ts ON bot_logs (ts);`,
 	// 4: the problems filter (warn and error lines) reads only those lines.
 	`CREATE INDEX bot_logs_problems ON bot_logs (user_id, id) WHERE level <> 'info';`,
+	// 5: bots controller Phase 2: per-user bot settings (mode, pause, limits), the order history, each
+	// agent's mouse and typing recordings, and each agent's Flows upload.
+	`CREATE TABLE bot_settings (
+		user_id          INTEGER PRIMARY KEY REFERENCES users (id),
+		dry_run          INTEGER NOT NULL DEFAULT 1,
+		paused           INTEGER NOT NULL DEFAULT 0,
+		paused_reason    TEXT    NOT NULL DEFAULT '',
+		max_order        INTEGER NOT NULL DEFAULT 0,
+		max_leg          INTEGER NOT NULL DEFAULT 0,
+		per_day          INTEGER NOT NULL DEFAULT 0,
+		orders_at_once   INTEGER NOT NULL DEFAULT 1,
+		pause_on_unknown INTEGER NOT NULL DEFAULT 1,
+		updated_at       INTEGER NOT NULL
+	);
+	CREATE TABLE bot_orders (
+		id          TEXT    PRIMARY KEY,
+		user_id     INTEGER NOT NULL REFERENCES users (id),
+		arb_key     TEXT    NOT NULL,
+		code_id     INTEGER NOT NULL DEFAULT 0,
+		state       TEXT    NOT NULL CHECK (state IN ('waiting', 'running', 'placed', 'stopped', 'outcome_unknown')),
+		reason      TEXT    NOT NULL DEFAULT '',
+		dry_run     INTEGER NOT NULL,
+		stake       INTEGER NOT NULL,
+		info_json   TEXT    NOT NULL DEFAULT '{}',
+		legs_json   TEXT    NOT NULL,
+		created_at  INTEGER NOT NULL,
+		sent_at     INTEGER NOT NULL DEFAULT 0,
+		ended_at    INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX bot_orders_user_created ON bot_orders (user_id, created_at);
+	CREATE TABLE bot_recordings (
+		code_id    INTEGER NOT NULL REFERENCES extension_codes (id),
+		user_id    INTEGER NOT NULL REFERENCES users (id),
+		kind       TEXT    NOT NULL CHECK (kind IN ('mouse', 'typing')),
+		body_json  TEXT    NOT NULL,
+		count      INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (code_id, kind)
+	);
+	ALTER TABLE bot_agents ADD COLUMN flows_json TEXT NOT NULL DEFAULT '';
+	ALTER TABLE bot_agents ADD COLUMN flows_at INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

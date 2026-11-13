@@ -8,7 +8,7 @@ Go WebSocket gateway. Subscribes to `arb.opportunities` on NATS JetStream, maint
 
 ## Structure
 
-The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal, `bot.go`: bot agents' presence, orders, events and the `/api/me/bot*` routes, `bot_agents.go`: agent status and the Fleet list, `bot_logs.go`: agent logs, `bot_shots.go`: screenshots, `bot_prune.go`: 7-day retention). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state, bot agents and bot logs) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
+The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal, `bot.go`: bot agents' presence, orders, events and the `/api/me/bot*` routes, `bot_agents.go`: agent status and the Fleet list, `bot_logs.go`: agent logs, `bot_shots.go`: screenshots, `bot_prune.go`: 7-day retention). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state, bot agents with their Flows, bot logs, bot settings, bot orders and the agents' recordings) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
 
 Key types in that file:
 - `Config` — env vars loaded at startup
@@ -74,7 +74,7 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 | `SNAPSHOT_CACHE_MS` | `500` | Snapshot JSON cached to avoid re-marshaling |
 | `BROADCAST_BATCH_MS` | `50` | Delta batching window |
 | `JWT_SECRET` | `""` | Unused by the gateway (accounts use opaque session tokens, not JWTs); compose still requires it |
-| `ACCOUNTS_DB` | `/data/accounts.db` | SQLite file for users, invites, sessions, reset codes, extension codes, per-user state, bot agents and bot logs. Bot screenshots go in `bot-screenshots/` in the same directory (kept 7 days). Compose mounts the `surebetter-gateway-data` volume at `/data`. Back it up (see `docs/DEPLOY.md`) |
+| `ACCOUNTS_DB` | `/data/accounts.db` | SQLite file for users, invites, sessions, reset codes, extension codes, per-user state, bot agents (with their Flows), bot logs, bot settings, bot orders and the agents' recordings. Bot screenshots go in `bot-screenshots/` in the same directory (kept 7 days). Compose mounts the `surebetter-gateway-data` volume at `/data`. Back it up (see `docs/DEPLOY.md`) |
 | `AUTH_REQUIRED` | `true` (compose: `false` until the frontend has login) | `true`: `/ws`, `/ws/value` and both snapshots need a session cookie or an extension code (both sockets also accept a `?ticket=`); `/api/telegram/*` needs an admin session. Only the exact value `false` (trimmed, case-insensitive) turns it off; anything else, typos included, means required. `false`: those stay open; the account API works either way |
 | `LOG_LEVEL` | `info` | zerolog levels: debug/info/warn/error |
 | `EVICTION_TTL_S` | `120` | Seconds since last update before an entry is evicted |
