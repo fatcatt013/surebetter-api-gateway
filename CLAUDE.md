@@ -8,7 +8,7 @@ Go WebSocket gateway. Subscribes to `arb.opportunities` on NATS JetStream, maint
 
 ## Structure
 
-The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal, `bot.go`: bot agents' presence, orders, events and the `/api/me/bot*` routes, `bot_agents.go`: agent status and the Fleet list, `bot_logs.go`: agent logs, `bot_shots.go`: screenshots, `bot_prune.go`: 7-day retention). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state, bot agents with their Flows, bot logs, bot settings, bot orders and the agents' recordings) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
+The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal, `bot.go`: bot agents' presence, orders, events and the `/api/me/bot*` routes, `bot_agents.go`: agent status and the Fleet list, `bot_logs.go`: agent logs, `bot_shots.go`: screenshots, `bot_prune.go`: 7-day retention, `bot_flows.go`: the agents' Flows). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state, bot agents with their Flows, bot logs, bot settings, bot orders and the agents' recordings) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
 
 Key types in that file:
 - `Config` — env vars loaded at startup
@@ -45,7 +45,7 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 | `GET /ws/value` | WebSocket upgrade — streams value-bet deltas (independent hub; same protocol, path prefix `/value/{id}`) |
 | `GET /api/value/snapshot` | Full current value-bet state as JSON (`{id: ValueBet}`) |
 | `/api/auth/*`, `/api/me/*`, `/api/admin/*` | Accounts API — see `../surebetter-common/docs/api-reference.md` → Accounts |
-| `/api/me/bot`, `/api/me/bot/{status,orders,events,agents,logs,logs.txt,screenshots}` | Bot orders and the Bots controller — see `../surebetter-common/docs/api-reference.md` → Bot orders, Bots controller |
+| `/api/me/bot`, `/api/me/bot/{status,orders,events,agents,logs,logs.txt,screenshots,flows}` | Bot orders and the Bots controller — see `../surebetter-common/docs/api-reference.md` → Bot orders, Bots controller |
 | `GET /health` | `{"status":"ok","service":"api-gateway","version":"dev"}` |
 | `GET /metrics` | Prometheus counters: `gateway_ws_clients_connected`, `gateway_messages_sent_total` |
 

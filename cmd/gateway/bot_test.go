@@ -1198,3 +1198,21 @@ func TestBot_ConcurrentOrdersOneFreeAgent(t *testing.T) {
 		t.Fatalf("answers: %v, want one 202 and one 409", got)
 	}
 }
+
+// waitAgents waits until userID has n agents online.
+func waitAgents(t *testing.T, bots *botHub, userID int64, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		bots.mu.Lock()
+		got := len(bots.agents[userID])
+		bots.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d agents online, want %d", got, n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
