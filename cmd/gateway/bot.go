@@ -80,6 +80,7 @@ type botHub struct {
 	orders map[string]*botOrder             // order id → waiting or running order
 	// settings caches each user's bot settings (loaded by loadSettings before b.mu is taken).
 	settings map[int64]accounts.BotSettings
+	commands map[string]*pendingCommand // window command id → the app request waiting for the agent's answer
 	// dbMu orders the database writes of the hub's changes: release takes it before it lets go of b.mu.
 	dbMu  sync.Mutex
 	logs  *minuteLimiter // POST /api/me/bot/logs lines per user per minute
@@ -91,8 +92,8 @@ type botHub struct {
 
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
 	return &botHub{reg: reg, acc: acc, now: time.Now, agents: map[int64]map[int64]*botPresence{}, orders: map[string]*botOrder{},
-		settings: map[int64]accounts.BotSettings{},
-		logs:     &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}}
+		settings: map[int64]accounts.BotSettings{}, commands: map[string]*pendingCommand{},
+		logs: &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}}
 }
 
 // view is userID's GET /api/me/bot body.
@@ -257,6 +258,9 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("GET /api/me/bot/screenshots/{id}", acc.RequireSession(http.HandlerFunc(b.handleGetShot)))
 	mux.Handle("GET /api/me/bot/settings", acc.RequireSession(http.HandlerFunc(b.handleGetSettings)))
 	mux.Handle("PUT /api/me/bot/settings", acc.RequireSession(http.HandlerFunc(b.handlePutSettings)))
+	mux.Handle("POST /api/me/bot/agents/{agentId}/windows", acc.RequireSession(http.HandlerFunc(b.handleAddWindow)))
+	mux.Handle("POST /api/me/bot/agents/{agentId}/windows/{windowId}/{action}", acc.RequireSession(http.HandlerFunc(b.handleWindowAction)))
+	mux.Handle("POST /api/me/bot/commands", acc.RequireBotCode(http.HandlerFunc(b.handleCommandAck)))
 	mux.Handle("PUT /api/me/bot/flows", acc.RequireBotCode(http.HandlerFunc(b.handlePutFlows)))
 	mux.Handle("GET /api/me/bot/flows", acc.RequireSession(http.HandlerFunc(b.handleGetFlows)))
 	mux.Handle("PUT /api/me/bot/agents/{agentId}/recordings/{kind}", acc.RequireSession(http.HandlerFunc(b.handlePutRecording)))
