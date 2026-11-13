@@ -278,9 +278,10 @@ type StateHub[T any] struct {
 	msgSent   atomic.Int64
 
 	// onChange, when set (arb hub with Telegram on), observes every state transition: an apply
-	// (removed=false) and an explicit removal or eviction (removed=true). Called outside stateMu;
-	// it must not block (the Telegram notifier's Observe is a non-blocking channel send).
-	onChange func(key string, item T, removed bool)
+	// (removed=false), an explicit removal (removed=true) or an eviction (removed and evicted).
+	// Called outside stateMu; it must not block (the Telegram notifier's Observe is a non-blocking
+	// channel send).
+	onChange func(key string, item T, removed, evicted bool)
 }
 
 // Hub is the arbitrage channel (/ws, arb.opportunities).
@@ -334,7 +335,7 @@ func (h *StateHub[T]) ApplyOpportunity(opp T) PatchOp {
 	h.snapshotCache = nil
 	h.stateMu.Unlock()
 	if h.onChange != nil {
-		h.onChange(key, opp, false)
+		h.onChange(key, opp, false, false)
 	}
 	return PatchOp{
 		Op:    "replace",
@@ -361,7 +362,7 @@ func (h *StateHub[T]) RemoveOpportunity(opp T) (PatchOp, bool) {
 		return PatchOp{}, false
 	}
 	if h.onChange != nil {
-		h.onChange(key, opp, true)
+		h.onChange(key, opp, true, false)
 	}
 	return PatchOp{Op: "remove", Path: h.spec.prefix + key}, true
 }
@@ -395,7 +396,7 @@ func (h *StateHub[T]) evictStale(prematchTTL, liveTTL time.Duration) []PatchOp {
 	h.stateMu.Unlock()
 	if h.onChange != nil {
 		for i, e := range evicted {
-			h.onChange(evictedKeys[i], e.opp, true)
+			h.onChange(evictedKeys[i], e.opp, true, true)
 		}
 	}
 	return ops
@@ -703,7 +704,7 @@ func newMux(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier, gate *wsGate) *
 	mux.HandleFunc("/ws/value", wsHandler(valueHub, gate, false))
 	mux.Handle("/api/arb/snapshot", gate.protect(snapshotHandler(hub)))
 	mux.Handle("/api/value/snapshot", gate.protect(snapshotHandler(valueHub)))
-	mux.Handle("/api/telegram/", gate.adminOnly(telegram.Handler(tg)))
+	mux.Handle("/api/telegram/", gate.adminOnly(telegram.Handler(tg, requestUserID)))
 	if gate != nil && gate.acc != nil {
 		accountsAPI := gate.acc.Handler()
 		mux.Handle("/api/auth/", accountsAPI)
@@ -798,7 +799,7 @@ func main() {
 	go bots.runPrune(ctx)
 
 	// Telegram bot: hook the arb hub before the bridge starts feeding it
-	tg := setupTelegram(ctx, cfg, hub, rdb)
+	tg := setupTelegram(ctx, cfg, hub, rdb, acc)
 
 	// Start NATS→hub bridge
 	go runNATSBridge(ctx, nc, hub)

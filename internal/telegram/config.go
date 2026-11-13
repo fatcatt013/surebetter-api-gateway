@@ -45,6 +45,7 @@ type BotConfig struct {
 	Filter    Filter     `json:"filter"`
 	Bankroll  Bankroll   `json:"bankroll"`
 	UpdatedAt int64      `json:"updated_at"`
+	UpdatedBy int64      `json:"updated_by,omitempty"` // user id of the admin who saved it (0 = unknown); set by the server
 }
 
 // ValidationError marks a config the caller got wrong (HTTP 400), as opposed to a storage failure.

@@ -172,6 +172,44 @@ var migrations = []string{
 	DROP TABLE bot_orders;
 	ALTER TABLE bot_orders_v6 RENAME TO bot_orders;
 	CREATE INDEX bot_orders_user_created ON bot_orders (user_id, created_at);`,
+	// 7: statistics of the arbs the Telegram bot posts: one row per message sent (edits add none),
+	// its legs in their own table so they group by bookmaker. user_id is the admin who last saved
+	// the bot config (NULL = unknown); no foreign key, so a stats row never fails on it. ended_at is
+	// when the bot learned the arb was gone (NULL while it lives, or when the end is unknown:
+	// end_reason 'unknown'). Kept forever for now (no pruning).
+	`CREATE TABLE telegram_sent_arbs (
+		id                INTEGER PRIMARY KEY,
+		sent_at           INTEGER NOT NULL,
+		user_id           INTEGER,
+		message_id        INTEGER NOT NULL,
+		arb_key           TEXT    NOT NULL,
+		first_detected_at INTEGER,
+		sport             TEXT    NOT NULL,
+		is_live           INTEGER NOT NULL,
+		market_type       TEXT    NOT NULL,
+		line              REAL    NOT NULL DEFAULT 0,
+		profit_pct        REAL    NOT NULL,
+		shown_profit_pct  REAL    NOT NULL,
+		currency          TEXT    NOT NULL,
+		total_stake       INTEGER NOT NULL,
+		payout            INTEGER NOT NULL,
+		profit            INTEGER NOT NULL,
+		ended_at          INTEGER,
+		end_reason        TEXT CHECK (end_reason IN ('removed', 'evicted', 'redetected', 'absent', 'unknown'))
+	);
+	CREATE INDEX telegram_sent_arbs_sent ON telegram_sent_arbs (sent_at);
+	CREATE INDEX telegram_sent_arbs_user_sent ON telegram_sent_arbs (user_id, sent_at);
+	CREATE INDEX telegram_sent_arbs_open ON telegram_sent_arbs (message_id) WHERE end_reason IS NULL;
+	CREATE TABLE telegram_sent_legs (
+		sent_id    INTEGER NOT NULL REFERENCES telegram_sent_arbs (id) ON DELETE CASCADE,
+		idx        INTEGER NOT NULL,
+		bookmaker  TEXT    NOT NULL,
+		outcome_id TEXT    NOT NULL,
+		odds       REAL    NOT NULL,
+		stake      INTEGER NOT NULL,
+		PRIMARY KEY (sent_id, idx)
+	);
+	CREATE INDEX telegram_sent_legs_bookmaker ON telegram_sent_legs (bookmaker, sent_id);`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

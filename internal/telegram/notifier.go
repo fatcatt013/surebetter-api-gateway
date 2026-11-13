@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ type Event struct {
 	Key     string // gateway oppStateKey
 	Arb     Arb
 	Removed bool
+	Evicted bool // with Removed: the hub evicted it (no update for its TTL) rather than the engine removing it
 }
 
 type enqueuer interface{ Enqueue(Job) }
@@ -35,6 +37,7 @@ type Options struct {
 	GoneDeleteAfter time.Duration
 	Present         func(key string) bool // is the arb still in the gateway's hub? (hub.Has)
 	Now             func() time.Time
+	Stats           Recorder // nil: no statistics
 }
 
 // Status is GET /api/telegram/status.
@@ -64,6 +67,12 @@ type entry struct {
 	removed bool   // a Remove arrived while the send was in flight
 	dirty   bool   // a change waits for the edit interval
 	text    string // text of the in-flight send
+
+	sent      Arb    // the arb the in-flight send rendered (its stats row)
+	userID    int64  // the config's updated_by at send time
+	endAt     int64  // with removed: when the arb ended, for its stats row
+	endReason string // with removed: why
+	restored  bool   // loaded at start and not seen since: an absence says nothing about when it ended
 }
 
 // fade is a message already edited to GONE; it is deleted GoneDeleteAfter later.
@@ -177,9 +186,17 @@ func (n *Notifier) Load(ctx context.Context) error {
 			n.fading[key] = &fade{Tracked: t}
 			continue
 		}
-		n.tracked[key] = &entry{Tracked: t, state: stateLive}
+		n.tracked[key] = &entry{Tracked: t, state: stateLive, restored: true}
 	}
 	n.trackedN.Store(int64(len(n.tracked)))
+	if n.opts.Stats != nil {
+		keep := make([]int64, 0, len(n.tracked))
+		for _, e := range n.tracked {
+			keep = append(keep, e.MessageID)
+		}
+		slices.Sort(keep)
+		n.opts.Stats.RecordSweep(keep)
+	}
 	n.startedAt = now
 	return nil
 }
@@ -210,7 +227,11 @@ func (n *Notifier) handle(_ context.Context, ev Event, now time.Time) {
 	if ev.Removed {
 		delete(n.seen, ev.Key)
 		if e := n.tracked[ev.Key]; e != nil {
-			n.goGone(ev.Key, e, now)
+			reason := EndRemoved
+			if ev.Evicted {
+				reason = EndEvicted
+			}
+			n.goGone(ev.Key, e, now, reason)
 		}
 		return
 	}
@@ -225,9 +246,10 @@ func (n *Notifier) handle(_ context.Context, ev Event, now time.Time) {
 	}
 	if e.FirstDetectedAt != 0 && ev.Arb.firstSeen() != 0 && ev.Arb.firstSeen() != e.FirstDetectedAt {
 		// The engine re-detected it: the old opportunity ended without a removal reaching us.
-		n.goGone(ev.Key, e, now)
+		n.goGone(ev.Key, e, now, EndRedetected)
 		return
 	}
+	e.restored = false
 	e.Arb = ev.Arb
 	if ev.Arb.ProfitPct > e.PeakProfit {
 		e.PeakProfit = ev.Arb.ProfitPct
@@ -252,6 +274,8 @@ func (n *Notifier) maybeSend(key string, a Arb, now time.Time) {
 	e := &entry{
 		Tracked: Tracked{FirstDetectedAt: a.firstSeen(), PeakProfit: a.ProfitPct, Arb: a, Bankroll: cfg.Bankroll, PresetName: cfg.Preset.Name},
 		state:   stateSending,
+		sent:    a,
+		userID:  cfg.UpdatedBy,
 	}
 	e.text = n.render.Render(n.view(e, now, false))
 	n.tracked[key] = e
@@ -276,11 +300,20 @@ func (n *Notifier) maybeEdit(key string, e *entry, now time.Time) {
 	n.out.Enqueue(Job{Kind: JobEdit, Key: key, MessageID: e.MessageID, Text: text})
 }
 
-func (n *Notifier) goGone(key string, e *entry, now time.Time) {
+// goGone closes the message of an arb that ended (reason: End*; "" when a removal that arrived
+// during the send already set it).
+func (n *Notifier) goGone(key string, e *entry, now time.Time, reason string) {
 	switch e.state {
 	case stateSending:
-		e.removed = true
+		if !e.removed {
+			e.removed, e.endAt, e.endReason = true, now.UnixMilli(), reason
+		}
 	case stateLive:
+		at := now.UnixMilli()
+		if e.endReason != "" {
+			at, reason = e.endAt, e.endReason
+		}
+		n.recordEnd(e, at, reason)
 		e.state = stateGone
 		if n.opts.GoneDeleteAfter <= 0 {
 			n.out.Enqueue(Job{Kind: JobDelete, Key: key, MessageID: e.MessageID})
@@ -334,8 +367,12 @@ func (n *Notifier) onResult(ctx context.Context, r Result, now time.Time) {
 		n.lastSentAt = e.SentAt
 		n.stMu.Unlock()
 		n.persist(ctx, key, e)
+		if n.opts.Stats != nil {
+			n.opts.Stats.RecordSent(sentArb(key, e.sent, e.Bankroll, e.userID, e.MessageID, e.SentAt))
+		}
+		e.sent = Arb{}
 		if e.removed {
-			n.goGone(key, e, now)
+			n.goGone(key, e, now, "")
 		}
 	case JobEdit:
 		if e.state != stateLive {
@@ -344,6 +381,7 @@ func (n *Notifier) onResult(ctx context.Context, r Result, now time.Time) {
 		if r.Err != nil {
 			n.recordErr(r.Err, now)
 			if isMessageGone(r.Err) {
+				n.recordEnd(e, 0, EndUnknown)
 				n.untrack(ctx, key, true)
 				return
 			}
@@ -446,9 +484,21 @@ func (n *Notifier) reconcile(now time.Time) {
 	}
 	for key, e := range n.tracked {
 		if e.state == stateLive && !n.opts.Present(key) {
-			n.goGone(key, e, now)
+			n.goGone(key, e, now, EndAbsent)
 		}
 	}
+}
+
+// recordEnd reports the end of a posted arb's row. A message restored at start and not seen since
+// that is found absent or re-detected ended during the downtime: its end time is unknown.
+func (n *Notifier) recordEnd(e *entry, at int64, reason string) {
+	if n.opts.Stats == nil {
+		return
+	}
+	if e.restored && (reason == EndAbsent || reason == EndRedetected) {
+		at, reason = 0, EndUnknown
+	}
+	n.opts.Stats.RecordEnd(SentEnd{MessageID: e.MessageID, EndedAt: at, Reason: reason})
 }
 
 func (n *Notifier) untrack(ctx context.Context, key string, stored bool) {
@@ -548,6 +598,9 @@ func (n *Notifier) SendTest(ctx context.Context) (int64, error) {
 func (n *Notifier) WriteMetrics(w io.Writer) {
 	fmt.Fprintf(w, "gateway_telegram_sent_total %d\ngateway_telegram_edits_total %d\ngateway_telegram_errors_total %d\ngateway_telegram_events_dropped_total %d\ngateway_telegram_tracked %d\n",
 		n.sentN.Load(), n.editsN.Load(), n.errorsN.Load(), n.droppedN.Load(), n.trackedN.Load())
+	if m, ok := n.opts.Stats.(interface{ WriteMetrics(io.Writer) }); ok {
+		m.WriteMetrics(w)
+	}
 }
 
 func digest(s string) string {

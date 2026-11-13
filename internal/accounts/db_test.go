@@ -230,8 +230,8 @@ func TestMigrate_RulesOnFlowAndCashedOut(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 6 {
-		t.Fatalf("user_version = %d (err %v), want 6", version, err)
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want %d", version, err, len(migrations))
 	}
 	// Settings: the row is kept and gains rules_on '[]'.
 	var settings string

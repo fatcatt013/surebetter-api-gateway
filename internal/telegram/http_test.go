@@ -17,7 +17,7 @@ func do(t *testing.T, h http.Handler, method, path, body string) *httptest.Respo
 }
 
 func TestHandler_Unconfigured(t *testing.T) {
-	h := Handler(nil)
+	h := Handler(nil, nil)
 	if rec := do(t, h, "GET", "/api/telegram/status", ""); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"configured":false`) {
 		t.Fatalf("status: %d %s", rec.Code, rec.Body)
 	}
@@ -30,7 +30,7 @@ func TestHandler_Unconfigured(t *testing.T) {
 
 func TestHandler_ConfigRoundTripAndValidation(t *testing.T) {
 	n, _ := newTestNotifier(t, newMemStore(), nil)
-	h := Handler(n)
+	h := Handler(n, nil)
 	cfg := validConfig()
 	cfg.Preset.Name = "New"
 	raw, _ := json.Marshal(cfg)
@@ -50,11 +50,29 @@ func TestHandler_ConfigRoundTripAndValidation(t *testing.T) {
 
 func TestHandler_TestAndStatus(t *testing.T) {
 	n, _ := newTestNotifier(t, newMemStore(), nil)
-	h := Handler(n)
+	h := Handler(n, nil)
 	if rec := do(t, h, "POST", "/api/telegram/test", ""); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"message_id":99`) {
 		t.Fatalf("test: %d %s", rec.Code, rec.Body)
 	}
 	if rec := do(t, h, "GET", "/api/telegram/status", ""); !strings.Contains(rec.Body.String(), `"configured":true`) {
 		t.Fatalf("status: %s", rec.Body)
+	}
+}
+
+func TestHandler_PutConfigRecordsWhoSavedIt(t *testing.T) {
+	n, _ := newTestNotifier(t, newMemStore(), nil)
+	h := Handler(n, func(*http.Request) int64 { return 7 })
+	cfg := validConfig()
+	cfg.UpdatedBy = 99 // a client cannot claim someone else
+	raw, _ := json.Marshal(cfg)
+	if rec := do(t, h, "PUT", "/api/telegram/config", string(raw)); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"updated_by":7`) {
+		t.Fatalf("PUT: %d %s", rec.Code, rec.Body)
+	}
+	if n.Config().UpdatedBy != 7 {
+		t.Fatalf("updated_by = %d, want 7", n.Config().UpdatedBy)
+	}
+	anon := Handler(n, nil) // AUTH_REQUIRED=false: nobody known
+	if rec := do(t, anon, "PUT", "/api/telegram/config", string(raw)); rec.Code != 200 || n.Config().UpdatedBy != 0 {
+		t.Fatalf("anonymous PUT: %d %s", rec.Code, rec.Body)
 	}
 }

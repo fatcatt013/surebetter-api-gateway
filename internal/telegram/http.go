@@ -9,8 +9,9 @@ import (
 )
 
 // Handler serves /api/telegram/*. A nil notifier (TELEGRAM_TOKEN or TELEGRAM_CHAT_ID unset)
-// answers status with configured:false and everything else with 503.
-func Handler(n *Notifier) http.Handler {
+// answers status with configured:false and everything else with 503. userOf names the signed-in
+// user of a request (0 or a nil func = unknown); a saved config records it as updated_by.
+func Handler(n *Notifier, userOf func(*http.Request) int64) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/telegram/status", func(w http.ResponseWriter, _ *http.Request) {
 		if n == nil {
@@ -35,6 +36,10 @@ func Handler(n *Notifier) http.Handler {
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&c); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 			return
+		}
+		c.UpdatedBy = 0
+		if userOf != nil {
+			c.UpdatedBy = userOf(r)
 		}
 		saved, err := n.SetConfig(r.Context(), c)
 		var ve *ValidationError
