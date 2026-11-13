@@ -365,3 +365,32 @@ func TestBotLogs_BodyUpTo2MiB(t *testing.T) {
 		t.Fatalf("2 MiB + 1 byte: %d %s", s, b)
 	}
 }
+
+// Rule 1's stuck-mode lines (contract §4: detail with A, B and the choice) keep their numbers and
+// the choice; 0 is a value (a cashout of 0 Kč), not "absent".
+func TestBotLogs_DetailKeepsTheStuckDecision(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	fixClock(bots)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	code := newCode(t, srv, token, "bot")
+	body := `{"lines":[{"ts":` + fmt.Sprint(logTS) + `,"level":"warn","windowId":"betano-1","orderId":"c81e55a0deadbeef","step":"stuck",` +
+		`"msg":"stuck · A cash out 955 Kč (loss 45) · B Under 1 030 Kč at 1.90 (loss 63) · cash out",` +
+		`"detail":{"cashout":955,"underOdds":1.9,"underStake":1030,"lossA":45,"lossB":63.5,"choice":"cashout","other":1}},` +
+		`{"ts":` + fmt.Sprint(logTS) + `,"level":"info","step":"stuck","msg":"stuck · nothing yet","detail":{"cashout":0,"lossA":0,"choice":"wait"}}]}`
+	if s, b := postLogs(t, srv, code, body); s != 204 {
+		t.Fatalf("post: %d %s", s, b)
+	}
+	lines, err := svc.QueryBotLogs(userIDOf(t, svc, token), accounts.BotLogFilter{})
+	if err != nil || len(lines) != 2 {
+		t.Fatalf("lines: %+v %v", lines, err)
+	}
+	if got := string(lines[1].Detail); got != `{"cashout":955,"underOdds":1.9,"underStake":1030,"lossA":45,"lossB":63.5,"choice":"cashout"}` {
+		t.Fatalf("stuck detail: %s", got)
+	}
+	if got := string(lines[0].Detail); got != `{"cashout":0,"lossA":0,"choice":"wait"}` {
+		t.Fatalf("zero values: %s", got)
+	}
+	if s, b := postLogs(t, srv, code, `{"lines":[{"ts":`+fmt.Sprint(logTS)+`,"level":"info","msg":"x","detail":{"lossB":"63"}}]}`); s != 400 || !strings.Contains(b, `"bad_logs"`) {
+		t.Fatalf("a number as a string: %d %s", s, b)
+	}
+}

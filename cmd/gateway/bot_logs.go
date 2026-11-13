@@ -27,7 +27,8 @@ type logLineIn struct {
 	Detail   *logDetail `json:"detail"`
 }
 
-// logDetail is what a line may carry for the Logs side panel. Other keys are dropped.
+// logDetail is what a line may carry for the Logs side panel. Other keys are dropped. Cashout …
+// Choice are rule 1's stuck-mode decision (A = cash out, B = restake Under, the choice).
 type logDetail struct {
 	Ordered    *float64 `json:"ordered,omitempty"`
 	OnSlip     *float64 `json:"onSlip,omitempty"`
@@ -36,6 +37,12 @@ type logDetail struct {
 	Shot       string   `json:"shot,omitempty"`
 	Match      string   `json:"match,omitempty"`
 	Market     string   `json:"market,omitempty"`
+	Cashout    *float64 `json:"cashout,omitempty"`
+	UnderOdds  *float64 `json:"underOdds,omitempty"`
+	UnderStake *float64 `json:"underStake,omitempty"`
+	LossA      *float64 `json:"lossA,omitempty"`
+	LossB      *float64 `json:"lossB,omitempty"`
+	Choice     string   `json:"choice,omitempty"`
 }
 
 var logLevels = map[string]bool{"info": true, "warn": true, "error": true}
