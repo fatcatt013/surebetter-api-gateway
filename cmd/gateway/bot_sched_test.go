@@ -264,7 +264,8 @@ func TestBotSched_OrderGoesWithWindowsAndTheModeSetting(t *testing.T) {
 	var info string
 	var stake int64
 	db.QueryRow(`SELECT info_json, stake FROM bot_orders WHERE id = ?`, a.OrderID).Scan(&info, &stake)
-	if info != `{"match":"Lyon – Lille","market":"Corners 10.5","live":true,"profitPct":2.4}` || stake != 203 {
+	if info != `{"match":"Lyon – Lille","market":"Corners 10.5","live":true,"profitPct":2.4,"marketType":"","line":null,"isLive":false,"sport":"","rounding":1}` ||
+		stake != 203 {
 		t.Fatalf("info %s stake %d", info, stake)
 	}
 	// Both windows are reserved: no free window, one running.
@@ -986,5 +987,149 @@ func TestBotSched_PauseAndLimitsAgainWhenAWaitingOrderIsSent(t *testing.T) {
 			}
 			expectNoMessage(t, bot, "the agent (the order was never sent)")
 		})
+	}
+}
+
+// rulesLeg is a leg with its canonical side (outcome_id).
+func rulesLeg(book, sourceID, outcomeID string, odds, stake float64) string {
+	return strings.TrimSuffix(legJSON(book, sourceID, odds, stake), "}") + fmt.Sprintf(`,"outcome_id":%q}`, outcomeID)
+}
+
+// totalsOrder is a tipsport Over / betano Under corners order with the Phase 3 fields; only the
+// Under leg has consensus fair odds.
+func totalsOrder(arbKey string) string {
+	under := strings.TrimSuffix(rulesLeg("betano", "s2", "UNDER", 2, 1025), "}") + `,"fair_odds":1.95}`
+	return `{"arb_key":"` + arbKey + `","legs":[` + rulesLeg("tipsport", "s1", "OVER", 2.05, 1000) + `,` + under +
+		`],"match":"Lyon – Lille","market":"Corners 9.5","live":true,"profit_pct":1.2,"market_type":"TOTAL_CORNERS","line":9.5,"is_live":true,` +
+		`"sport":"football","rounding":10}`
+}
+
+// readOrderJSON reads the next message on the agent's socket as an order, as JSON.
+func readOrderJSON(t *testing.T, bot *websocket.Conn) map[string]any {
+	t.Helper()
+	m := readJSON(t, bot)
+	o, ok := m["order"].(map[string]any)
+	if m["type"] != "order" || !ok {
+		t.Fatalf("agent got %v, want an order", m)
+	}
+	return o
+}
+
+func TestBotSched_OrderFieldsValidation(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	tip := legJSON("tipsport", "s1", 2.1, 100)
+	bet := legJSON("betano", "s2", 2.05, 102)
+	with := func(extra string) string { return `{"arb_key":"k","legs":[` + tip + `,` + bet + `],` + extra + `}` }
+	bad := map[string]string{
+		"market_type over 64": with(`"market_type":"` + strings.Repeat("M", 65) + `"`),
+		"market_type number":  with(`"market_type":5`),
+		"sport over 40":       with(`"sport":"` + strings.Repeat("s", 41) + `"`),
+		"line a string":       with(`"line":"9.5"`),
+		"is_live a string":    with(`"is_live":"yes"`),
+		"rounding 0":          with(`"rounding":0`),
+		"rounding 5":          with(`"rounding":5`),
+		"rounding 1000":       with(`"rounding":1000`),
+		"rounding 10.5":       with(`"rounding":10.5`),
+		"rounding a string":   with(`"rounding":"10"`),
+		"outcome_id over 120": `{"arb_key":"k","legs":[` + tip + `,` + rulesLeg("betano", "s2", strings.Repeat("o", 121), 2.05, 102) + `]}`,
+		"fair_odds 1":         `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":1}]}`,
+		"fair_odds 0.5":       `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":0.5}]}`,
+		"fair_odds negative":  `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":-2}]}`,
+		"fair_odds a string":  `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":"1.9"}]}`,
+	}
+	for name, body := range bad {
+		if s, b := postOrder(t, srv, token, body); s != 400 || !strings.Contains(b, `"bad_order"`) {
+			t.Errorf("%s: %d %s, want 400 bad_order", name, s, b)
+		}
+	}
+	// At the limits, and null line / rounding: valid (no agent online, so the next check answers).
+	for name, body := range map[string]string{
+		"limits":         with(`"market_type":"` + strings.Repeat("M", 64) + `","sport":"` + strings.Repeat("s", 40) + `","rounding":100`),
+		"nulls":          with(`"line":null,"rounding":null`),
+		"rounding 1":     with(`"rounding":1`),
+		"outcome_id 120": `{"arb_key":"k","legs":[` + tip + `,` + rulesLeg("betano", "s2", strings.Repeat("o", 120), 2.05, 102) + `]}`,
+		"fair_odds":      `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":1.01}]}`,
+		"fair_odds null": `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":null}]}`,
+	} {
+		if s, b := postOrder(t, srv, token, body); s != 409 || !strings.Contains(b, `"bot_offline"`) {
+			t.Errorf("%s: %d %s, want 409 bot_offline", name, s, b)
+		}
+	}
+}
+
+// The order message carries the arb's fields, each leg's side and, from the settings at send time,
+// max_leg and rules_on; info_json and legs_json keep them.
+func TestBotSched_OrderFieldsReachTheAgent(t *testing.T) {
+	srv, svc, bots, db := newBotServerDB(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.MaxLeg = 3000 })
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	bot := startAgentWith(t, srv, code, p2Status("", win("tipsport", 1, "idle"), win("betano", 1, "busy")), app)
+	a := postOrderOK(t, srv, token, totalsOrder("arb-1"))
+	expectEvent(t, app, a.OrderID, "waiting", "Needs a free Betano window")
+	expectBot(t, app, "on the waiting order")
+	// Switched on while the order waits: the order carries the setting at the moment it is sent.
+	if s, b := putSettings(t, srv, token, `{"rulesOn":["totals-over-first"]}`); s != 200 {
+		t.Fatalf("settings: %d %s", s, b)
+	}
+	expectBot(t, app, "on the settings change")
+	if s, b := postStatus(t, srv, code, tipBetIdle); s != 204 {
+		t.Fatalf("status: %d %s", s, b)
+	}
+	o := readOrderJSON(t, bot)
+	want := map[string]any{"order_id": a.OrderID, "market_type": "TOTAL_CORNERS", "line": 9.5, "is_live": true, "sport": "football",
+		"match": "Lyon – Lille", "rounding": float64(10), "max_leg": float64(3000), "dry_run": true}
+	for k, v := range want {
+		if o[k] != v {
+			t.Errorf("order %s = %v, want %v", k, o[k], v)
+		}
+	}
+	if rules, _ := json.Marshal(o["rules_on"]); string(rules) != `["totals-over-first"]` {
+		t.Errorf("rules_on = %s", rules)
+	}
+	legs, _ := o["legs"].([]any)
+	if len(legs) != 2 || legs[0].(map[string]any)["outcome_id"] != "OVER" || legs[1].(map[string]any)["outcome_id"] != "UNDER" ||
+		legs[1].(map[string]any)["window_id"] != "betano-1" || legs[1].(map[string]any)["fair_odds"] != 1.95 {
+		t.Fatalf("legs: %v", legs)
+	}
+	if fair, ok := legs[0].(map[string]any)["fair_odds"]; !ok || fair != nil {
+		t.Fatalf("a leg without fair odds carries fair_odds null: %v", legs[0])
+	}
+	expectEvent(t, app, a.OrderID, "sent", "")
+	var info string
+	db.QueryRow(`SELECT info_json FROM bot_orders WHERE id = ?`, a.OrderID).Scan(&info)
+	if info != `{"match":"Lyon – Lille","market":"Corners 9.5","live":true,"profitPct":1.2,"marketType":"TOTAL_CORNERS","line":9.5,"isLive":true,`+
+		`"sport":"football","rounding":10}` {
+		t.Fatalf("info_json: %s", info)
+	}
+	if _, _, _, _, rowLegs := orderRow(t, db, a.OrderID); len(rowLegs) != 2 || rowLegs[0].OutcomeID != "OVER" || rowLegs[1].OutcomeID != "UNDER" ||
+		rowLegs[0].FairOdds != nil || rowLegs[1].FairOdds == nil || *rowLegs[1].FairOdds != 1.95 {
+		t.Fatalf("legs_json: %+v", rowLegs)
+	}
+}
+
+// An order from an older app (no Phase 3 fields): line null, rounding 1, no rules switched on.
+func TestBotSched_OrderWithoutTheNewFields(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	bot := startBot(t, srv, newCode(t, srv, token, "bot"), app)
+	postOrderOK(t, srv, token, tipBetOrder("arb-1"))
+	o := readOrderJSON(t, bot)
+	if o["market_type"] != "" || o["line"] != nil || o["is_live"] != false || o["sport"] != "" || o["match"] != "" || o["rounding"] != float64(1) ||
+		o["max_leg"] != float64(0) {
+		t.Fatalf("order: %v", o)
+	}
+	if line, ok := o["line"]; !ok || line != nil {
+		t.Fatalf("line must be present and null: %v", o)
+	}
+	if rules, _ := json.Marshal(o["rules_on"]); string(rules) != `[]` {
+		t.Fatalf("rules_on = %s, want []", rules)
+	}
+	if leg := o["legs"].([]any)[0].(map[string]any); leg["outcome_id"] != "" || leg["fair_odds"] != nil {
+		t.Fatalf("leg: %v", leg)
 	}
 }

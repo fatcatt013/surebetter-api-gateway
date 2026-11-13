@@ -29,24 +29,32 @@ const (
 
 // botLeg is one leg of an order, as the app sends it.
 type botLeg struct {
-	Bookmaker       string  `json:"bookmaker"`
-	MatchURL        string  `json:"match_url"`
-	SourceID        string  `json:"source_id"`
-	SourceMarketRef string  `json:"source_market_ref"`
-	MarketName      string  `json:"market_name"`
-	Label           string  `json:"label"`
-	Odds            float64 `json:"odds"`
-	Stake           float64 `json:"stake"`
+	Bookmaker       string   `json:"bookmaker"`
+	MatchURL        string   `json:"match_url"`
+	SourceID        string   `json:"source_id"`
+	SourceMarketRef string   `json:"source_market_ref"`
+	MarketName      string   `json:"market_name"`
+	Label           string   `json:"label"`
+	Odds            float64  `json:"odds"`
+	Stake           float64  `json:"stake"`
+	OutcomeID       string   `json:"outcome_id"` // the leg's canonical side (OVER, UNDER, HOME, a team …); "" from an older app
+	FairOdds        *float64 `json:"fair_odds"`  // consensus fair odds of this leg (rule 2); nil = unknown
 }
 
-// botOrderIn is the POST /api/me/bot/orders body. match, market, live and profit_pct are for display only.
+// botOrderIn is the POST /api/me/bot/orders body. match, market, live and profit_pct are for display
+// only; market_type, line, is_live, sport and rounding go to the agent (its rules), all optional.
 type botOrderIn struct {
-	ArbKey    string   `json:"arb_key"`
-	Legs      []botLeg `json:"legs"`
-	Match     string   `json:"match"`
-	Market    string   `json:"market"`
-	Live      bool     `json:"live"`
-	ProfitPct float64  `json:"profit_pct"`
+	ArbKey     string   `json:"arb_key"`
+	Legs       []botLeg `json:"legs"`
+	Match      string   `json:"match"`
+	Market     string   `json:"market"`
+	Live       bool     `json:"live"`
+	ProfitPct  float64  `json:"profit_pct"`
+	MarketType string   `json:"market_type"`
+	Line       *float64 `json:"line"` // nil: the market has no line
+	IsLive     bool     `json:"is_live"`
+	Sport      string   `json:"sport"`
+	Rounding   *int     `json:"rounding"` // 1, 10 or 100; nil = 1
 }
 
 // agentLeg is a leg as the agent receives it: the app's leg plus the window the gateway reserved.
@@ -55,20 +63,44 @@ type agentLeg struct {
 	WindowID string `json:"window_id"`
 }
 
-// botOrderMsg is the order the agent's bot socket receives ({"type":"order","order":…}).
+// botOrderMsg is the order the agent's bot socket receives ({"type":"order","order":…}). dry_run,
+// max_leg and rules_on are the user's settings when it is sent.
 type botOrderMsg struct {
-	OrderID string     `json:"order_id"`
-	ArbKey  string     `json:"arb_key"`
-	DryRun  bool       `json:"dry_run"`
-	Legs    []agentLeg `json:"legs"`
+	OrderID    string     `json:"order_id"`
+	ArbKey     string     `json:"arb_key"`
+	DryRun     bool       `json:"dry_run"`
+	Legs       []agentLeg `json:"legs"`
+	MarketType string     `json:"market_type"`
+	Line       *float64   `json:"line"`
+	IsLive     bool       `json:"is_live"`
+	Sport      string     `json:"sport"`
+	Match      string     `json:"match"`
+	Rounding   int        `json:"rounding"`
+	MaxLeg     int64      `json:"max_leg"`  // Kč, 0 = no limit
+	RulesOn    []string   `json:"rules_on"` // never null
 }
 
-// orderInfo is an order's display fields (bot_orders.info_json).
+// orderInfo is an order's display fields and the arb's fields the agent gets (bot_orders.info_json).
 type orderInfo struct {
-	Match     string  `json:"match"`
-	Market    string  `json:"market"`
-	Live      bool    `json:"live"`
-	ProfitPct float64 `json:"profitPct"`
+	Match      string   `json:"match"`
+	Market     string   `json:"market"`
+	Live       bool     `json:"live"`
+	ProfitPct  float64  `json:"profitPct"`
+	MarketType string   `json:"marketType"`
+	Line       *float64 `json:"line"`
+	IsLive     bool     `json:"isLive"`
+	Sport      string   `json:"sport"`
+	Rounding   int      `json:"rounding"` // 0 in rows older than Phase 3
+}
+
+// infoOf is in's display and arb fields as info_json keeps them (rounding 1 when absent).
+func infoOf(in botOrderIn) orderInfo {
+	rounding := 1
+	if in.Rounding != nil {
+		rounding = *in.Rounding
+	}
+	return orderInfo{Match: in.Match, Market: in.Market, Live: in.Live, ProfitPct: in.ProfitPct, MarketType: in.MarketType, Line: in.Line,
+		IsLive: in.IsLive, Sport: in.Sport, Rounding: rounding}
 }
 
 // storedLeg is a leg as bot_orders.legs_json keeps it: the app's leg, its window and its last step.
@@ -101,6 +133,17 @@ type botOrder struct {
 func (o *botOrder) legsJSON() string {
 	js, _ := json.Marshal(o.legs) // plain structs: cannot fail
 	return string(js)
+}
+
+// message is o as an agent receives it under the settings st, its legs in windows ("" = none).
+func (o *botOrder) message(st accounts.BotSettings, windows [2]string) botOrderMsg {
+	msg := botOrderMsg{OrderID: o.id, ArbKey: o.arbKey, DryRun: st.DryRun, MarketType: o.info.MarketType, Line: o.info.Line,
+		IsLive: o.info.IsLive, Sport: o.info.Sport, Match: o.info.Match, Rounding: o.info.Rounding, MaxLeg: st.MaxLeg,
+		RulesOn: rulesOnList(st.RulesOn)}
+	for i, l := range o.legs {
+		msg.Legs = append(msg.Legs, agentLeg{botLeg: l.botLeg, WindowID: windows[i]})
+	}
+	return msg
 }
 
 // effects is what a hub change must do once b.mu is released: database writes, botEvent messages
@@ -232,14 +275,30 @@ var (
 
 // validOrder checks the shape: an arb key (at most 256 bytes), exactly 2 legs at different
 // bookmakers, each with a selection id, odds above 1 and a stake above 0 and at most maxKc (so
-// stake sums never overflow); match and market at most 200 characters and a finite profit_pct.
+// stake sums never overflow); match and market at most 200 characters and a finite profit_pct;
+// then the arb fields (validArbFields).
 func validOrder(o botOrderIn) bool {
 	if strings.TrimSpace(o.ArbKey) == "" || len(o.ArbKey) > 256 || len(o.Legs) != 2 || o.Legs[0].Bookmaker == o.Legs[1].Bookmaker ||
-		runeLen(o.Match) > 200 || runeLen(o.Market) > 200 || math.IsNaN(o.ProfitPct) || math.IsInf(o.ProfitPct, 0) {
+		runeLen(o.Match) > 200 || runeLen(o.Market) > 200 || math.IsNaN(o.ProfitPct) || math.IsInf(o.ProfitPct, 0) || !validArbFields(o) {
 		return false
 	}
 	for _, l := range o.Legs {
 		if strings.TrimSpace(l.Bookmaker) == "" || l.Bookmaker != strings.TrimSpace(l.Bookmaker) || strings.TrimSpace(l.SourceID) == "" || !(l.Odds > 1) || !(l.Stake > 0) || !(l.Stake <= maxKc) {
+			return false
+		}
+	}
+	return true
+}
+
+// validArbFields checks the fields the agent's rules read: market_type at most 64 and sport at most
+// 40 characters, rounding absent or 1, 10 or 100, each leg's outcome_id at most 120 characters and
+// its fair_odds absent, null or above 1.
+func validArbFields(o botOrderIn) bool {
+	if runeLen(o.MarketType) > 64 || runeLen(o.Sport) > 40 || (o.Rounding != nil && *o.Rounding != 1 && *o.Rounding != 10 && *o.Rounding != 100) {
+		return false
+	}
+	for _, l := range o.Legs {
+		if runeLen(l.OutcomeID) > 120 || (l.FairOdds != nil && !(*l.FairOdds > 1)) {
 			return false
 		}
 	}
@@ -314,7 +373,7 @@ func (b *botHub) submitLocked(userID int64, in botOrderIn, fx *effects) (submitt
 		return submitted{}, errBookNotReady
 	}
 	o := &botOrder{id: newOrderID(), userID: userID, arbKey: in.ArbKey, state: orderWaiting, dryRun: st.DryRun, stake: stake,
-		info: orderInfo{Match: in.Match, Market: in.Market, Live: in.Live, ProfitPct: in.ProfitPct}, created: now, dayChecked: dayChecked}
+		info: infoOf(in), created: now, dayChecked: dayChecked}
 	for _, l := range in.Legs {
 		o.legs = append(o.legs, storedLeg{botLeg: l})
 	}
@@ -504,14 +563,10 @@ func (b *botHub) startLocked(o *botOrder, fx *effects) bool {
 				return false
 			}
 		}
-		msg := botOrderMsg{OrderID: o.id, ArbKey: o.arbKey, DryRun: st.DryRun}
-		for i, l := range o.legs {
-			msg.Legs = append(msg.Legs, agentLeg{botLeg: l.botLeg, WindowID: wins[i]})
-		}
 		payload, _ := json.Marshal(struct {
 			Type  string      `json:"type"`
 			Order botOrderMsg `json:"order"`
-		}{"order", msg})
+		}{"order", o.message(st, wins)})
 		if !p.client.trySend(payload) {
 			skip[codeID] = true
 			continue
