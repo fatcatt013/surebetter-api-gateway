@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -104,11 +106,14 @@ func infoOf(in botOrderIn) orderInfo {
 }
 
 // storedLeg is a leg as bot_orders.legs_json keeps it: the app's leg, its window and its last step.
+// A final event that reports the legs replaces Stake and Odds with what was really staked (odds 0
+// in the report keeps the ordered odds) and sets Placed.
 type storedLeg struct {
 	botLeg
 	WindowID string `json:"windowId"`
 	Step     string `json:"step"`
 	StepAt   int64  `json:"stepAt"` // Unix ms; 0 = no step yet
+	Placed   *bool  `json:"placed"` // nil: not reported (running, or an agent older than Phase 3)
 }
 
 // botOrder is a waiting or running order, in memory until its final state.
@@ -126,6 +131,7 @@ type botOrder struct {
 	legs    []storedLeg
 	created time.Time
 	sent    time.Time
+	flow    string // the agent's last flow object, compact JSON; "" = none yet
 	// dayChecked: the POST that created it just checked the day limit (cleared when that POST ends).
 	dayChecked bool
 }
@@ -247,13 +253,14 @@ func (b *botHub) saveSettingsLocked(userID int64, st accounts.BotSettings, fx *e
 
 // botEventMsg is the {"type":"botEvent"} message the user's non-bot /ws sockets receive.
 type botEventMsg struct {
-	Type      string `json:"type"`
-	OrderID   string `json:"order_id"`
-	ArbKey    string `json:"arb_key"`
-	Event     string `json:"event"`
-	Bookmaker string `json:"bookmaker,omitempty"`
-	Reason    string `json:"reason,omitempty"`
-	Step      string `json:"step,omitempty"`
+	Type      string          `json:"type"`
+	OrderID   string          `json:"order_id"`
+	ArbKey    string          `json:"arb_key"`
+	Event     string          `json:"event"`
+	Bookmaker string          `json:"bookmaker,omitempty"`
+	Reason    string          `json:"reason,omitempty"`
+	Step      string          `json:"step,omitempty"`
+	Flow      json.RawMessage `json:"flow,omitempty"` // event flow only
 }
 
 // relayLocked queues ev as a botEvent of o for the user's non-bot sockets. b.mu must be held.
@@ -841,27 +848,109 @@ var botEvents = map[string]bool{
 	"accepted":        false,
 	"leg_ready":       false,
 	"leg_step":        false,
+	"flow":            false,
 	"placed":          true,
 	"stopped":         true,
 	"outcome_unknown": true,
+	"cashed_out":      true,
 }
 
 var errUnknownOrder = errors.New("unknown_order")
 
-// botEventIn is the POST /api/me/bot/events body.
+// botEventIn is the POST /api/me/bot/events body. flow: event flow only; legs: read on final events.
 type botEventIn struct {
-	OrderID   string `json:"order_id"`
-	Event     string `json:"event"`
-	Bookmaker string `json:"bookmaker"`
-	Reason    string `json:"reason"`
-	Step      string `json:"step"`
+	OrderID   string          `json:"order_id"`
+	Event     string          `json:"event"`
+	Bookmaker string          `json:"bookmaker"`
+	Reason    string          `json:"reason"`
+	Step      string          `json:"step"`
+	Flow      json.RawMessage `json:"flow"`
+	Legs      []finalLeg      `json:"legs"`
+}
+
+// finalLeg is one leg as a final event reports it: what was really staked.
+type finalLeg struct {
+	Bookmaker string  `json:"bookmaker"`
+	Stake     float64 `json:"stake"`
+	Odds      float64 `json:"odds"` // 0 = not known (the ordered odds stay)
+	Placed    bool    `json:"placed"`
+}
+
+// maxFlow is the largest flow object (compact JSON) an agent may post.
+const maxFlow = 1 << 10
+
+// flowIDPattern is a rule or playbook id in a flow.
+var flowIDPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,40}$`)
+
+// compactFlow checks a flow object and returns it compact: a JSON object of at most 1 KiB with a
+// rule and a playbook id ([A-Za-z0-9-]{1,40}), a whole phase 0–99 and stuck null (or absent) or an
+// object. Other keys are kept unchecked. "": not a valid flow.
+func compactFlow(raw json.RawMessage) string {
+	var buf bytes.Buffer
+	if json.Compact(&buf, raw) != nil || buf.Len() > maxFlow || !bytes.HasPrefix(buf.Bytes(), []byte("{")) {
+		return ""
+	}
+	var f struct {
+		Rule     string          `json:"rule"`
+		Playbook string          `json:"playbook"`
+		Phase    *int            `json:"phase"`
+		Stuck    json.RawMessage `json:"stuck"`
+	}
+	if json.Unmarshal(buf.Bytes(), &f) != nil || !flowIDPattern.MatchString(f.Rule) || !flowIDPattern.MatchString(f.Playbook) ||
+		f.Phase == nil || *f.Phase < 0 || *f.Phase > 99 || !(len(f.Stuck) == 0 || string(f.Stuck) == "null" || f.Stuck[0] == '{') {
+		return ""
+	}
+	return buf.String()
+}
+
+// validFinalLegs checks a final event's legs: at most 2, at different non-empty bookmakers (at most
+// 40 characters), stake 0–maxKc, odds ≥ 0.
+func validFinalLegs(legs []finalLeg) bool {
+	if len(legs) > 2 || (len(legs) == 2 && legs[0].Bookmaker == legs[1].Bookmaker) {
+		return false
+	}
+	for _, l := range legs {
+		if l.Bookmaker == "" || runeLen(l.Bookmaker) > 40 || !(l.Stake >= 0) || l.Stake > maxKc || !(l.Odds >= 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// applyFinalLegs records what the agent really staked on o's legs (a reported bookmaker that is not
+// one of o's legs is ignored) and makes o's stake the real total: live, the placed legs' stakes;
+// in a dry run (nothing is placed) every reported leg's stake. No legs: o is left alone.
+func (o *botOrder) applyFinalLegs(legs []finalLeg) {
+	var total float64
+	reported := false
+	for _, fl := range legs {
+		for i := range o.legs {
+			l := &o.legs[i]
+			if l.Bookmaker != fl.Bookmaker {
+				continue
+			}
+			reported = true
+			placed := fl.Placed
+			l.Stake, l.Placed = fl.Stake, &placed
+			if fl.Odds > 0 {
+				l.Odds = fl.Odds
+			}
+			if placed || o.dryRun {
+				total += fl.Stake
+			}
+		}
+	}
+	if reported {
+		o.stake = int64(math.Round(total))
+	}
 }
 
 // event relays one order event, posted by codeID's agent, to the user's non-bot /ws sockets.
-// leg_step records the leg's step and its time. A final event ends the order (row, reservation)
-// and retries the waiting orders. errUnknownOrder: the order is unknown, ended, waiting, another
-// user's, or was sent to another agent.
-func (b *botHub) event(userID, codeID int64, in botEventIn) error {
+// leg_step records the leg's step and its time; flow keeps the order's last flow (memory and row)
+// and relays it. A final event records the legs it reports (applyFinalLegs), ends the order (row,
+// reservation) and retries the waiting orders. errUnknownOrder: the order is unknown, ended,
+// waiting, another user's, or was sent to another agent. flow must be compactFlow's result.
+func (b *botHub) event(userID, codeID int64, in botEventIn, flow string) error {
 	b.loadSettings(userID)
 	b.mu.Lock()
 	fx := &effects{}
@@ -871,15 +960,24 @@ func (b *botHub) event(userID, codeID int64, in botEventIn) error {
 		b.release(fx)
 		return errUnknownOrder
 	}
-	if in.Event == "leg_step" {
+	ev := botEventMsg{Event: in.Event, Bookmaker: in.Bookmaker, Reason: in.Reason, Step: in.Step}
+	switch in.Event {
+	case "leg_step":
 		for i := range o.legs {
 			if o.legs[i].Bookmaker == in.Bookmaker {
 				o.legs[i].Step, o.legs[i].StepAt = in.Step, b.now().UnixMilli()
 			}
 		}
+	case "flow":
+		o.flow, ev.Flow = flow, json.RawMessage(flow)
+		if b.acc != nil {
+			id := o.id
+			fx.write(func() error { return b.acc.SetBotOrderFlow(id, flow) })
+		}
 	}
-	b.relayLocked(fx, o, botEventMsg{Event: in.Event, Bookmaker: in.Bookmaker, Reason: in.Reason, Step: in.Step})
+	b.relayLocked(fx, o, ev)
 	if botEvents[in.Event] {
+		o.applyFinalLegs(in.Legs)
 		b.endLocked(o, in.Event, in.Reason, false, fx)
 		b.dispatchLocked(userID, fx)
 	}
@@ -893,12 +991,17 @@ func (b *botHub) handleEvent(w http.ResponseWriter, r *http.Request) {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_event")
 		return
 	}
-	if _, ok := botEvents[in.Event]; !ok || runeLen(in.Step) > 40 || (in.Event == "leg_step" && (in.Step == "" || in.Bookmaker == "")) {
+	flow := ""
+	if in.Event == "flow" {
+		flow = compactFlow(in.Flow)
+	}
+	if _, ok := botEvents[in.Event]; !ok || runeLen(in.Step) > 40 || (in.Event == "leg_step" && (in.Step == "" || in.Bookmaker == "")) ||
+		(in.Event == "flow" && flow == "") || !validFinalLegs(in.Legs) {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_event")
 		return
 	}
 	p := principalOf(r)
-	switch err := b.event(p.UserID, p.CodeID, in); {
+	switch err := b.event(p.UserID, p.CodeID, in, flow); {
 	case err == nil:
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, errUnknownOrder):

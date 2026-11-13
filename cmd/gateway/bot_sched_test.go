@@ -1133,3 +1133,181 @@ func TestBotSched_OrderWithoutTheNewFields(t *testing.T) {
 		t.Fatalf("leg: %v", leg)
 	}
 }
+
+const flowPhase1 = `{"rule":"totals-over-first","playbook":"overFirst","phase":1,"stuck":null}`
+
+// The agent's flow events: kept per order (memory and row), relayed with the flow, never a {"type":"bot"}.
+func TestBotSched_FlowEvents(t *testing.T) {
+	srv, svc, bots, db := newBotServerDB(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	bot := startAgentWith(t, srv, code, p2Status("", win("tipsport", 1, "idle"), win("betano", 1, "idle"), win("fortuna", 1, "busy")), app)
+	o := placeOrder(t, srv, token, "arb-1", bot, app)
+	flowEvent := func(flow string) string { return `{"order_id":"` + o.OrderID + `","event":"flow","flow":` + flow + `}` }
+	rowFlow := func() string {
+		t.Helper()
+		var js string
+		if err := db.QueryRow(`SELECT flow_json FROM bot_orders WHERE id = ?`, o.OrderID).Scan(&js); err != nil {
+			t.Fatal(err)
+		}
+		return js
+	}
+	bad := map[string]string{
+		"no flow":           `{"order_id":"` + o.OrderID + `","event":"flow"}`,
+		"flow null":         flowEvent(`null`),
+		"flow an array":     flowEvent(`[]`),
+		"flow a string":     flowEvent(`"overFirst"`),
+		"no rule":           flowEvent(`{"playbook":"overFirst","phase":1,"stuck":null}`),
+		"rule with a space": flowEvent(`{"rule":"totals over","playbook":"overFirst","phase":1,"stuck":null}`),
+		"playbook over 40":  flowEvent(`{"rule":"r","playbook":"` + strings.Repeat("p", 41) + `","phase":1,"stuck":null}`),
+		"no phase":          flowEvent(`{"rule":"r","playbook":"p","stuck":null}`),
+		"phase -1":          flowEvent(`{"rule":"r","playbook":"p","phase":-1,"stuck":null}`),
+		"phase 100":         flowEvent(`{"rule":"r","playbook":"p","phase":100,"stuck":null}`),
+		"phase 1.5":         flowEvent(`{"rule":"r","playbook":"p","phase":1.5,"stuck":null}`),
+		"stuck a number":    flowEvent(`{"rule":"r","playbook":"p","phase":1,"stuck":5}`),
+		"over 1 KiB":        flowEvent(`{"rule":"r","playbook":"p","phase":1,"stuck":{"note":"` + strings.Repeat("n", 1000) + `"}}`),
+	}
+	for name, body := range bad {
+		if s, b := postEvent(t, srv, code, body); s != 400 || !strings.Contains(b, `"bad_event"`) {
+			t.Errorf("%s: %d %s, want 400 bad_event", name, s, b)
+		}
+	}
+	if s, b := postEvent(t, srv, code, flowEvent(" {\"rule\": \"totals-over-first\", \"playbook\": \"overFirst\", \"phase\": 1, \"stuck\": null} ")); s != 204 {
+		t.Fatalf("flow: %d %s", s, b)
+	}
+	m := expectEvent(t, app, o.OrderID, "flow", "")
+	if js, _ := json.Marshal(m["flow"]); string(js) != `{"phase":1,"playbook":"overFirst","rule":"totals-over-first","stuck":null}` {
+		t.Fatalf("relayed flow: %s", js)
+	}
+	bots.mu.Lock()
+	mem := bots.orders[o.OrderID].flow
+	bots.mu.Unlock()
+	if mem != flowPhase1 || rowFlow() != flowPhase1 {
+		t.Fatalf("flow kept compact: memory %s row %s", mem, rowFlow())
+	}
+	stuck := `{"rule":"totals-over-first","playbook":"overFirst","phase":2,"stuck":{"since":1763035200000,"cashout":955,"underOdds":1.9,"choice":"wait"}}`
+	if s, b := postEvent(t, srv, code, flowEvent(stuck)); s != 204 {
+		t.Fatalf("stuck flow: %d %s", s, b)
+	}
+	expectEvent(t, app, o.OrderID, "flow", "")
+	if rowFlow() != stuck {
+		t.Fatalf("row after the second flow: %s", rowFlow())
+	}
+	// A waiting order has no agent to post its flow.
+	waiting := postOrderOK(t, srv, token, orderJSON("arb-2", legJSON("tipsport", "s1", 2.1, 100), legJSON("fortuna", "s3", 2, 100)))
+	expectEvent(t, app, waiting.OrderID, "waiting", "")
+	expectBot(t, app, "on the waiting order")
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+waiting.OrderID+`","event":"flow","flow":`+flowPhase1+`}`); s != 404 || !strings.Contains(b, `"unknown_order"`) {
+		t.Fatalf("flow of a waiting order: %d %s", s, b)
+	}
+	// The final event keeps the last flow in the row.
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+o.OrderID+`","event":"placed"}`); s != 204 {
+		t.Fatalf("placed: %d %s", s, b)
+	}
+	expectEvent(t, app, o.OrderID, "placed", "")
+	if rowFlow() != stuck {
+		t.Fatalf("row after the final event: %s", rowFlow())
+	}
+}
+
+// cashed_out is final (windows free, row, relay) and does not pause, whatever pauseOnUnknown says.
+func TestBotSched_CashedOutIsFinalAndDoesNotPause(t *testing.T) {
+	srv, svc, bots, db := newBotServerDB(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	setSettings(t, svc, bots, userIDOf(t, svc, token), func(st *accounts.BotSettings) { st.DryRun = false })
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	bot := startBot(t, srv, code, app)
+	o := placeOrder(t, srv, token, "arb-1", bot, app)
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+o.OrderID+`","event":"cashed_out","reason":"Over cashed out · 95 Kč of 100",`+
+		`"legs":[{"bookmaker":"tipsport","stake":100,"odds":2.1,"placed":true},{"bookmaker":"betano","stake":0,"odds":0,"placed":false}]}`); s != 204 {
+		t.Fatalf("cashed_out: %d %s", s, b)
+	}
+	expectEvent(t, app, o.OrderID, "cashed_out", "Over cashed out · 95 Kč of 100")
+	expectBot(t, app, "after the final event")
+	if v := getView(t, srv, token); v.Paused || v.Running != 0 || !v.Books[0].Ready || !v.Books[1].Ready {
+		t.Fatalf("view: %+v", v)
+	}
+	var state string
+	var stake int64
+	db.QueryRow(`SELECT state, stake FROM bot_orders WHERE id = ?`, o.OrderID).Scan(&state, &stake)
+	if state != "cashed_out" || stake != 100 {
+		t.Fatalf("row: %s %d", state, stake)
+	}
+	placeOrder(t, srv, token, "arb-2", bot, app) // not paused: the next order goes
+}
+
+// A final event's legs are what was really staked: legs_json gets their stakes, odds and placed,
+// and the order's stake becomes the real total (live: the placed legs; dry run: every reported leg).
+func TestBotSched_FinalLegsSetTheRealStake(t *testing.T) {
+	srv, svc, bots, db := newBotServerDB(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	bot := startBot(t, srv, code, app)
+	row := func(id string) (int64, []storedLeg) {
+		t.Helper()
+		var stake int64
+		db.QueryRow(`SELECT stake FROM bot_orders WHERE id = ?`, id).Scan(&stake)
+		_, _, _, _, legs := orderRow(t, db, id)
+		return stake, legs
+	}
+	final := func(id, event, legs string) {
+		t.Helper()
+		if s, b := postEvent(t, srv, code, `{"order_id":"`+id+`","event":"`+event+`","legs":`+legs+`}`); s != 204 {
+			t.Fatalf("%s: %d %s", event, s, b)
+		}
+		expectEvent(t, app, id, event, "")
+		expectBot(t, app, "after the final event")
+	}
+
+	// Dry run (the default): nothing is really placed; the stake is the legs the agent reports.
+	o := placeOrder(t, srv, token, "arb-1", bot, app) // 100 + 102
+	final(o.OrderID, "stopped", `[{"bookmaker":"tipsport","stake":100,"odds":2.1,"placed":false},{"bookmaker":"betano","stake":97,"odds":2.16,"placed":false}]`)
+	stake, legs := row(o.OrderID)
+	if stake != 197 || legs[1].Stake != 97 || legs[1].Odds != 2.16 || legs[1].Placed == nil || *legs[1].Placed || legs[0].Placed == nil {
+		t.Fatalf("dry run row: %d %+v", stake, legs)
+	}
+
+	// Live: only placed legs count. A leg of another bookmaker is ignored; odds 0 keeps the ordered odds.
+	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.DryRun = false })
+	o = placeOrder(t, srv, token, "arb-2", bot, app)
+	final(o.OrderID, "outcome_unknown", `[{"bookmaker":"tipsport","stake":100,"odds":0,"placed":true},{"bookmaker":"fortuna","stake":5000,"odds":3,"placed":true}]`)
+	stake, legs = row(o.OrderID)
+	if stake != 100 || legs[0].Odds != 2.1 || legs[0].Placed == nil || !*legs[0].Placed || legs[1].Placed != nil || legs[1].Stake != 102 {
+		t.Fatalf("live row: %d %+v", stake, legs)
+	}
+	m := readJSON(t, bot) // outcome_unknown paused the user
+	if m["type"] != "pause" {
+		t.Fatalf("agent got %v, want pause", m)
+	}
+	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.Paused, st.PausedReason = false, "" })
+
+	// A final event without legs keeps the ordered stake; placed stays unknown (null).
+	o = placeOrder(t, srv, token, "arb-3", bot, app)
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+o.OrderID+`","event":"placed"}`); s != 204 {
+		t.Fatalf("placed: %d %s", s, b)
+	}
+	expectEvent(t, app, o.OrderID, "placed", "")
+	if stake, legs = row(o.OrderID); stake != 202 || legs[0].Placed != nil || legs[1].Placed != nil {
+		t.Fatalf("no legs: %d %+v", stake, legs)
+	}
+
+	for name, legs := range map[string]string{
+		"three legs":        `[{"bookmaker":"a","stake":1,"odds":2,"placed":true},{"bookmaker":"b","stake":1,"odds":2,"placed":true},{"bookmaker":"c","stake":1,"odds":2,"placed":true}]`,
+		"same bookmaker":    `[{"bookmaker":"tipsport","stake":1,"odds":2,"placed":true},{"bookmaker":"tipsport","stake":1,"odds":2,"placed":true}]`,
+		"no bookmaker":      `[{"stake":1,"odds":2,"placed":true}]`,
+		"bookmaker over 40": `[{"bookmaker":"` + strings.Repeat("b", 41) + `","stake":1,"odds":2,"placed":true}]`,
+		"stake negative":    `[{"bookmaker":"tipsport","stake":-1,"odds":2,"placed":true}]`,
+		"stake over 10M":    `[{"bookmaker":"tipsport","stake":10000001,"odds":2,"placed":true}]`,
+		"odds negative":     `[{"bookmaker":"tipsport","stake":1,"odds":-2,"placed":true}]`,
+		"placed a string":   `[{"bookmaker":"tipsport","stake":1,"odds":2,"placed":"yes"}]`,
+		"legs not an array": `{"bookmaker":"tipsport"}`,
+	} {
+		if s, b := postEvent(t, srv, code, `{"order_id":"0123456789abcdef","event":"placed","legs":`+legs+`}`); s != 400 || !strings.Contains(b, `"bad_event"`) {
+			t.Errorf("%s: %d %s, want 400 bad_event", name, s, b)
+		}
+	}
+}
