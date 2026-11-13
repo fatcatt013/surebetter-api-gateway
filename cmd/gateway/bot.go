@@ -197,6 +197,10 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("GET /api/me/bot/screenshots/{id}", acc.RequireSession(http.HandlerFunc(b.handleGetShot)))
 	mux.Handle("PUT /api/me/bot/flows", acc.RequireBotCode(http.HandlerFunc(b.handlePutFlows)))
 	mux.Handle("GET /api/me/bot/flows", acc.RequireSession(http.HandlerFunc(b.handleGetFlows)))
+	mux.Handle("PUT /api/me/bot/agents/{agentId}/recordings/{kind}", acc.RequireSession(http.HandlerFunc(b.handlePutRecording)))
+	mux.Handle("GET /api/me/bot/agents/{agentId}/recordings", acc.RequireSession(http.HandlerFunc(b.handleAgentRecordings)))
+	mux.Handle("GET /api/me/bot/recordings", acc.RequireBotCode(http.HandlerFunc(b.handleOwnRecordings)))
+	mux.Handle("GET /api/me/bot/recordings/{kind}", acc.RequireBotCode(http.HandlerFunc(b.handleOwnRecording)))
 	return accounts.CSRF(mux)
 }
 
