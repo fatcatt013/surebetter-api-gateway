@@ -21,6 +21,9 @@ type orderLegView struct {
 	OutcomeID string   `json:"outcomeId"`
 	Placed    *bool    `json:"placed"`   // null until a final event reports the legs
 	FairOdds  *float64 `json:"fairOdds"` // consensus fair odds the app sent; null = unknown
+	// LimitLevel is the leg's level in the agent's limit index when the order was sent (0–2); null =
+	// not sent yet (waiting) or an order older than Phase 3b.
+	LimitLevel *int `json:"limitLevel"`
 }
 
 // orderView is one order in GET /api/me/bot/orders.
@@ -55,7 +58,8 @@ func legViews(legs []storedLeg) []orderLegView {
 	out := make([]orderLegView, 0, len(legs))
 	for _, l := range legs {
 		out = append(out, orderLegView{Bookmaker: l.Bookmaker, WindowID: l.WindowID, Label: l.Label, Odds: l.Odds, Stake: l.Stake,
-			Step: l.Step, StepAt: l.StepAt, OutcomeID: l.OutcomeID, Placed: l.Placed, FairOdds: l.FairOdds})
+			Step: l.Step, StepAt: l.StepAt, OutcomeID: l.OutcomeID, Placed: l.Placed, FairOdds: l.FairOdds,
+			LimitLevel: l.LimitLevel})
 	}
 	return out
 }

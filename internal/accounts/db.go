@@ -210,6 +210,9 @@ var migrations = []string{
 		PRIMARY KEY (sent_id, idx)
 	);
 	CREATE INDEX telegram_sent_legs_bookmaker ON telegram_sent_legs (bookmaker, sent_id);`,
+	// 8: bots controller Phase 3b (rule 3): each agent's limit index, a JSON array of
+	// {"bookmaker","sport","marketTypes":[…],"level":0|1|2} set by hand in the Fleet; '[]' = every cell Normal.
+	`ALTER TABLE bot_agents ADD COLUMN limit_index_json TEXT NOT NULL DEFAULT '[]';`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

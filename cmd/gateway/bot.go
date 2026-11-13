@@ -85,6 +85,10 @@ type botHub struct {
 	// next successful read applies it to the real settings and stores them.
 	memPause map[int64]string
 	commands map[string]*pendingCommand // window command id → the app request waiting for the agent's answer
+	// limits caches each agent's limit index by code id (loadLimitIndex before b.mu is taken; a PUT
+	// replaces it under limitMu, which keeps the stored and the cached index the same).
+	limits  map[int64][]limitEntry
+	limitMu sync.Mutex
 	// dbMu orders the database writes of the hub's changes: release takes it before it lets go of b.mu.
 	dbMu  sync.Mutex
 	logs  *minuteLimiter // POST /api/me/bot/logs lines per user per minute
@@ -97,7 +101,8 @@ type botHub struct {
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
 	return &botHub{reg: reg, acc: acc, now: time.Now, agents: map[int64]map[int64]*botPresence{}, orders: map[string]*botOrder{},
 		settings: map[int64]accounts.BotSettings{}, memPause: map[int64]string{}, commands: map[string]*pendingCommand{},
-		logs: &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}}
+		limits: map[int64][]limitEntry{},
+		logs:   &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}}
 }
 
 // view is userID's GET /api/me/bot body.
@@ -265,6 +270,8 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("POST /api/me/bot/agents/{agentId}/windows", acc.RequireSession(http.HandlerFunc(b.handleAddWindow)))
 	mux.Handle("POST /api/me/bot/agents/{agentId}/windows/{windowId}/{action}", acc.RequireSession(http.HandlerFunc(b.handleWindowAction)))
 	mux.Handle("POST /api/me/bot/agents/{agentId}/try", acc.RequireSession(http.HandlerFunc(b.handleTry)))
+	mux.Handle("GET /api/me/bot/agents/{agentId}/limit-index", acc.RequireSession(http.HandlerFunc(b.handleGetLimitIndex)))
+	mux.Handle("PUT /api/me/bot/agents/{agentId}/limit-index", acc.RequireSession(http.HandlerFunc(b.handlePutLimitIndex)))
 	mux.Handle("POST /api/me/bot/commands", acc.RequireBotCode(http.HandlerFunc(b.handleCommandAck)))
 	mux.Handle("PUT /api/me/bot/flows", acc.RequireBotCode(http.HandlerFunc(b.handlePutFlows)))
 	mux.Handle("GET /api/me/bot/flows", acc.RequireSession(http.HandlerFunc(b.handleGetFlows)))

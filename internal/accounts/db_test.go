@@ -299,3 +299,40 @@ func TestMigrate_RulesOnFlowAndCashedOut(t *testing.T) {
 	}
 	fk.Close()
 }
+
+func TestMigrate_AgentLimitIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The schema as shipped with Phase 3 (version 7) and one agent with its status and Flows.
+	steps := append(append([]string{}, migrations[:7]...), `PRAGMA user_version = 7`,
+		`INSERT INTO users (id, email, password_hash, role, created_at) VALUES (1, 'u@example.com', 'x', 'user', 0)`,
+		`INSERT INTO extension_codes (id, user_id, name, kind, code_hash, hint, created_at) VALUES (5, 1, 'Home PC', 'bot', 'h', 'ABCD', 0)`,
+		`INSERT INTO bot_agents (code_id, user_id, version, host_name, windows_json, first_seen_at, last_seen_at, flows_json, flows_at)
+			VALUES (5, 1, '1.2.3', 'home-pc', '[{"id":"betano-1"}]', 10, 20, '{"rules":[]}', 30)`)
+	for _, q := range steps {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%.60s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want %d", version, err, len(migrations))
+	}
+	// The agent row is kept and gains limit_index_json '[]'.
+	var row string
+	if err := db.QueryRow(`SELECT code_id || '/' || user_id || '/' || version || '/' || host_name || '/' || windows_json || '/' || first_seen_at || '/' ||
+		last_seen_at || '/' || flows_json || '/' || flows_at || '/' || limit_index_json FROM bot_agents`).Scan(&row); err != nil ||
+		row != `5/1/1.2.3/home-pc/[{"id":"betano-1"}]/10/20/{"rules":[]}/30/[]` {
+		t.Fatalf("agent after the migration: %q (err %v)", row, err)
+	}
+}

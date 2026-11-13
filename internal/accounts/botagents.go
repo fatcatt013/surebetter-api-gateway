@@ -95,3 +95,24 @@ func (s *Service) BotAgentFlows(userID, codeID int64) (string, int64, error) {
 	}
 	return flows, at, err
 }
+
+// BotAgentLimitIndex returns codeID's limit index (a JSON array, "[]" when none was saved); found
+// false when codeID has no agent row of userID.
+func (s *Service) BotAgentLimitIndex(userID, codeID int64) (js string, found bool, err error) {
+	err = s.db.QueryRow(`SELECT limit_index_json FROM bot_agents WHERE code_id = ? AND user_id = ?`, codeID, userID).Scan(&js)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return js, err == nil, err
+}
+
+// SaveBotAgentLimitIndex replaces codeID's limit index with js (a validated JSON array); found false
+// when codeID has no agent row of userID (nothing is written).
+func (s *Service) SaveBotAgentLimitIndex(userID, codeID int64, js string) (found bool, err error) {
+	res, err := s.db.Exec(`UPDATE bot_agents SET limit_index_json = ? WHERE code_id = ? AND user_id = ?`, js, codeID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}

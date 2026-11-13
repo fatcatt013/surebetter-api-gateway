@@ -42,6 +42,10 @@ type botLeg struct {
 	Stake           float64  `json:"stake"`
 	OutcomeID       string   `json:"outcome_id"` // the leg's canonical side (OVER, UNDER, HOME, a team …); "" from an older app
 	FairOdds        *float64 `json:"fair_odds"`  // consensus fair odds of this leg (rule 2); nil = unknown
+	// LimitLevel is the leg's bookmaker's level in the chosen agent's limit index (rule 3): 0 Normal,
+	// 1 Some limits, 2 Strict. The gateway sets it when the order is sent (an order body's is ignored;
+	// a Try body's is used as given). nil: not sent yet, or an order older than Phase 3b.
+	LimitLevel *int `json:"limit_level,omitempty"`
 }
 
 // botOrderIn is the POST /api/me/bot/orders body. match, market, live and profit_pct are for display
@@ -145,12 +149,14 @@ func (o *botOrder) legsJSON() string {
 	return string(js)
 }
 
-// message is o as an agent receives it under the settings st, its legs in windows ("" = none).
-func (o *botOrder) message(st accounts.BotSettings, windows [2]string) botOrderMsg {
+// message is o as an agent receives it under the settings st, its legs in windows ("" = none) at
+// levels (the agent's limit index).
+func (o *botOrder) message(st accounts.BotSettings, windows [2]string, levels [2]int) botOrderMsg {
 	msg := botOrderMsg{OrderID: o.id, ArbKey: o.arbKey, DryRun: st.DryRun, MarketType: o.info.MarketType, Line: o.info.Line,
 		IsLive: o.info.IsLive, Sport: o.info.Sport, Match: o.info.Match, Rounding: o.info.Rounding, MaxLeg: st.MaxLeg,
 		RulesOn: rulesOnList(st.RulesOn)}
 	for i, l := range o.legs {
+		l.LimitLevel = &levels[i]
 		msg.Legs = append(msg.Legs, agentLeg{botLeg: l.botLeg, WindowID: windows[i]})
 	}
 	return msg
@@ -401,6 +407,7 @@ func (b *botHub) submitLocked(userID int64, in botOrderIn, fx *effects) (submitt
 	o := &botOrder{id: newOrderID(), userID: userID, arbKey: in.ArbKey, state: orderWaiting, dryRun: st.DryRun, stake: stake,
 		info: infoOf(in), created: now, dayChecked: dayChecked}
 	for _, l := range in.Legs {
+		l.LimitLevel = nil // set from the chosen agent's limit index when it is sent
 		o.legs = append(o.legs, storedLeg{botLeg: l})
 	}
 	b.orders[o.id] = o
@@ -589,10 +596,11 @@ func (b *botHub) startLocked(o *botOrder, fx *effects) bool {
 				return false
 			}
 		}
+		levels := b.limitLevelsLocked(codeID, o)
 		payload, _ := json.Marshal(struct {
 			Type  string      `json:"type"`
 			Order botOrderMsg `json:"order"`
-		}{"order", o.message(st, wins)})
+		}{"order", o.message(st, wins, levels)})
 		if !p.client.trySend(payload) {
 			skip[codeID] = true
 			continue
@@ -601,7 +609,7 @@ func (b *botHub) startLocked(o *botOrder, fx *effects) bool {
 		o.state, o.codeID, o.boot, o.sent, o.dryRun, o.reason = orderRunning, codeID, p.boot, now, st.DryRun, ""
 		o.deadline = now.Add(orderMemory)
 		for i := range o.legs {
-			o.legs[i].WindowID = wins[i]
+			o.legs[i].WindowID, o.legs[i].LimitLevel = wins[i], &levels[i]
 			delete(p.idleSince, wins[i])
 		}
 		p.reservedAt = now

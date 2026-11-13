@@ -136,6 +136,7 @@ func statusOf(in botStatusIn) botStatus {
 // waiting orders are retried. false: codeID has no open bot socket.
 func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 	b.loadSettings(userID)
+	b.loadLimitIndex(userID, codeID) // before the agent can be picked for an order
 	b.mu.Lock()
 	p := b.presenceLocked(userID, codeID)
 	if p == nil {

@@ -73,10 +73,11 @@ func TestBotOrders_RunningWaitingAndHistory(t *testing.T) {
 	}
 	r := got.Running[0]
 	sent := clk.now().Add(-time.Second).UnixMilli()
+	normal := 0 // the leg's level in the agent's limit index when it was sent
 	want := orderView{ID: running.OrderID, ArbKey: "arb-2", State: "running", DryRun: true, AgentID: codeID, Agent: "Home PC",
 		Match: "Lyon – Lille", Market: "Corners 10.5", Live: true, ProfitPct: 2.4, Stake: 202, CreatedAt: sent, SentAt: sent, Rounding: 1,
-		Legs: []orderLegView{{Bookmaker: "tipsport", WindowID: "tipsport-1", Odds: 2.1, Stake: 100},
-			{Bookmaker: "betano", WindowID: "betano-2", Odds: 2.05, Stake: 102.4, Step: "checkOdds", StepAt: clk.now().UnixMilli()}}}
+		Legs: []orderLegView{{Bookmaker: "tipsport", WindowID: "tipsport-1", Odds: 2.1, Stake: 100, LimitLevel: &normal},
+			{Bookmaker: "betano", WindowID: "betano-2", Odds: 2.05, Stake: 102.4, Step: "checkOdds", StepAt: clk.now().UnixMilli(), LimitLevel: &normal}}}
 	if rj, wj := mustJSON(r), mustJSON(want); rj != wj {
 		t.Fatalf("running:\n got %s\nwant %s", rj, wj)
 	}

@@ -81,12 +81,13 @@ func (b *botHub) handleWindowAction(w http.ResponseWriter, r *http.Request) {
 
 // handleTry is POST /api/me/bot/agents/{agentId}/try: the order body (arb key and selection ids may
 // be left out) goes to the agent as a try command with the order message it would get now (the
-// settings' dry_run, max_leg and rules_on; no order id, no windows). Nothing is started; the agent
+// settings' dry_run, max_leg and rules_on, each leg's limit_level from the agent's limit index or,
+// when the body gives one (0–2), that one; no order id, no windows). Nothing is started; the agent
 // answers which rule and playbook would run, and the app gets that result.
 func (b *botHub) handleTry(w http.ResponseWriter, r *http.Request) {
 	var in botOrderIn
 	codeID, ok := agentParam(r)
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&in); err != nil || !ok || !validTry(in) {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&in); err != nil || !ok || !validTry(in) || !validTryLevels(in) {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_order")
 		return
 	}
@@ -95,15 +96,32 @@ func (b *botHub) handleTry(w http.ResponseWriter, r *http.Request) {
 		accounts.WriteError(w, http.StatusInternalServerError, "internal")
 		return
 	}
-	b.mu.Lock()
-	st := b.settingsLocked(userID)
-	b.mu.Unlock()
+	b.loadLimitIndex(userID, codeID)
 	o := &botOrder{arbKey: in.ArbKey, info: infoOf(in)}
 	for _, l := range in.Legs {
 		o.legs = append(o.legs, storedLeg{botLeg: l})
 	}
-	msg := o.message(st, [2]string{})
+	b.mu.Lock()
+	st := b.settingsLocked(userID)
+	levels := b.limitLevelsLocked(codeID, o)
+	b.mu.Unlock()
+	for i, l := range in.Legs {
+		if l.LimitLevel != nil {
+			levels[i] = *l.LimitLevel
+		}
+	}
+	msg := o.message(st, [2]string{}, levels)
 	b.runCommand(w, r, codeID, botCommand{Action: "try", Order: &msg})
+}
+
+// validTryLevels: each leg's limit_level is absent, null, 0, 1 or 2.
+func validTryLevels(in botOrderIn) bool {
+	for _, l := range in.Legs {
+		if l.LimitLevel != nil && (*l.LimitLevel < 0 || *l.LimitLevel > 2) {
+			return false
+		}
+	}
+	return true
 }
 
 // runCommand sends cmd to agent codeID and answers the app with the agent's answer, waiting at most
