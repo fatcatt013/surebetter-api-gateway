@@ -43,3 +43,26 @@ func TestBotSettings_DefaultsSaveAndLoad(t *testing.T) {
 		t.Fatalf("another user's settings: %+v", got)
 	}
 }
+
+func TestBotSettings_RulesOn(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	if d := DefaultBotSettings(); d.RulesOn != "[]" {
+		t.Fatalf("default rules on: %q", d.RulesOn)
+	}
+	st := DefaultBotSettings()
+	st.RulesOn = `["totals-over-first","later-rule"]`
+	if err := s.SaveBotSettings(user.UserID, st); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.BotSettings(user.UserID); err != nil || got != st {
+		t.Fatalf("after save: %+v %v", got, err)
+	}
+	st.RulesOn = "[]"
+	if err := s.SaveBotSettings(user.UserID, st); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.BotSettings(user.UserID); got.RulesOn != "[]" {
+		t.Fatalf("after switching every rule off: %+v", got)
+	}
+}

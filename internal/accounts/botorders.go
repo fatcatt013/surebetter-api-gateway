@@ -7,19 +7,20 @@ type BotOrderRow struct {
 	ArbKey    string
 	CodeID    int64  // the agent it was sent to; 0 = never sent
 	Agent     string // the agent's (code's) name; filled by reads only
-	State     string // waiting, running, placed, stopped or outcome_unknown
+	State     string // waiting, running, placed, stopped, outcome_unknown or cashed_out
 	Reason    string
 	DryRun    bool
-	Stake     int64
-	InfoJSON  string // match, market, live, profitPct
-	LegsJSON  string // legs with windowId and last step
+	Stake     int64  // the ordered stakes summed; a final event that reports the legs makes it the real total
+	InfoJSON  string // match, market, live, profitPct and the order fields the agent gets (market type, line …)
+	LegsJSON  string // legs with windowId, last step and, once ended, what was really staked
+	FlowJSON  string // the agent's last flow object ("" = none)
 	CreatedAt int64
 	SentAt    int64
 	EndedAt   int64
 }
 
 // BotOrderDayStats sums a user's orders created in one day: all orders, the placed ones, and the
-// live stake (orders not stopped, dry_run = 0).
+// live stake (orders not stopped, dry_run = 0; cashed_out counts: its stake was placed).
 type BotOrderDayStats struct {
 	Orders    int
 	Placed    int
@@ -29,8 +30,8 @@ type BotOrderDayStats struct {
 // InsertBotOrder stores a new order (Agent is ignored).
 func (s *Service) InsertBotOrder(r BotOrderRow) error {
 	_, err := s.db.Exec(`INSERT INTO bot_orders (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json,
-			created_at, sent_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.UserID, r.ArbKey, r.CodeID, r.State, r.Reason, r.DryRun, r.Stake, r.InfoJSON, r.LegsJSON, r.CreatedAt, r.SentAt, r.EndedAt)
+			flow_json, created_at, sent_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.UserID, r.ArbKey, r.CodeID, r.State, r.Reason, r.DryRun, r.Stake, r.InfoJSON, r.LegsJSON, r.FlowJSON, r.CreatedAt, r.SentAt, r.EndedAt)
 	return err
 }
 
@@ -42,23 +43,29 @@ func (s *Service) MarkBotOrderSent(id string, codeID int64, dryRun bool, legsJSO
 	return err
 }
 
-// EndBotOrder ends a waiting or running order with a final state (placed, stopped or
-// outcome_unknown), its reason, its legs (with their last steps) and the end time. An order that
-// already ended is left alone.
-func (s *Service) EndBotOrder(id, state, reason, legsJSON string, endedAt int64) error {
-	_, err := s.db.Exec(`UPDATE bot_orders SET state = ?, reason = ?, legs_json = ?, ended_at = ?
-		WHERE id = ? AND state IN ('waiting', 'running')`, state, reason, legsJSON, endedAt, id)
+// EndBotOrder ends a waiting or running order with a final state (placed, stopped, outcome_unknown
+// or cashed_out), its reason, its legs (with their last steps), its stake (the real total when the
+// agent reported the legs) and the end time. An order that already ended is left alone.
+func (s *Service) EndBotOrder(id, state, reason, legsJSON string, stake, endedAt int64) error {
+	_, err := s.db.Exec(`UPDATE bot_orders SET state = ?, reason = ?, legs_json = ?, stake = ?, ended_at = ?
+		WHERE id = ? AND state IN ('waiting', 'running')`, state, reason, legsJSON, stake, endedAt, id)
+	return err
+}
+
+// SetBotOrderFlow stores a running order's last flow object. Other states are left alone.
+func (s *Service) SetBotOrderFlow(id, flowJSON string) error {
+	_, err := s.db.Exec(`UPDATE bot_orders SET flow_json = ? WHERE id = ? AND state = 'running'`, flowJSON, id)
 	return err
 }
 
 const botOrderColumns = `o.id, o.user_id, o.arb_key, o.code_id, COALESCE(c.name, ''), o.state, o.reason, o.dry_run, o.stake,
-	o.info_json, o.legs_json, o.created_at, o.sent_at, o.ended_at`
+	o.info_json, o.legs_json, o.flow_json, o.created_at, o.sent_at, o.ended_at`
 
-// EndedBotOrders returns userID's orders created in [from, to) that ended (placed, stopped or
-// outcome_unknown), newest first, at most limit.
+// EndedBotOrders returns userID's orders created in [from, to) that ended (placed, stopped,
+// outcome_unknown or cashed_out), newest first, at most limit.
 func (s *Service) EndedBotOrders(userID, from, to int64, limit int) ([]BotOrderRow, error) {
 	rows, err := s.db.Query(`SELECT `+botOrderColumns+` FROM bot_orders o LEFT JOIN extension_codes c ON c.id = o.code_id
-		WHERE o.user_id = ? AND o.created_at >= ? AND o.created_at < ? AND o.state IN ('placed', 'stopped', 'outcome_unknown')
+		WHERE o.user_id = ? AND o.created_at >= ? AND o.created_at < ? AND o.state IN ('placed', 'stopped', 'outcome_unknown', 'cashed_out')
 		ORDER BY o.created_at DESC, o.id DESC LIMIT ?`, userID, from, to, limit)
 	if err != nil {
 		return nil, err
@@ -68,7 +75,7 @@ func (s *Service) EndedBotOrders(userID, from, to int64, limit int) ([]BotOrderR
 	for rows.Next() {
 		var r BotOrderRow
 		if err := rows.Scan(&r.ID, &r.UserID, &r.ArbKey, &r.CodeID, &r.Agent, &r.State, &r.Reason, &r.DryRun, &r.Stake,
-			&r.InfoJSON, &r.LegsJSON, &r.CreatedAt, &r.SentAt, &r.EndedAt); err != nil {
+			&r.InfoJSON, &r.LegsJSON, &r.FlowJSON, &r.CreatedAt, &r.SentAt, &r.EndedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

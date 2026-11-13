@@ -25,11 +25,11 @@ func TestBotOrders_Lifecycle(t *testing.T) {
 	if err := s.MarkBotOrderSent(w.ID, code.ID, false, `[{"bookmaker":"tipsport","windowId":"tipsport-2"}]`, 1500); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.EndBotOrder(w.ID, "placed", "", `[{"bookmaker":"tipsport","windowId":"tipsport-2","step":"placeBet"}]`, 9000); err != nil {
+	if err := s.EndBotOrder(w.ID, "placed", "", `[{"bookmaker":"tipsport","windowId":"tipsport-2","step":"placeBet"}]`, 202, 9000); err != nil {
 		t.Fatal(err)
 	}
 	// A row that already ended is not changed again.
-	if err := s.EndBotOrder(w.ID, "stopped", "late", `[]`, 9999); err != nil {
+	if err := s.EndBotOrder(w.ID, "stopped", "late", `[]`, 1, 9999); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := s.EndedBotOrders(user.UserID, 0, 2000, 500)
@@ -60,7 +60,7 @@ func TestBotOrders_EndedListAndDayStats(t *testing.T) {
 				t.Fatal(err)
 			}
 		case "placed", "stopped", "outcome_unknown":
-			if err := s.EndBotOrder(id, state, "", "[]", created+5); err != nil {
+			if err := s.EndBotOrder(id, state, "", "[]", stake, created+5); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -110,7 +110,7 @@ func TestBotOrders_CloseOpen(t *testing.T) {
 	if err := s.MarkBotOrderSent("r1", 0, true, "[]", 1001); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.EndBotOrder("p1", "placed", "", "[]", 1002); err != nil {
+	if err := s.EndBotOrder("p1", "placed", "", "[]", 1, 1002); err != nil {
 		t.Fatal(err)
 	}
 	closed, err := s.CloseOpenBotOrders("Gateway restarted", 5000)
@@ -133,5 +133,48 @@ func TestBotOrders_CloseOpen(t *testing.T) {
 	}
 	if again, err := s.CloseOpenBotOrders("Gateway restarted", 6000); err != nil || len(again) != 0 {
 		t.Fatalf("second close: %+v %v", again, err)
+	}
+}
+
+// The last flow is stored while the order runs; a final state (cashed_out too) stores the real stake.
+func TestBotOrders_FlowStakeAndCashedOut(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	if err := s.InsertBotOrder(BotOrderRow{ID: "00000000000000c1", UserID: user.UserID, ArbKey: "k", State: "waiting", DryRun: false, Stake: 2000,
+		InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	// Not running yet: the flow is not stored.
+	if err := s.SetBotOrderFlow("00000000000000c1", `{"phase":0}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkBotOrderSent("00000000000000c1", 0, false, "[]", 1001); err != nil {
+		t.Fatal(err)
+	}
+	flow := `{"rule":"totals-over-first","playbook":"overFirst","phase":1,"stuck":null}`
+	if err := s.SetBotOrderFlow("00000000000000c1", flow); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EndBotOrder("00000000000000c1", "cashed_out", "Over cashed out · 955 Kč of 1 000", `[{"bookmaker":"tipsport","placed":true}]`, 1000, 1500); err != nil {
+		t.Fatal(err)
+	}
+	// Ended: neither the flow nor the row changes any more.
+	if err := s.SetBotOrderFlow("00000000000000c1", `{"phase":2}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EndBotOrder("00000000000000c1", "placed", "", "[]", 1, 1600); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.EndedBotOrders(user.UserID, 0, 2000, 500)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ended: %+v %v", rows, err)
+	}
+	if r := rows[0]; r.State != "cashed_out" || r.Reason != "Over cashed out · 955 Kč of 1 000" || r.Stake != 1000 || r.FlowJSON != flow ||
+		r.LegsJSON != `[{"bookmaker":"tipsport","placed":true}]` || r.EndedAt != 1500 {
+		t.Fatalf("row: %+v", r)
+	}
+	// A cashed-out order is not placed, but its live stake counts for the day.
+	if st, err := s.BotOrderDay(user.UserID, 0, 2000); err != nil || st != (BotOrderDayStats{Orders: 1, Placed: 0, LiveStake: 1000}) {
+		t.Fatalf("day: %+v %v", st, err)
 	}
 }

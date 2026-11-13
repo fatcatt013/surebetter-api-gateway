@@ -730,7 +730,7 @@ func TestBotSched_ChecksInContractOrder(t *testing.T) {
 			InfoJSON: "{}", LegsJSON: "[]", CreatedAt: r.at.UnixMilli()}); e != nil {
 			t.Fatal(e)
 		}
-		if e := svc.EndBotOrder(id, r.state, "", "[]", r.at.UnixMilli()+1); e != nil {
+		if e := svc.EndBotOrder(id, r.state, "", "[]", r.stake, r.at.UnixMilli()+1); e != nil {
 			t.Fatal(e)
 		}
 	}
@@ -754,7 +754,7 @@ func TestBotSched_DayLimitAgainWhenAWaitingOrderIsSentLive(t *testing.T) {
 		InfoJSON: "{}", LegsJSON: "[]", CreatedAt: from.UnixMilli()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.EndBotOrder("00000000000000aa", "placed", "", "[]", from.UnixMilli()+1); err != nil { // live, 500 today
+	if err := svc.EndBotOrder("00000000000000aa", "placed", "", "[]", 500, from.UnixMilli()+1); err != nil { // live, 500 today
 		t.Fatal(err)
 	}
 	app := appSocket(t, srv, token)

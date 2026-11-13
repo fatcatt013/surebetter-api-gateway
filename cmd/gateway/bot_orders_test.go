@@ -43,7 +43,7 @@ func TestBotOrders_RunningWaitingAndHistory(t *testing.T) {
 		CreatedAt: time.Date(2026, 11, 12, 22, 59, 0, 0, time.UTC).UnixMilli()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.EndBotOrder("00000000000000aa", "placed", "", "[]", 1); err != nil {
+	if err := svc.EndBotOrder("00000000000000aa", "placed", "", "[]", 10, 1); err != nil {
 		t.Fatal(err)
 	}
 	ended := placeOrder(t, srv, token, "arb-1", bot, app)
