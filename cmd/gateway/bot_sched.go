@@ -18,7 +18,8 @@ import (
 )
 
 const (
-	// orderMemory is how long a running order waits for its final event before it ends outcome_unknown.
+	// orderMemory is how long a running order waits for its final event before it ends outcome_unknown,
+	// counted from its send and again from each flow event.
 	orderMemory = 10 * time.Minute
 	// waitExpiry is how long an order may wait for a free agent before it ends stopped ("Expired · …").
 	waitExpiry = 20 * time.Second
@@ -131,7 +132,10 @@ type botOrder struct {
 	legs    []storedLeg
 	created time.Time
 	sent    time.Time
-	flow    string // the agent's last flow object, compact JSON; "" = none yet
+	// deadline: a running order without a final event by then ends outcome_unknown (send +
+	// orderMemory, pushed to at least now + orderMemory by each flow event).
+	deadline time.Time
+	flow     string // the agent's last flow object, compact JSON; "" = none yet
 	// dayChecked: the POST that created it just checked the day limit (cleared when that POST ends).
 	dayChecked bool
 }
@@ -595,6 +599,7 @@ func (b *botHub) startLocked(o *botOrder, fx *effects) bool {
 		}
 		now := b.now()
 		o.state, o.codeID, o.boot, o.sent, o.dryRun, o.reason = orderRunning, codeID, p.boot, now, st.DryRun, ""
+		o.deadline = now.Add(orderMemory)
 		for i := range o.legs {
 			o.legs[i].WindowID = wins[i]
 			delete(p.idleSince, wins[i])
@@ -729,7 +734,7 @@ func (b *botHub) endLocked(o *botOrder, state, reason string, relay bool, fx *ef
 		}
 	}
 	if b.acc != nil {
-		id, legs, stake := o.id, o.legsJSON(), o.stake
+		id, legs, stake := o.id, o.legsJSON(), o.countedStake(state)
 		fx.write(func() error { return b.acc.EndBotOrder(id, state, reason, legs, stake, now.UnixMilli()) })
 	}
 	if relay {
@@ -778,13 +783,13 @@ func sendPauseLocked(userID, codeID int64, p *botPresence) {
 }
 
 // expireLocked ends waiting orders older than waitExpiry (stopped · "Expired · <wait reason>") and
-// running orders without a final event after orderMemory (outcome_unknown · "No result from the
+// running orders without a final event by their deadline (outcome_unknown · "No result from the
 // agent"). b.mu must be held.
 func (b *botHub) expireLocked(fx *effects) {
 	now := b.now()
 	var due []*botOrder
 	for _, o := range b.orders {
-		if (o.state == orderWaiting && !now.Before(o.created.Add(waitExpiry))) || (o.state == orderRunning && !now.Before(o.sent.Add(orderMemory))) {
+		if (o.state == orderWaiting && !now.Before(o.created.Add(waitExpiry))) || (o.state == orderRunning && !now.Before(o.deadline)) {
 			due = append(due, o)
 		}
 	}
@@ -932,32 +937,49 @@ func validFinalLegs(legs []finalLeg) bool {
 	return true
 }
 
-// applyFinalLegs records what the agent really staked on o's legs (a reported bookmaker that is not
-// one of o's legs is ignored) and makes o's stake the real total: live, the placed legs' stakes;
-// in a dry run (nothing is placed) every reported leg's stake. No legs: o is left alone.
+// applyFinalLegs records what the agent really staked on o's legs: stake, odds (0 keeps the ordered
+// odds) and placed. A reported bookmaker that is not one of o's legs is ignored; a leg not reported
+// keeps its ordered stake and placed nil. countedStake then reads them.
 func (o *botOrder) applyFinalLegs(legs []finalLeg) {
-	var total float64
-	reported := false
 	for _, fl := range legs {
 		for i := range o.legs {
 			l := &o.legs[i]
 			if l.Bookmaker != fl.Bookmaker {
 				continue
 			}
-			reported = true
 			placed := fl.Placed
 			l.Stake, l.Placed = fl.Stake, &placed
 			if fl.Odds > 0 {
 				l.Odds = fl.Odds
 			}
-			if placed || o.dryRun {
-				total += fl.Stake
-			}
 		}
 	}
-	if reported {
-		o.stake = int64(math.Round(total))
+}
+
+// countedStake is what o counts once it ends in state (bot_orders.stake: the day limit and the
+// history). Live: each leg's ordered stake, replaced by the stake a final event reported for it
+// (applyFinalLegs), a reported leg not placed counting 0 except on outcome_unknown; outcome_unknown
+// never counts less than the ordered total; stopped counts only the legs reported placed (normally
+// none). A dry run (nothing is ever placed) counts every leg's stake as it stands.
+func (o *botOrder) countedStake(state string) int64 {
+	var total float64
+	for _, l := range o.legs {
+		switch {
+		case o.dryRun:
+			total += l.Stake
+		case l.Placed == nil: // not reported
+			if state != "stopped" {
+				total += l.Stake
+			}
+		case *l.Placed || state == "outcome_unknown":
+			total += l.Stake
+		}
 	}
+	counted := int64(math.Round(total))
+	if !o.dryRun && state == "outcome_unknown" && counted < o.stake {
+		counted = o.stake
+	}
+	return counted
 }
 
 // event relays one order event, posted by codeID's agent, to the user's non-bot /ws sockets.
@@ -985,6 +1007,9 @@ func (b *botHub) event(userID, codeID int64, in botEventIn, flow string) error {
 		}
 	case "flow":
 		o.flow, ev.Flow = flow, json.RawMessage(flow)
+		if d := b.now().Add(orderMemory); d.After(o.deadline) {
+			o.deadline = d // the agent still works on it (a stuck mode may last minutes)
+		}
 		if b.acc != nil {
 			id := o.id
 			fx.write(func() error { return b.acc.SetBotOrderFlow(id, flow) })

@@ -10,7 +10,7 @@ type BotOrderRow struct {
 	State     string // waiting, running, placed, stopped, outcome_unknown or cashed_out
 	Reason    string
 	DryRun    bool
-	Stake     int64  // the ordered stakes summed; a final event that reports the legs makes it the real total
+	Stake     int64  // the ordered stakes summed until it ends; then the counted stake (day limit, history)
 	InfoJSON  string // match, market, live, profitPct and the order fields the agent gets (market type, line …)
 	LegsJSON  string // legs with windowId, last step and, once ended, what was really staked
 	FlowJSON  string // the agent's last flow object ("" = none)
@@ -20,7 +20,8 @@ type BotOrderRow struct {
 }
 
 // BotOrderDayStats sums a user's orders created in one day: all orders, the placed ones, and the
-// live stake (orders not stopped, dry_run = 0; cashed_out counts: its stake was placed).
+// live stake (dry_run = 0, every state: a final order's stake is what it counts, e.g. a stopped
+// order's placed legs, normally 0).
 type BotOrderDayStats struct {
 	Orders    int
 	Placed    int
@@ -88,14 +89,15 @@ func (s *Service) BotOrderDay(userID, from, to int64) (BotOrderDayStats, error) 
 	var st BotOrderDayStats
 	err := s.db.QueryRow(`SELECT COUNT(*),
 			COALESCE(SUM(state = 'placed'), 0),
-			COALESCE(SUM(CASE WHEN dry_run = 0 AND state <> 'stopped' THEN stake ELSE 0 END), 0)
+			COALESCE(SUM(CASE WHEN dry_run = 0 THEN stake ELSE 0 END), 0)
 		FROM bot_orders WHERE user_id = ? AND created_at >= ? AND created_at < ?`, userID, from, to).
 		Scan(&st.Orders, &st.Placed, &st.LiveStake)
 	return st, err
 }
 
-// CloseOpenBotOrders ends every order the last gateway process left open: waiting → stopped,
-// running → outcome_unknown, both with reason and ended_at. It returns the closed orders (with
+// CloseOpenBotOrders ends every order the last gateway process left open: waiting → stopped
+// (a live one placed nothing: its stake becomes 0), running → outcome_unknown (its ordered stake
+// stays), both with reason and ended_at. It returns the closed orders (with
 // their new state), running ones first, each group by id.
 func (s *Service) CloseOpenBotOrders(reason string, endedAt int64) ([]BotOrderRow, error) {
 	tx, err := s.db.Begin()
@@ -128,7 +130,8 @@ func (s *Service) CloseOpenBotOrders(reason string, endedAt int64) ([]BotOrderRo
 		return nil, err
 	}
 	for _, r := range closed {
-		if _, err := tx.Exec(`UPDATE bot_orders SET state = ?, reason = ?, ended_at = ? WHERE id = ?`, r.State, r.Reason, r.EndedAt, r.ID); err != nil {
+		if _, err := tx.Exec(`UPDATE bot_orders SET state = ?, reason = ?, ended_at = ?,
+				stake = CASE WHEN ? = 'stopped' AND dry_run = 0 THEN 0 ELSE stake END WHERE id = ?`, r.State, r.Reason, r.EndedAt, r.State, r.ID); err != nil {
 			return nil, err
 		}
 	}

@@ -68,7 +68,7 @@ func TestBotOrders_EndedListAndDayStats(t *testing.T) {
 	// Day = [1000, 2000).
 	add("a1", user.UserID, "placed", false, 100, 999)           // the day before
 	add("a2", user.UserID, "placed", false, 200, 1000)          // live, counts
-	add("a3", user.UserID, "stopped", false, 400, 1100)         // stopped: no live stake
+	add("a3", user.UserID, "stopped", false, 400, 1100)         // stopped: its stake is its placed legs, counts
 	add("a4", user.UserID, "outcome_unknown", false, 800, 1200) // counts
 	add("a5", user.UserID, "placed", true, 1600, 1300)          // dry run: no live stake
 	add("a6", user.UserID, "running", false, 3200, 1400)        // counts
@@ -80,7 +80,7 @@ func TestBotOrders_EndedListAndDayStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st != (BotOrderDayStats{Orders: 6, Placed: 2, LiveStake: 200 + 800 + 3200 + 6400}) {
+	if st != (BotOrderDayStats{Orders: 6, Placed: 2, LiveStake: 200 + 400 + 800 + 3200 + 6400}) {
 		t.Fatalf("day stats: %+v", st)
 	}
 	rows, err := s.EndedBotOrders(user.UserID, 1000, 2000, 500)
@@ -113,12 +113,21 @@ func TestBotOrders_CloseOpen(t *testing.T) {
 	if err := s.EndBotOrder("p1", "placed", "", "[]", 1, 1002); err != nil {
 		t.Fatal(err)
 	}
+	// A live waiting order placed nothing: closed stopped, its stake becomes 0 (the day sum counts stopped orders).
+	if err := s.InsertBotOrder(BotOrderRow{ID: "w2", UserID: user.UserID, ArbKey: "w2", State: "waiting", DryRun: false, Stake: 500,
+		InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 1000}); err != nil {
+		t.Fatal(err)
+	}
 	closed, err := s.CloseOpenBotOrders("Gateway restarted", 5000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(closed) != 2 || closed[0].ID != "r1" || closed[0].State != "outcome_unknown" || closed[1].ID != "w1" || closed[1].State != "stopped" {
+	if len(closed) != 3 || closed[0].ID != "r1" || closed[0].State != "outcome_unknown" || closed[1].ID != "w1" || closed[1].State != "stopped" ||
+		closed[2].ID != "w2" || closed[2].State != "stopped" {
 		t.Fatalf("closed: %+v", closed)
+	}
+	if st, err := s.BotOrderDay(user.UserID, 0, 2000); err != nil || st.LiveStake != 0 {
+		t.Fatalf("a live waiting order closed stopped still counts: %+v %v", st, err)
 	}
 	rows, _ := s.EndedBotOrders(user.UserID, 0, 2000, 500)
 	states := map[string]string{}
@@ -128,7 +137,7 @@ func TestBotOrders_CloseOpen(t *testing.T) {
 			t.Fatalf("%s ended_at %d", r.ID, r.EndedAt)
 		}
 	}
-	if states["w1"] != "stopped/Gateway restarted" || states["r1"] != "outcome_unknown/Gateway restarted" || states["p1"] != "placed/" {
+	if states["w1"] != "stopped/Gateway restarted" || states["w2"] != "stopped/Gateway restarted" || states["r1"] != "outcome_unknown/Gateway restarted" || states["p1"] != "placed/" {
 		t.Fatalf("states: %v", states)
 	}
 	if again, err := s.CloseOpenBotOrders("Gateway restarted", 6000); err != nil || len(again) != 0 {

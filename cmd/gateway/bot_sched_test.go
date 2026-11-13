@@ -711,7 +711,7 @@ func TestBotSched_ChecksInContractOrder(t *testing.T) {
 	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.MaxOrder = 150 })
 	err(orderJSON("k", legJSON("tipsport", "s1", 2.1, 100), legJSON("betano", "s2", 2, 51)), "limit_order")
 
-	// Day limit: live only; today's live stake of waiting, running, placed and outcome_unknown orders counts.
+	// Day limit: live only; today's live stake of every state counts (a stopped order's stake is its placed legs).
 	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.MaxLeg, st.MaxOrder, st.PerDay, st.DryRun = 0, 0, 1000, false })
 	from, _ := pragueDayOf(clk.now())
 	for i, r := range []struct {
@@ -722,7 +722,7 @@ func TestBotSched_ChecksInContractOrder(t *testing.T) {
 	}{
 		{"placed", false, 500, from},                         // counts
 		{"outcome_unknown", false, 200, from.Add(time.Hour)}, // counts
-		{"stopped", false, 5000, from.Add(time.Hour)},        // stopped: no
+		{"stopped", false, 100, from.Add(time.Hour)},         // stopped with a placed leg: counts
 		{"placed", true, 5000, from.Add(time.Hour)},          // dry run: no
 		{"placed", false, 5000, from.Add(-time.Millisecond)}, // yesterday (Prague): no
 	} {
@@ -735,8 +735,8 @@ func TestBotSched_ChecksInContractOrder(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	err(orderJSON("k", legJSON("tipsport", "s1", 2.1, 150), legJSON("betano", "s2", 2, 150.5)), "limit_day") // 700 + 301 > 1000
-	err(orderJSON("k", legJSON("tipsport", "s1", 2.1, 150), legJSON("betano", "s2", 2, 150)), "bot_offline") // 700 + 300 = 1000
+	err(orderJSON("k", legJSON("tipsport", "s1", 2.1, 100), legJSON("betano", "s2", 2, 100.5)), "limit_day") // 800 + 201 > 1000
+	err(orderJSON("k", legJSON("tipsport", "s1", 2.1, 100), legJSON("betano", "s2", 2, 100)), "bot_offline") // 800 + 200 = 1000
 	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.DryRun = true })
 	err(orderJSON("k", legJSON("tipsport", "s1", 2.1, 1500), legJSON("betano", "s2", 2, 1500)), "bot_offline") // dry run: no day limit
 }
@@ -1271,12 +1271,13 @@ func TestBotSched_FinalLegsSetTheRealStake(t *testing.T) {
 		t.Fatalf("dry run row: %d %+v", stake, legs)
 	}
 
-	// Live: only placed legs count. A leg of another bookmaker is ignored; odds 0 keeps the ordered odds.
+	// Live: a leg the event does not report keeps its ordered stake (betano 102). A leg of another
+	// bookmaker is ignored; odds 0 keeps the ordered odds.
 	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.DryRun = false })
 	o = placeOrder(t, srv, token, "arb-2", bot, app)
 	final(o.OrderID, "outcome_unknown", `[{"bookmaker":"tipsport","stake":100,"odds":0,"placed":true},{"bookmaker":"fortuna","stake":5000,"odds":3,"placed":true}]`)
 	stake, legs = row(o.OrderID)
-	if stake != 100 || legs[0].Odds != 2.1 || legs[0].Placed == nil || !*legs[0].Placed || legs[1].Placed != nil || legs[1].Stake != 102 {
+	if stake != 202 || legs[0].Odds != 2.1 || legs[0].Placed == nil || !*legs[0].Placed || legs[1].Placed != nil || legs[1].Stake != 102 {
 		t.Fatalf("live row: %d %+v", stake, legs)
 	}
 	m := readJSON(t, bot) // outcome_unknown paused the user
@@ -1309,5 +1310,96 @@ func TestBotSched_FinalLegsSetTheRealStake(t *testing.T) {
 		if s, b := postEvent(t, srv, code, `{"order_id":"0123456789abcdef","event":"placed","legs":`+legs+`}`); s != 400 || !strings.Contains(b, `"bad_event"`) {
 			t.Errorf("%s: %d %s, want 400 bad_event", name, s, b)
 		}
+	}
+}
+
+// Contract (review): a live order's counted stake (day limit and history) starts from each leg's
+// ordered stake and replaces only the legs the final event reports (placed:false counts 0, except on
+// outcome_unknown); outcome_unknown never counts less than the ordered total; a stopped order counts
+// its placed legs; the day sum includes every state. legs_json keeps the reported values.
+func TestBotSched_CountedStakeOfALiveOrder(t *testing.T) {
+	srv, svc, bots, db := newBotServerDB(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.DryRun, st.PauseOnUnknown = false, false })
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	bot := startBot(t, srv, code, app)
+	var total int64
+	for i, c := range []struct {
+		name, event, legs string
+		stake             int64
+		legStakes         [2]float64
+	}{
+		{"placed, the second leg restaked lower", "placed",
+			`[{"bookmaker":"tipsport","stake":100,"odds":2.1,"placed":true},{"bookmaker":"betano","stake":90,"odds":2.3,"placed":true}]`, 190, [2]float64{100, 90}},
+		{"placed, one leg reported: the other keeps its ordered stake", "placed",
+			`[{"bookmaker":"betano","stake":95,"odds":2.2,"placed":true}]`, 195, [2]float64{100, 95}},
+		{"cashed_out: the leg not placed counts 0", "cashed_out",
+			`[{"bookmaker":"tipsport","stake":100,"odds":2.1,"placed":true},{"bookmaker":"betano","stake":102,"odds":2.16,"placed":false}]`, 100, [2]float64{100, 102}},
+		{"outcome_unknown never counts less than the ordered total", "outcome_unknown",
+			`[{"bookmaker":"tipsport","stake":50,"odds":2.1,"placed":true},{"bookmaker":"betano","stake":40,"odds":2.16,"placed":false}]`, 202, [2]float64{50, 40}},
+		{"outcome_unknown counts a reported leg not placed, above the ordered total", "outcome_unknown",
+			`[{"bookmaker":"tipsport","stake":100,"odds":2.1,"placed":true},{"bookmaker":"betano","stake":150,"odds":2.16,"placed":false}]`, 250, [2]float64{100, 150}},
+		{"stopped counts its placed legs", "stopped",
+			`[{"bookmaker":"tipsport","stake":100,"odds":2.1,"placed":true},{"bookmaker":"betano","stake":102,"odds":2.16,"placed":false}]`, 100, [2]float64{100, 102}},
+		{"stopped without legs counts 0", "stopped", "", 0, [2]float64{100, 102}},
+	} {
+		o := placeOrder(t, srv, token, fmt.Sprintf("arb-%d", i), bot, app)
+		body := `{"order_id":"` + o.OrderID + `","event":"` + c.event + `"`
+		if c.legs != "" {
+			body += `,"legs":` + c.legs
+		}
+		if s, b := postEvent(t, srv, code, body+"}"); s != 204 {
+			t.Fatalf("%s: %d %s", c.name, s, b)
+		}
+		expectEvent(t, app, o.OrderID, c.event, "")
+		expectBot(t, app, "after the final event")
+		var stake int64
+		db.QueryRow(`SELECT stake FROM bot_orders WHERE id = ?`, o.OrderID).Scan(&stake)
+		_, _, _, _, legs := orderRow(t, db, o.OrderID)
+		if stake != c.stake || legs[0].Stake != c.legStakes[0] || legs[1].Stake != c.legStakes[1] {
+			t.Errorf("%s: stake %d legs %v %v, want %d %v", c.name, stake, legs[0].Stake, legs[1].Stake, c.stake, c.legStakes)
+		}
+		total += c.stake
+	}
+	from, to := pragueDayOf(bots.now())
+	if day, err := svc.BotOrderDay(uid, from.UnixMilli(), to.UnixMilli()); err != nil || day.LiveStake != total {
+		t.Fatalf("day live stake %+v (err %v), want %d (every state counts)", day, err, total)
+	}
+}
+
+// Contract (review): a flow event extends a running order's deadline to at least now + orderMemory,
+// so a long stuck mode is not ended by the gateway while the agent still works on it.
+func TestBotSched_FlowExtendsTheDeadline(t *testing.T) {
+	srv, svc, bots, db := newBotServerDB(t)
+	clk := &botClock{t: time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	bot := startBot(t, srv, code, app)
+	o := placeOrder(t, srv, token, "arb-1", bot, app)
+
+	clk.advance(9 * time.Minute)
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+o.OrderID+`","event":"flow","flow":{"rule":"totals-over-first","playbook":"overFirst","phase":1,"stuck":null}}`); s != 204 {
+		t.Fatalf("flow: %d %s", s, b)
+	}
+	expectEvent(t, app, o.OrderID, "flow", "")
+	clk.advance(time.Minute) // 10 min after the send
+	bots.tick()
+	if state, _, _, _, _ := orderRow(t, db, o.OrderID); state != "running" {
+		t.Fatalf("10 min after the send, 1 min after a flow: %s, want running", state)
+	}
+	clk.advance(9*time.Minute - time.Millisecond)
+	bots.tick()
+	if state, _, _, _, _ := orderRow(t, db, o.OrderID); state != "running" {
+		t.Fatalf("just under 10 min after the flow: %s, want running", state)
+	}
+	clk.advance(time.Millisecond)
+	bots.tick()
+	expectEvent(t, app, o.OrderID, "outcome_unknown", "No result from the agent")
+	if state, _, _, _, _ := orderRow(t, db, o.OrderID); state != "outcome_unknown" {
+		t.Fatalf("10 min after the flow: %s, want outcome_unknown", state)
 	}
 }
