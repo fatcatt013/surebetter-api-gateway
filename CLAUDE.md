@@ -45,7 +45,7 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 | `GET /ws/value` | WebSocket upgrade — streams value-bet deltas (independent hub; same protocol, path prefix `/value/{id}`) |
 | `GET /api/value/snapshot` | Full current value-bet state as JSON (`{id: ValueBet}`) |
 | `/api/auth/*`, `/api/me/*`, `/api/admin/*` | Accounts API — see `../surebetter-common/docs/api-reference.md` → Accounts |
-| `/api/me/bot`, `/api/me/bot/{status,orders,events,agents,logs,logs.txt,screenshots,flows,recordings,settings,commands}`, `/api/me/bot/agents/{id}/{recordings,windows}` | Bot orders and the Bots controller — see `../surebetter-common/docs/api-reference.md` → Bot orders, Bots controller |
+| `/api/me/bot`, `/api/me/bot/{status,orders,events,agents,logs,logs.txt,screenshots,flows,recordings,settings,commands}`, `/api/me/bot/agents/{id}/{recordings,windows,try}` | Bot orders and the Bots controller — see `../surebetter-common/docs/api-reference.md` → Bot orders, Bots controller |
 | `GET /health` | `{"status":"ok","service":"api-gateway","version":"dev"}` |
 | `GET /metrics` | Prometheus counters: `gateway_ws_clients_connected`, `gateway_messages_sent_total` |
 
@@ -59,7 +59,7 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 
 `/ws?cid=<id>` tags a socket with a client id (max 64 chars, `[A-Za-z0-9_-]`); a `PUT /api/me/state/{key}` sent with the same `X-Client-Id` header skips that socket but notifies the user's other sockets (`{"type":"state","key":...}`). `/ws?feed=0` (arb `/ws` only) gets no snapshot or patches, just `state` messages and pings.
 
-`/ws?ticket=…&feed=0&bot=1` is the user's bot socket: only a ticket issued to a bot code (kind `bot`) may open it (403 otherwise); feed always off; one per bot code, several codes (agents) of one user may be online (a new socket with the same code closes the older one with 1000). It receives the orders the gateway picked its agent for (`{"type":"order","order":{…,"dry_run","legs":[{…,"outcome_id","fair_odds","window_id"}],"market_type","line","is_live","sport","match","rounding","max_leg","rules_on"}}`, only when its last status said `proto` ≥ 2), `{"type":"pause"}` when the user is paused (and, while paused, on a socket's first protocol-2 status), window commands (`{"type":"command","command":{…}}`, answered with `POST /api/me/bot/commands`), `{"type":"recordings"}` when the app uploaded a recording for it, and never `bot`/`botEvent`.
+`/ws?ticket=…&feed=0&bot=1` is the user's bot socket: only a ticket issued to a bot code (kind `bot`) may open it (403 otherwise); feed always off; one per bot code, several codes (agents) of one user may be online (a new socket with the same code closes the older one with 1000). It receives the orders the gateway picked its agent for (`{"type":"order","order":{…,"dry_run","legs":[{…,"outcome_id","fair_odds","window_id"}],"market_type","line","is_live","sport","match","rounding","max_leg","rules_on"}}`, only when its last status said `proto` ≥ 2), `{"type":"pause"}` when the user is paused (and, while paused, on a socket's first protocol-2 status), window commands and Tries (`{"type":"command","command":{…}}`, a Try with `"action":"try"` and the `"order"` it would get, only when its last status said `proto` ≥ 3, answered with `POST /api/me/bot/commands`), `{"type":"recordings"}` when the app uploaded a recording for it, and never `bot`/`botEvent`.
 
 Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before broadcasting.
 

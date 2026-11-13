@@ -280,17 +280,32 @@ var (
 	errLimitDay     = errors.New("limit_day")
 )
 
-// validOrder checks the shape: an arb key (at most 256 bytes), exactly 2 legs at different
-// bookmakers, each with a selection id, odds above 1 and a stake above 0 and at most maxKc (so
-// stake sums never overflow); match and market at most 200 characters and a finite profit_pct;
-// then the arb fields (validArbFields).
+// validOrder checks a new order: the shape every order body has (validTry), an arb key and each
+// leg's selection id.
 func validOrder(o botOrderIn) bool {
-	if strings.TrimSpace(o.ArbKey) == "" || len(o.ArbKey) > 256 || len(o.Legs) != 2 || o.Legs[0].Bookmaker == o.Legs[1].Bookmaker ||
-		runeLen(o.Match) > 200 || runeLen(o.Market) > 200 || math.IsNaN(o.ProfitPct) || math.IsInf(o.ProfitPct, 0) || !validArbFields(o) {
+	if strings.TrimSpace(o.ArbKey) == "" || !validTry(o) {
 		return false
 	}
 	for _, l := range o.Legs {
-		if strings.TrimSpace(l.Bookmaker) == "" || l.Bookmaker != strings.TrimSpace(l.Bookmaker) || strings.TrimSpace(l.SourceID) == "" || !(l.Odds > 1) || !(l.Stake > 0) || !(l.Stake <= maxKc) {
+		if strings.TrimSpace(l.SourceID) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// validTry checks the shape every order body has, a Try's too (which may leave out the arb key and
+// the selection ids): an arb key of at most 256 bytes, exactly 2 legs at different bookmakers
+// (non-empty, no surrounding spaces), each with odds above 1 and a stake above 0 and at most maxKc
+// (so stake sums never overflow); match and market at most 200 characters, a finite profit_pct and
+// the arb fields (validArbFields).
+func validTry(o botOrderIn) bool {
+	if len(o.ArbKey) > 256 || len(o.Legs) != 2 || o.Legs[0].Bookmaker == o.Legs[1].Bookmaker || runeLen(o.Match) > 200 ||
+		runeLen(o.Market) > 200 || math.IsNaN(o.ProfitPct) || math.IsInf(o.ProfitPct, 0) || !validArbFields(o) {
+		return false
+	}
+	for _, l := range o.Legs {
+		if strings.TrimSpace(l.Bookmaker) == "" || l.Bookmaker != strings.TrimSpace(l.Bookmaker) || !(l.Odds > 1) || !(l.Stake > 0) || !(l.Stake <= maxKc) {
 			return false
 		}
 	}

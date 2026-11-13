@@ -259,3 +259,197 @@ func TestBotCommands_PendingCommandMakesAnOrderWait(t *testing.T) {
 		t.Fatalf("agent got %+v", o)
 	}
 }
+
+// tipBetIdleP3 is tipBetIdle from a Phase 3 agent (protocol 3: it takes a Try).
+var tipBetIdleP3 = strings.Replace(tipBetIdle, `"proto":2`, `"proto":3`, 1)
+
+// tryBody is a Try body as the app prefills it from a recent order: no arb key, no selection ids.
+const tryBody = `{"legs":[{"bookmaker":"tipsport","odds":2.05,"stake":1000,"outcome_id":"OVER"},{"bookmaker":"betano","odds":2,"stake":1025,"outcome_id":"UNDER"}],` +
+	`"market_type":"TOTAL_CORNERS","line":9.5,"is_live":true,"sport":"football","rounding":10}`
+
+// tryResult is an agent's answer to a Try.
+const tryResult = `{"rule":"totals-over-first","ruleOn":true,"playbook":"overFirst","wouldMatch":"totals-over-first",` +
+	`"legs":[{"bookmaker":"tipsport","side":"OVER","role":"Over"},{"bookmaker":"betano","side":"UNDER","role":"Under"}],` +
+	`"phases":["Both ready","Over confirmed"],"underStake":{"exact":1025,"stake":1030,"resultPct":0.24}}`
+
+// readTry reads the next message on the agent's socket as a try command and returns its id and order.
+func readTry(t *testing.T, bot *websocket.Conn) (string, map[string]any) {
+	t.Helper()
+	m := readJSON(t, bot)
+	cmd, _ := m["command"].(map[string]any)
+	order, _ := cmd["order"].(map[string]any)
+	id, _ := cmd["id"].(string)
+	if m["type"] != "command" || cmd["action"] != "try" || !bootPattern.MatchString(id) || order == nil {
+		t.Fatalf("agent got %v, want a try command", m)
+	}
+	return id, order
+}
+
+func TestBotTry_RoundTrip(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) {
+		st.MaxLeg, st.RulesOn, st.Paused, st.PausedReason = 3000, `["totals-over-first"]`, true, "Paused"
+	})
+	app := appSocket(t, srv, token)
+	code, id := newBotCode(t, srv, token, "Home PC")
+	bot := startAgentWith(t, srv, code, tipBetIdleP3, app)
+	if m := readJSON(t, bot); m["type"] != "pause" { // paused: the agent's first protocol-2 status gets the pause
+		t.Fatalf("agent got %v, want pause", m)
+	}
+	path := fmt.Sprintf("/api/me/bot/agents/%d/try", id)
+
+	// A Try is not an order: it goes while paused, carries the settings and the order message, no windows.
+	done := commandAsync(t, srv, token, path, tryBody)
+	cmdID, o := readTry(t, bot)
+	want := map[string]any{"order_id": "", "arb_key": "", "dry_run": true, "market_type": "TOTAL_CORNERS", "line": 9.5, "is_live": true,
+		"sport": "football", "match": "", "rounding": float64(10), "max_leg": float64(3000)}
+	for k, v := range want {
+		if o[k] != v {
+			t.Errorf("try order %s = %v, want %v", k, o[k], v)
+		}
+	}
+	if rules, _ := json.Marshal(o["rules_on"]); string(rules) != `["totals-over-first"]` {
+		t.Errorf("rules_on = %s", rules)
+	}
+	legs, _ := o["legs"].([]any)
+	if len(legs) != 2 || legs[0].(map[string]any)["outcome_id"] != "OVER" || legs[1].(map[string]any)["window_id"] != "" ||
+		legs[1].(map[string]any)["stake"] != float64(1025) {
+		t.Fatalf("try legs: %v", legs)
+	}
+	// ok without a result is refused (the app keeps waiting); then the result is the app's answer.
+	if s, b := postAck(t, srv, code, `{"id":"`+cmdID+`","ok":true}`); s != 400 || !strings.Contains(b, `"bad_command"`) {
+		t.Fatalf("try ack without a result: %d %s", s, b)
+	}
+	if s, b := postAck(t, srv, code, `{"id":"`+cmdID+`","ok":true,"result":`+tryResult+`}`); s != 204 {
+		t.Fatalf("ack: %d %s", s, b)
+	}
+	if a := <-done; a.status != 200 || a.body != tryResult {
+		t.Fatalf("app answer: %+v", a)
+	}
+	if v := getView(t, srv, token); v.Running != 0 || v.Waiting != 0 {
+		t.Fatalf("a Try starts nothing: %+v", v)
+	}
+
+	// The agent's refusal.
+	done = commandAsync(t, srv, token, path, tryBody)
+	cmdID, _ = readTry(t, bot)
+	if s, b := postAck(t, srv, code, `{"id":"`+cmdID+`","ok":false,"error":"failed","message":"no playbook"}`); s != 204 {
+		t.Fatalf("ack: %d %s", s, b)
+	}
+	if a := <-done; a.status != 409 || a.body != `{"error":"failed","message":"no playbook"}` {
+		t.Fatalf("app answer: %+v", a)
+	}
+
+	// The result's shape: an object of at most 8 KiB.
+	done = commandAsync(t, srv, token, path, tryBody)
+	cmdID, _ = readTry(t, bot)
+	for name, result := range map[string]string{
+		"an array":   `[]`,
+		"a string":   `"overFirst"`,
+		"over 8 KiB": `{"note":"` + strings.Repeat("n", 8<<10) + `"}`,
+	} {
+		if s, b := postAck(t, srv, code, `{"id":"`+cmdID+`","ok":true,"result":`+result+`}`); s != 400 || !strings.Contains(b, `"bad_command"`) {
+			t.Errorf("%s: %d %s, want 400 bad_command", name, s, b)
+		}
+	}
+	big := `{"note":"` + strings.Repeat("n", 8<<10-12) + `"}` // 8 KiB once compact
+	if s, b := postAck(t, srv, code, `{"id":"`+cmdID+`","ok":true,"result": `+big+`}`); s != 204 {
+		t.Fatalf("8 KiB result: %d %s", s, b)
+	}
+	if a := <-done; a.status != 200 || a.body != big {
+		t.Fatalf("app answer: %d %d bytes", a.status, len(a.body))
+	}
+	expectNoMessage(t, app, "app (a Try sends no botEvent)")
+}
+
+func TestBotTry_Refusals(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	defer func(d time.Duration) { commandWait = d }(commandWait)
+	commandWait = 200 * time.Millisecond
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code, id := newBotCode(t, srv, token, "Home PC")
+	oldCode, oldID := newBotCode(t, srv, token, "Old PC")
+	p2Code, p2ID := newBotCode(t, srv, token, "Phase 2 PC")
+	_, offlineID := newBotCode(t, srv, token, "Offline PC")
+	_, otherID := newBotCode(t, srv, newUser(t, svc, "o@example.com", accounts.RoleUser), "Other")
+	bot := startAgentWith(t, srv, code, tipBetIdleP3, app)
+	startAgentWith(t, srv, oldCode, `{"books":[{"bookmaker":"tipsport","ready":true}],"dryRun":true}`, app)
+	p2 := startAgentWith(t, srv, p2Code, p2Status(""), app) // protocol 2, no windows: takes orders, not a Try
+	try := func(agent int64, body string) (int, string) {
+		return request(t, srv, "POST", fmt.Sprintf("/api/me/bot/agents/%d/try", agent), token, body, nil)
+	}
+	for name, body := range map[string]string{
+		"not JSON":       `{"legs":`,
+		"one leg":        `{"legs":[{"bookmaker":"tipsport","odds":2.05,"stake":1000}]}`,
+		"same bookmaker": `{"legs":[{"bookmaker":"tipsport","odds":2.05,"stake":1000},{"bookmaker":"tipsport","odds":2,"stake":1025}]}`,
+		"odds 1":         `{"legs":[{"bookmaker":"tipsport","odds":1,"stake":1000},{"bookmaker":"betano","odds":2,"stake":1025}]}`,
+		"stake 0":        `{"legs":[{"bookmaker":"tipsport","odds":2.05,"stake":0},{"bookmaker":"betano","odds":2,"stake":1025}]}`,
+		"rounding 5":     strings.Replace(tryBody, `"rounding":10`, `"rounding":5`, 1),
+		"sport over 40":  strings.Replace(tryBody, `"sport":"football"`, `"sport":"`+strings.Repeat("s", 41)+`"`, 1),
+	} {
+		if s, b := try(id, body); s != 400 || !strings.Contains(b, `"bad_order"`) {
+			t.Errorf("%s: %d %s, want 400 bad_order", name, s, b)
+		}
+	}
+	if s, b := request(t, srv, "POST", "/api/me/bot/agents/home/try", token, tryBody, nil); s != 400 || !strings.Contains(b, `"bad_order"`) {
+		t.Fatalf("agent id not numeric: %d %s", s, b)
+	}
+	if s, b := try(otherID, tryBody); s != 404 || !strings.Contains(b, `"unknown_agent"`) {
+		t.Fatalf("another user's agent: %d %s", s, b)
+	}
+	if s, b := try(offlineID, tryBody); s != 409 || !strings.Contains(b, `"agent_offline"`) {
+		t.Fatalf("offline agent: %d %s", s, b)
+	}
+	// An online agent older than protocol 3 cannot take a Try: "Update the agent".
+	if s, b := try(oldID, tryBody); s != 409 || !strings.Contains(b, `"agent_update"`) {
+		t.Fatalf("Phase 1 agent: %d %s", s, b)
+	}
+	if s, b := try(p2ID, tryBody); s != 409 || !strings.Contains(b, `"agent_update"`) {
+		t.Fatalf("Phase 2 agent: %d %s", s, b)
+	}
+	if s, b := request(t, srv, "POST", fmt.Sprintf("/api/me/bot/agents/%d/try", id), "", tryBody, bearer(code)); s != 403 || !strings.Contains(b, `"session_required"`) {
+		t.Fatalf("try with a bot code: %d %s", s, b)
+	}
+	if s, b := request(t, srv, "POST", fmt.Sprintf("/api/me/bot/agents/%d/try", id), token, tryBody, map[string]string{"Origin": "http://evil.example"}); s != 403 || !strings.Contains(b, `"bad_origin"`) {
+		t.Fatalf("cross-site try: %d %s", s, b)
+	}
+	// While the windows are reserved for an order, a Try still goes (it presses nothing); no answer → 504.
+	placeOrder(t, srv, token, "arb-1", bot, app)
+	done := commandAsync(t, srv, token, fmt.Sprintf("/api/me/bot/agents/%d/try", id), tryBody)
+	cmdID, _ := readTry(t, bot)
+	if a := <-done; a.status != 504 || !strings.Contains(a.body, `"agent_timeout"`) {
+		t.Fatalf("no answer: %+v", a)
+	}
+	if s, b := postAck(t, srv, code, `{"id":"`+cmdID+`","ok":true,"result":`+tryResult+`}`); s != 404 || !strings.Contains(b, `"unknown_command"`) {
+		t.Fatalf("late ack: %d %s", s, b)
+	}
+	// Window commands still go to a protocol-2 agent.
+	done = commandAsync(t, srv, token, fmt.Sprintf("/api/me/bot/agents/%d/windows", p2ID), `{"bookmaker":"tipsport"}`)
+	cmd := readCommand(t, p2)
+	if s, b := postAck(t, srv, p2Code, `{"id":"`+cmd.ID+`","ok":true,"windowId":"tipsport-1"}`); s != 204 || cmd.Action != "add" {
+		t.Fatalf("protocol-2 agent: %+v, ack %d %s", cmd, s, b)
+	}
+	if a := <-done; a.status != 200 {
+		t.Fatalf("window command to a protocol-2 agent: %+v", a)
+	}
+}
+
+// A window command's answer may not carry a result; one that does is answered as before.
+func TestBotCommands_ResultOnAWindowCommandIsIgnored(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code, id := newBotCode(t, srv, token, "Home PC")
+	bot := startBot(t, srv, code, app)
+	done := commandAsync(t, srv, token, fmt.Sprintf("/api/me/bot/agents/%d/windows/tipsport-1/restart", id), ``)
+	cmd := readCommand(t, bot)
+	if s, b := postAck(t, srv, code, `{"id":"`+cmd.ID+`","ok":true,"windowId":"tipsport-1","result":{"x":1}}`); s != 204 {
+		t.Fatalf("ack: %d %s", s, b)
+	}
+	if a := <-done; a.status != 200 || a.body != `{"ok":true,"windowId":"tipsport-1"}` {
+		t.Fatalf("app answer: %+v", a)
+	}
+}

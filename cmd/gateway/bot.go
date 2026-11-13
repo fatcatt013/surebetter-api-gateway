@@ -264,6 +264,7 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("PUT /api/me/bot/settings", acc.RequireSession(http.HandlerFunc(b.handlePutSettings)))
 	mux.Handle("POST /api/me/bot/agents/{agentId}/windows", acc.RequireSession(http.HandlerFunc(b.handleAddWindow)))
 	mux.Handle("POST /api/me/bot/agents/{agentId}/windows/{windowId}/{action}", acc.RequireSession(http.HandlerFunc(b.handleWindowAction)))
+	mux.Handle("POST /api/me/bot/agents/{agentId}/try", acc.RequireSession(http.HandlerFunc(b.handleTry)))
 	mux.Handle("POST /api/me/bot/commands", acc.RequireBotCode(http.HandlerFunc(b.handleCommandAck)))
 	mux.Handle("PUT /api/me/bot/flows", acc.RequireBotCode(http.HandlerFunc(b.handlePutFlows)))
 	mux.Handle("GET /api/me/bot/flows", acc.RequireSession(http.HandlerFunc(b.handleGetFlows)))
