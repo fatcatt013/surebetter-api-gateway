@@ -11,42 +11,71 @@ import (
 
 // orderLegView is one leg in the Orders screen.
 type orderLegView struct {
-	Bookmaker string  `json:"bookmaker"`
-	WindowID  string  `json:"windowId"`
-	Label     string  `json:"label"`
-	Odds      float64 `json:"odds"`
-	Stake     float64 `json:"stake"`
-	Step      string  `json:"step"`
-	StepAt    int64   `json:"stepAt"`
+	Bookmaker string   `json:"bookmaker"`
+	WindowID  string   `json:"windowId"`
+	Label     string   `json:"label"`
+	Odds      float64  `json:"odds"`
+	Stake     float64  `json:"stake"`
+	Step      string   `json:"step"`
+	StepAt    int64    `json:"stepAt"`
+	OutcomeID string   `json:"outcomeId"`
+	Placed    *bool    `json:"placed"`   // null until a final event reports the legs
+	FairOdds  *float64 `json:"fairOdds"` // consensus fair odds the app sent; null = unknown
 }
 
 // orderView is one order in GET /api/me/bot/orders.
 type orderView struct {
-	ID        string         `json:"id"`
-	ArbKey    string         `json:"arbKey"`
-	State     string         `json:"state"`
-	Reason    string         `json:"reason"`
-	DryRun    bool           `json:"dryRun"`
-	AgentID   int64          `json:"agentId"`
-	Agent     string         `json:"agent"`
-	Match     string         `json:"match"`
-	Market    string         `json:"market"`
-	Live      bool           `json:"live"`
-	ProfitPct float64        `json:"profitPct"`
-	Stake     int64          `json:"stake"`
-	CreatedAt int64          `json:"createdAt"`
-	SentAt    int64          `json:"sentAt"`
-	EndedAt   int64          `json:"endedAt"`
-	Legs      []orderLegView `json:"legs"`
+	ID         string          `json:"id"`
+	ArbKey     string          `json:"arbKey"`
+	State      string          `json:"state"`
+	Reason     string          `json:"reason"`
+	DryRun     bool            `json:"dryRun"`
+	AgentID    int64           `json:"agentId"`
+	Agent      string          `json:"agent"`
+	Match      string          `json:"match"`
+	Market     string          `json:"market"`
+	Live       bool            `json:"live"`
+	ProfitPct  float64         `json:"profitPct"`
+	Stake      int64           `json:"stake"`
+	CreatedAt  int64           `json:"createdAt"`
+	SentAt     int64           `json:"sentAt"`
+	EndedAt    int64           `json:"endedAt"`
+	Legs       []orderLegView  `json:"legs"`
+	MarketType string          `json:"marketType"`
+	Line       *float64        `json:"line"`
+	IsLive     bool            `json:"isLive"`
+	Sport      string          `json:"sport"`
+	Rounding   int             `json:"rounding"`
+	Rule       string          `json:"rule"`     // from the last flow; "" = none
+	Playbook   string          `json:"playbook"` // from the last flow; "" = none
+	Flow       json.RawMessage `json:"flow"`     // the agent's last flow object; null = none
 }
 
 func legViews(legs []storedLeg) []orderLegView {
 	out := make([]orderLegView, 0, len(legs))
 	for _, l := range legs {
 		out = append(out, orderLegView{Bookmaker: l.Bookmaker, WindowID: l.WindowID, Label: l.Label, Odds: l.Odds, Stake: l.Stake,
-			Step: l.Step, StepAt: l.StepAt})
+			Step: l.Step, StepAt: l.StepAt, OutcomeID: l.OutcomeID, Placed: l.Placed, FairOdds: l.FairOdds})
 	}
 	return out
+}
+
+// withDetails fills v's arb fields from info (rounding 1 for orders stored before Phase 3) and its
+// flow, rule and playbook from the stored flow ("" = none).
+func (v orderView) withDetails(info orderInfo, flow string) orderView {
+	v.MarketType, v.Line, v.IsLive, v.Sport, v.Rounding = info.MarketType, info.Line, info.IsLive, info.Sport, info.Rounding
+	if v.Rounding == 0 {
+		v.Rounding = 1
+	}
+	if flow != "" {
+		var f struct {
+			Rule     string `json:"rule"`
+			Playbook string `json:"playbook"`
+		}
+		json.Unmarshal([]byte(flow), &f) // checked by compactFlow when it was posted
+		v.Flow, v.Rule, v.Playbook = json.RawMessage(flow), f.Rule, f.Playbook
+	}
+	return v
 }
 
 // viewOf is a waiting or running order as the Orders screen shows it; names maps code ids to agent names.
@@ -57,7 +86,7 @@ func (o *botOrder) viewOf(names map[int64]string) orderView {
 	if o.state == orderRunning {
 		v.SentAt = o.sent.UnixMilli()
 	}
-	return v
+	return v.withDetails(o.info, o.flow)
 }
 
 // rowView is a stored order as the Orders screen shows it.
@@ -68,7 +97,7 @@ func rowView(r accounts.BotOrderRow) orderView {
 	json.Unmarshal([]byte(r.LegsJSON), &legs)
 	return orderView{ID: r.ID, ArbKey: r.ArbKey, State: r.State, Reason: r.Reason, DryRun: r.DryRun, AgentID: r.CodeID, Agent: r.Agent,
 		Match: info.Match, Market: info.Market, Live: info.Live, ProfitPct: info.ProfitPct, Stake: r.Stake, CreatedAt: r.CreatedAt,
-		SentAt: r.SentAt, EndedAt: r.EndedAt, Legs: legViews(legs)}
+		SentAt: r.SentAt, EndedAt: r.EndedAt, Legs: legViews(legs)}.withDetails(info, r.FlowJSON)
 }
 
 // ordersView is the GET /api/me/bot/orders body.

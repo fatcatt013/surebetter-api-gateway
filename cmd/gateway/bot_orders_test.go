@@ -74,7 +74,7 @@ func TestBotOrders_RunningWaitingAndHistory(t *testing.T) {
 	r := got.Running[0]
 	sent := clk.now().Add(-time.Second).UnixMilli()
 	want := orderView{ID: running.OrderID, ArbKey: "arb-2", State: "running", DryRun: true, AgentID: codeID, Agent: "Home PC",
-		Match: "Lyon – Lille", Market: "Corners 10.5", Live: true, ProfitPct: 2.4, Stake: 202, CreatedAt: sent, SentAt: sent,
+		Match: "Lyon – Lille", Market: "Corners 10.5", Live: true, ProfitPct: 2.4, Stake: 202, CreatedAt: sent, SentAt: sent, Rounding: 1,
 		Legs: []orderLegView{{Bookmaker: "tipsport", WindowID: "tipsport-1", Odds: 2.1, Stake: 100},
 			{Bookmaker: "betano", WindowID: "betano-2", Odds: 2.05, Stake: 102.4, Step: "checkOdds", StepAt: clk.now().UnixMilli()}}}
 	if rj, wj := mustJSON(r), mustJSON(want); rj != wj {
@@ -140,5 +140,69 @@ func TestBotOrders_Cancel(t *testing.T) {
 	}
 	if s, b := del("0123456789abcdef", token, nil); s != 404 || !strings.Contains(b, `"unknown_order"`) {
 		t.Fatalf("unknown: %d %s", s, b)
+	}
+}
+
+// Phase 3 fields of the Orders view: the arb's fields, each leg's side and placed, and the agent's
+// last flow with its rule and playbook, for running orders and in the history.
+func TestBotOrders_FlowRuleAndPlacedInTheViews(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	bot := startAgentWith(t, srv, code, p2Status("", win("tipsport", 1, "idle"), win("betano", 1, "idle"), win("fortuna", 1, "busy")), app)
+	a := postOrderOK(t, srv, token, totalsOrder("arb-1"))
+	readOrder(t, bot)
+	expectEvent(t, app, a.OrderID, "sent", "")
+	expectBot(t, app, "on the sent order")
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+a.OrderID+`","event":"flow","flow":`+flowPhase1+`}`); s != 204 {
+		t.Fatalf("flow: %d %s", s, b)
+	}
+	expectEvent(t, app, a.OrderID, "flow", "")
+	waiting := postOrderOK(t, srv, token, orderJSON("arb-2", legJSON("tipsport", "s1", 2.1, 100), legJSON("fortuna", "s3", 2, 100)))
+	expectEvent(t, app, waiting.OrderID, "waiting", "")
+	expectBot(t, app, "on the waiting order")
+	// An order stored before Phase 3: no arb fields in its info_json.
+	if err := svc.InsertBotOrder(accounts.BotOrderRow{ID: "00000000000000aa", UserID: uid, ArbKey: "old", State: "waiting", DryRun: true, Stake: 10,
+		InfoJSON: `{"match":"Old","market":"","live":false,"profitPct":1}`, LegsJSON: `[{"bookmaker":"tipsport","windowId":"tipsport-1"}]`,
+		CreatedAt: time.Now().UnixMilli()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.EndBotOrder("00000000000000aa", "placed", "", `[{"bookmaker":"tipsport","windowId":"tipsport-1"}]`, 10, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	got := getOrders(t, srv, token, "")
+	r := got.Running[0]
+	if r.MarketType != "TOTAL_CORNERS" || r.Line == nil || *r.Line != 9.5 || !r.IsLive || r.Sport != "football" || r.Rounding != 10 ||
+		r.Rule != "totals-over-first" || r.Playbook != "overFirst" || string(r.Flow) != flowPhase1 ||
+		r.Legs[0].OutcomeID != "OVER" || r.Legs[1].OutcomeID != "UNDER" || r.Legs[0].Placed != nil || r.Legs[0].FairOdds != nil ||
+		r.Legs[1].FairOdds == nil || *r.Legs[1].FairOdds != 1.95 {
+		t.Fatalf("running: %s", mustJSON(r))
+	}
+	if w := got.Waiting[0]; w.Rule != "" || w.Playbook != "" || string(w.Flow) != "null" || w.Line != nil || w.Rounding != 1 {
+		t.Fatalf("waiting: %s", mustJSON(w))
+	}
+	if h := got.History[0]; h.ID != "00000000000000aa" || h.Rounding != 1 || h.Line != nil || string(h.Flow) != "null" || h.Legs[0].Placed != nil {
+		t.Fatalf("an order from before Phase 3: %s", mustJSON(h))
+	}
+
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+a.OrderID+`","event":"placed","legs":[{"bookmaker":"tipsport","stake":1000,"odds":2.08,"placed":true},`+
+		`{"bookmaker":"betano","stake":1040,"odds":2,"placed":true}]}`); s != 204 {
+		t.Fatalf("placed: %d %s", s, b)
+	}
+	expectEvent(t, app, a.OrderID, "placed", "")
+	got = getOrders(t, srv, token, "")
+	var h orderView
+	for _, o := range got.History {
+		if o.ID == a.OrderID {
+			h = o
+		}
+	}
+	if h.Rule != "totals-over-first" || h.Playbook != "overFirst" || string(h.Flow) != flowPhase1 || h.Stake != 2040 || h.Legs[0].Odds != 2.08 ||
+		h.Legs[1].Stake != 1040 || h.Legs[0].Placed == nil || !*h.Legs[0].Placed || h.Legs[1].Placed == nil || !*h.Legs[1].Placed ||
+		h.MarketType != "TOTAL_CORNERS" || h.Rounding != 10 || h.Legs[1].OutcomeID != "UNDER" || h.Legs[1].FairOdds == nil || *h.Legs[1].FairOdds != 1.95 {
+		t.Fatalf("history: %s", mustJSON(h))
 	}
 }
