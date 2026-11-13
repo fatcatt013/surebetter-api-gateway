@@ -145,8 +145,10 @@ var migrations = []string{
 	// 6: bots controller Phase 3: the rules each user switched on, each order's last flow, and the
 	// final state cashed_out. SQLite cannot change a CHECK in place, so bot_orders is rebuilt: a copy
 	// with the new CHECK and column, every row copied, the old table dropped, the copy renamed and its
-	// index created again (nothing references bot_orders, so foreign keys stay as they are). It runs
-	// in migrate's transaction: it is all or nothing.
+	// index created again (nothing references bot_orders, so foreign keys stay as they are). From
+	// Phase 3 on a row's stake is its counted stake and the day sum counts stopped orders, so the live
+	// stopped rows (nothing was bet on them) get stake 0. It runs in migrate's transaction: it is all
+	// or nothing.
 	`ALTER TABLE bot_settings ADD COLUMN rules_on TEXT NOT NULL DEFAULT '[]';
 	CREATE TABLE bot_orders_v6 (
 		id          TEXT    PRIMARY KEY,
@@ -166,6 +168,7 @@ var migrations = []string{
 	);
 	INSERT INTO bot_orders_v6 (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json, created_at, sent_at, ended_at)
 		SELECT id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json, created_at, sent_at, ended_at FROM bot_orders;
+	UPDATE bot_orders_v6 SET stake = 0 WHERE state = 'stopped' AND dry_run = 0;
 	DROP TABLE bot_orders;
 	ALTER TABLE bot_orders_v6 RENAME TO bot_orders;
 	CREATE INDEX bot_orders_user_created ON bot_orders (user_id, created_at);`,

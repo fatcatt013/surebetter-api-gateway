@@ -213,6 +213,10 @@ func TestMigrate_RulesOnFlowAndCashedOut(t *testing.T) {
 			created_at, sent_at, ended_at) VALUES ('%016x', 1, 'k%d', 5, '%s', 'r%d', %d, %d, '{"match":"M%d"}', '[{"bookmaker":"b%d"}]', %d, %d, %d)`,
 			i+1, i, state, i, i%2, 100+i, i, i, 1000+i, 2000+i, 3000+i))
 	}
+	// A live stopped order: nothing was bet on it, so migration 6 sets its stake to 0 (the day sum
+	// counts stopped orders from Phase 3 on). The dry-run stopped order above keeps its stake.
+	steps = append(steps, `INSERT INTO bot_orders (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json,
+		created_at, sent_at, ended_at) VALUES ('0000000000000006', 1, 'k5', 5, 'stopped', 'r5', 0, 105, '{"match":"M5"}', '[{"bookmaker":"b5"}]', 1005, 2005, 3005)`)
 	for _, q := range steps {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("%.60s: %v", q, err)
@@ -259,6 +263,7 @@ func TestMigrate_RulesOnFlowAndCashedOut(t *testing.T) {
 		`0000000000000003 1 k2 5 placed r2 0 102 {"match":"M2"} [{"bookmaker":"b2"}] 1002 2002 3002 ""`,
 		`0000000000000004 1 k3 5 stopped r3 1 103 {"match":"M3"} [{"bookmaker":"b3"}] 1003 2003 3003 ""`,
 		`0000000000000005 1 k4 5 outcome_unknown r4 0 104 {"match":"M4"} [{"bookmaker":"b4"}] 1004 2004 3004 ""`,
+		`0000000000000006 1 k5 5 stopped r5 0 0 {"match":"M5"} [{"bookmaker":"b5"}] 1005 2005 3005 ""`,
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("orders after the migration:\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
