@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
+	"slices"
 
 	"github.com/surebetter/api-gateway/internal/accounts"
 )
@@ -22,18 +24,34 @@ type botSettingsView struct {
 	Paused       bool      `json:"paused"`
 	PausedReason string    `json:"pausedReason"`
 	Limits       botLimits `json:"limits"`
+	RulesOn      []string  `json:"rulesOn"`
 }
 
 func settingsView(st accounts.BotSettings) botSettingsView {
 	return botSettingsView{DryRun: st.DryRun, Paused: st.Paused, PausedReason: st.PausedReason, Limits: botLimits{MaxOrder: st.MaxOrder,
-		MaxLeg: st.MaxLeg, PerDay: st.PerDay, OrdersAtOnce: st.OrdersAtOnce, PauseOnUnknown: st.PauseOnUnknown}}
+		MaxLeg: st.MaxLeg, PerDay: st.PerDay, OrdersAtOnce: st.OrdersAtOnce, PauseOnUnknown: st.PauseOnUnknown}, RulesOn: rulesOnList(st.RulesOn)}
+}
+
+// rulePattern is a rule id; maxRulesOn the most ids a user may switch on.
+var rulePattern = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
+
+const maxRulesOn = 20
+
+// rulesOnList is the rule ids in a stored rules_on (never nil; unreadable or empty → none).
+func rulesOnList(js string) []string {
+	var ids []string
+	if json.Unmarshal([]byte(js), &ids) != nil || ids == nil {
+		return []string{}
+	}
+	return ids
 }
 
 // botSettingsIn is a PUT body: any subset of the fields (absent or null = unchanged).
 type botSettingsIn struct {
-	DryRun *bool `json:"dryRun"`
-	Paused *bool `json:"paused"`
-	Limits *struct {
+	DryRun  *bool     `json:"dryRun"`
+	Paused  *bool     `json:"paused"`
+	RulesOn *[]string `json:"rulesOn"`
+	Limits  *struct {
 		MaxOrder       *int64 `json:"maxOrder"`
 		MaxLeg         *int64 `json:"maxLeg"`
 		PerDay         *int64 `json:"perDay"`
@@ -45,11 +63,26 @@ type botSettingsIn struct {
 // maxKc is the largest Kč limit.
 const maxKc = 10_000_000
 
-// apply returns st with in's fields, false when one is out of range (Kč 0–10 000 000, ordersAtOnce 1–20).
-// paused is left to the caller.
+// apply returns st with in's fields, false when one is out of range (Kč 0–10 000 000, ordersAtOnce
+// 1–20, rulesOn at most 20 ids of [a-z0-9-]{1,40}; a repeated id is kept once). paused is left to the caller.
 func (in botSettingsIn) apply(st accounts.BotSettings) (accounts.BotSettings, bool) {
 	if in.DryRun != nil {
 		st.DryRun = *in.DryRun
+	}
+	if in.RulesOn != nil {
+		if len(*in.RulesOn) > maxRulesOn {
+			return st, false
+		}
+		ids := []string{}
+		for _, id := range *in.RulesOn {
+			if !rulePattern.MatchString(id) {
+				return st, false
+			}
+			if !slices.Contains(ids, id) {
+				ids = append(ids, id)
+			}
+		}
+		st.RulesOn = mustJSON(ids)
 	}
 	if l := in.Limits; l != nil {
 		for _, kc := range []struct {

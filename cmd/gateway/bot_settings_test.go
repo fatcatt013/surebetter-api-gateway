@@ -17,7 +17,7 @@ func putSettings(t *testing.T, srv *httptest.Server, token, body string) (int, s
 	return request(t, srv, "PUT", "/api/me/bot/settings", token, body, nil)
 }
 
-const defaultSettingsJSON = `{"dryRun":true,"paused":false,"pausedReason":"","limits":{"maxOrder":0,"maxLeg":0,"perDay":0,"ordersAtOnce":1,"pauseOnUnknown":true}}`
+const defaultSettingsJSON = `{"dryRun":true,"paused":false,"pausedReason":"","limits":{"maxOrder":0,"maxLeg":0,"perDay":0,"ordersAtOnce":1,"pauseOnUnknown":true},"rulesOn":[]}`
 
 func TestBotSettings_GetPutAndValidation(t *testing.T) {
 	srv, svc, _ := newBotServer(t)
@@ -46,7 +46,7 @@ func TestBotSettings_GetPutAndValidation(t *testing.T) {
 	}
 	// A subset changes only what it names and answers the full settings.
 	s, b := putSettings(t, srv, token, `{"dryRun":false,"limits":{"maxOrder":10000000,"ordersAtOnce":20,"pauseOnUnknown":false}}`)
-	want := `{"dryRun":false,"paused":false,"pausedReason":"","limits":{"maxOrder":10000000,"maxLeg":0,"perDay":0,"ordersAtOnce":20,"pauseOnUnknown":false}}`
+	want := `{"dryRun":false,"paused":false,"pausedReason":"","limits":{"maxOrder":10000000,"maxLeg":0,"perDay":0,"ordersAtOnce":20,"pauseOnUnknown":false},"rulesOn":[]}`
 	if s != 200 || strings.TrimSpace(b) != want {
 		t.Fatalf("put: %d %s", s, b)
 	}
@@ -262,4 +262,52 @@ func TestBotSettings_AutoPauseWithUnreadableSettingsKeepsTheRow(t *testing.T) {
 	if got := settingsRow(t, db, uid); got != "1/1/Outcome unknown · order 00000000/500" {
 		t.Fatalf("stored row: %s", got)
 	}
+}
+
+func TestBotSettings_RulesOn(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	app := appSocket(t, srv, token)
+	ids := make([]string, 21)
+	for i := range ids {
+		ids[i] = fmt.Sprintf(`"rule-%d"`, i)
+	}
+	bad := map[string]string{
+		"not an array":     `{"rulesOn":"totals-over-first"}`,
+		"a number":         `{"rulesOn":[1]}`,
+		"uppercase":        `{"rulesOn":["Totals-over-first"]}`,
+		"empty id":         `{"rulesOn":[""]}`,
+		"space":            `{"rulesOn":["totals over first"]}`,
+		"id over 40 chars": `{"rulesOn":["` + strings.Repeat("r", 41) + `"]}`,
+		"21 ids":           `{"rulesOn":[` + strings.Join(ids, ",") + `]}`,
+	}
+	for name, body := range bad {
+		if s, b := putSettings(t, srv, token, body); s != 400 || !strings.Contains(b, `"bad_settings"`) {
+			t.Errorf("%s: %d %s, want 400 bad_settings", name, s, b)
+		}
+	}
+	// PUT replaces the list; an unknown id is kept (an agent may know it); a repeated id is kept once.
+	s, b := putSettings(t, srv, token, `{"rulesOn":["totals-over-first","unknown-rule","totals-over-first"]}`)
+	if s != 200 || !strings.HasSuffix(strings.TrimSpace(b), `"rulesOn":["totals-over-first","unknown-rule"]}`) {
+		t.Fatalf("put: %d %s", s, b)
+	}
+	expectBot(t, app, "on switching rules on")
+	if st, _ := svc.BotSettings(uid); st.RulesOn != `["totals-over-first","unknown-rule"]` {
+		t.Fatalf("stored: %+v", st)
+	}
+	// null and absent leave it; the same list again is no change.
+	for _, body := range []string{`{"rulesOn":null}`, `{"dryRun":true}`, `{"rulesOn":["totals-over-first","unknown-rule"]}`} {
+		if s, b := putSettings(t, srv, token, body); s != 200 || !strings.Contains(b, `"rulesOn":["totals-over-first","unknown-rule"]`) {
+			t.Fatalf("put %s: %d %s", body, s, b)
+		}
+	}
+	if s, b := putSettings(t, srv, token, `{"rulesOn":[]}`); s != 200 || !strings.HasSuffix(strings.TrimSpace(b), `"rulesOn":[]}`) {
+		t.Fatalf("every rule off: %d %s", s, b)
+	}
+	expectBot(t, app, "on switching every rule off")
+	if st, _ := svc.BotSettings(uid); st.RulesOn != "[]" {
+		t.Fatalf("stored after off: %+v", st)
+	}
+	expectNoMessage(t, app, "app after the puts that changed nothing")
 }
