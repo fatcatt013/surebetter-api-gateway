@@ -150,3 +150,115 @@ func (s *Service) TelegramSentBetween(from, to int64) ([]TelegramSentRow, error)
 	}
 	return out, legs.Err()
 }
+
+// TelegramStatRow is the part of a posted arb the statistics page needs: no ids of messages or
+// users, no stakes, the legs reduced to their bookmakers (in the message's order). Zero
+// FirstDetectedAt and EndedAt mean unknown; EndReason "" means still open.
+type TelegramStatRow struct {
+	ID              int64
+	SentAt          int64
+	FirstDetectedAt int64
+	EndedAt         int64
+	Sport           string
+	IsLive          bool
+	MarketType      string
+	Line            float64
+	ProfitPct       float64
+	Profit          int64
+	Currency        string
+	EndReason       string
+	Books           []string
+}
+
+// telegramStatsPage is how many arbs one statement of ScanTelegramStats reads.
+var telegramStatsPage = 2000
+
+// ScanTelegramStats calls fn for every arb sent in [from, to), oldest first (ties by id), and
+// stops at fn's first error. The database has one connection, which the Telegram stats writer,
+// logins and the bots share: so it reads short pages (keyset on sent_at, id) and calls fn only
+// between statements, never holding the connection for the whole range. Repeated strings (sport,
+// market, currency, reason, bookmaker) share one copy, which keeps a long range small in memory.
+func (s *Service) ScanTelegramStats(from, to int64, fn func(TelegramStatRow) error) error {
+	intern := map[string]string{}
+	str := func(v string) string {
+		if c, ok := intern[v]; ok {
+			return c
+		}
+		intern[v] = v
+		return v
+	}
+	afterAt, afterID := from, int64(0)
+	for {
+		page, err := s.telegramStatsPage(afterAt, afterID, to, str)
+		if err != nil {
+			return err
+		}
+		for _, r := range page {
+			if err := fn(r); err != nil {
+				return err
+			}
+		}
+		if len(page) < telegramStatsPage {
+			return nil
+		}
+		last := page[len(page)-1]
+		afterAt, afterID = last.SentAt, last.ID
+	}
+}
+
+// telegramStatsPage reads up to telegramStatsPage arbs after (afterAt, afterID) and before to,
+// with their bookmakers.
+func (s *Service) telegramStatsPage(afterAt, afterID, to int64, str func(string) string) ([]TelegramStatRow, error) {
+	rows, err := s.db.Query(`SELECT id, sent_at, first_detected_at, ended_at, sport, is_live, market_type, line, profit_pct,
+			profit, currency, end_reason
+		FROM telegram_sent_arbs WHERE sent_at < ? AND (sent_at > ? OR (sent_at = ? AND id > ?))
+		ORDER BY sent_at, id LIMIT ?`, to, afterAt, afterAt, afterID, telegramStatsPage)
+	if err != nil {
+		return nil, err
+	}
+	page := []TelegramStatRow{}
+	ids := []int64{}
+	for rows.Next() {
+		var r TelegramStatRow
+		var first, ended sql.NullInt64
+		var reason sql.NullString
+		if err := rows.Scan(&r.ID, &r.SentAt, &first, &ended, &r.Sport, &r.IsLive, &r.MarketType, &r.Line, &r.ProfitPct,
+			&r.Profit, &r.Currency, &reason); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		r.FirstDetectedAt, r.EndedAt = first.Int64, ended.Int64
+		r.Sport, r.MarketType, r.Currency, r.EndReason = str(r.Sport), str(r.MarketType), str(r.Currency), str(reason.String)
+		page = append(page, r)
+		ids = append(ids, r.ID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(page) == 0 {
+		return page, err
+	}
+	idJSON, err := json.Marshal(ids)
+	if err != nil {
+		return nil, err
+	}
+	legs, err := s.db.Query(`SELECT sent_id, bookmaker FROM telegram_sent_legs
+		WHERE sent_id IN (SELECT value FROM json_each(?)) ORDER BY sent_id, idx`, string(idJSON))
+	if err != nil {
+		return nil, err
+	}
+	defer legs.Close()
+	byID := make(map[int64]int, len(page))
+	for i, r := range page {
+		byID[r.ID] = i
+	}
+	for legs.Next() {
+		var id int64
+		var book string
+		if err := legs.Scan(&id, &book); err != nil {
+			return nil, err
+		}
+		if i, ok := byID[id]; ok {
+			page[i].Books = append(page[i].Books, str(book))
+		}
+	}
+	return page, legs.Err()
+}

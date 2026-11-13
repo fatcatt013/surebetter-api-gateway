@@ -1,6 +1,7 @@
 package accounts
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -144,5 +145,66 @@ func TestTelegramSent_LegsQueryableByBookmaker(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM telegram_sent_legs l JOIN telegram_sent_arbs a ON a.id = l.sent_id
 		WHERE l.bookmaker = 'tipsport' AND a.sent_at >= 0 AND l.stake = 5097`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("legs by bookmaker: %d %v", n, err)
+	}
+}
+
+func TestTelegramSent_ScanStatsPagesInSentOrderWithBooks(t *testing.T) {
+	s, _, _ := newTestService(t)
+	defer func(n int) { telegramStatsPage = n }(telegramStatsPage)
+	telegramStatsPage = 2 // several pages
+	for i, at := range []int64{5000, 1000, 3000, 3000, 9000, 7000} {
+		r := sentRow(int64(i+1), at)
+		if i == 2 {
+			r.FirstDetectedAt = 0
+			r.Legs = append(r.Legs, TelegramSentLeg{Bookmaker: "fortuna", OutcomeID: "x", Odds: 9, Stake: 1})
+		}
+		if i == 3 {
+			r.Legs = nil
+		}
+		if _, err := s.InsertTelegramSent(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.EndTelegramSent(2, 4000, "removed"); err != nil { // sent at 1000
+		t.Fatal(err)
+	}
+	var got []TelegramStatRow
+	err := s.ScanTelegramStats(1000, 9000, func(r TelegramStatRow) error { got = append(got, r); return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var at []int64
+	for _, r := range got {
+		at = append(at, r.SentAt)
+	}
+	if !reflect.DeepEqual(at, []int64{1000, 3000, 3000, 5000, 7000}) { // [from, to), oldest first, ties by id
+		t.Fatalf("sent_at %v", at)
+	}
+	want0 := TelegramStatRow{ID: got[0].ID, SentAt: 1000, FirstDetectedAt: 1000 - 38000, EndedAt: 4000, Sport: "tennis", IsLive: true,
+		MarketType: "GAME_HANDICAP", Line: 3.5, ProfitPct: 2.96, Profit: 296, Currency: "CZK", EndReason: "removed",
+		Books: []string{"betano", "tipsport"}}
+	if !reflect.DeepEqual(got[0], want0) {
+		t.Fatalf("row\n got %+v\nwant %+v", got[0], want0)
+	}
+	if got[1].FirstDetectedAt != 0 || !reflect.DeepEqual(got[1].Books, []string{"betano", "tipsport", "fortuna"}) || got[1].EndReason != "" {
+		t.Fatalf("3-leg row with unknown detection: %+v", got[1])
+	}
+	if got[2].Books != nil {
+		t.Fatalf("no legs: %+v", got[2])
+	}
+}
+
+func TestTelegramSent_ScanStatsStopsOnCallbackError(t *testing.T) {
+	s, _, _ := newTestService(t)
+	for i := 0; i < 3; i++ {
+		if _, err := s.InsertTelegramSent(sentRow(int64(i+1), int64(1000*(i+1)))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stop := errors.New("stop")
+	n := 0
+	err := s.ScanTelegramStats(0, 10_000, func(TelegramStatRow) error { n++; return stop })
+	if !errors.Is(err, stop) || n != 1 {
+		t.Fatalf("n %d err %v", n, err)
 	}
 }
