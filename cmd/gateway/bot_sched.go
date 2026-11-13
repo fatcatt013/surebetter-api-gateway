@@ -213,15 +213,15 @@ var (
 )
 
 // validOrder checks the shape: an arb key (at most 256 bytes), exactly 2 legs at different
-// bookmakers, each with a selection id, odds above 1 and a positive stake; match and market at
-// most 200 characters and a finite profit_pct.
+// bookmakers, each with a selection id, odds above 1 and a stake above 0 and at most maxKc (so
+// stake sums never overflow); match and market at most 200 characters and a finite profit_pct.
 func validOrder(o botOrderIn) bool {
 	if strings.TrimSpace(o.ArbKey) == "" || len(o.ArbKey) > 256 || len(o.Legs) != 2 || o.Legs[0].Bookmaker == o.Legs[1].Bookmaker ||
 		runeLen(o.Match) > 200 || runeLen(o.Market) > 200 || math.IsNaN(o.ProfitPct) || math.IsInf(o.ProfitPct, 0) {
 		return false
 	}
 	for _, l := range o.Legs {
-		if strings.TrimSpace(l.Bookmaker) == "" || l.Bookmaker != strings.TrimSpace(l.Bookmaker) || strings.TrimSpace(l.SourceID) == "" || !(l.Odds > 1) || !(l.Stake > 0) {
+		if strings.TrimSpace(l.Bookmaker) == "" || l.Bookmaker != strings.TrimSpace(l.Bookmaker) || strings.TrimSpace(l.SourceID) == "" || !(l.Odds > 1) || !(l.Stake > 0) || !(l.Stake <= maxKc) {
 			return false
 		}
 	}
@@ -275,7 +275,7 @@ func (b *botHub) submitLocked(userID int64, in botOrderIn, fx *effects) (submitt
 		if err != nil {
 			return submitted{}, err
 		}
-		if day.LiveStake+stake > st.PerDay {
+		if stake > st.PerDay-day.LiveStake {
 			return submitted{}, errLimitDay
 		}
 	}
@@ -517,7 +517,7 @@ func (b *botHub) overDayLocked(o *botOrder, st accounts.BotSettings, fx *effects
 	if !o.dryRun { // its row (posted live, still waiting) is already in the sum
 		used -= o.stake
 	}
-	return used+o.stake > st.PerDay, nil
+	return o.stake > st.PerDay-used, nil
 }
 
 // waitReasonLocked says why o cannot go now: "Orders at once: <n> running", else the bookmakers

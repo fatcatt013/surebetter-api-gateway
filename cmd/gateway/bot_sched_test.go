@@ -922,3 +922,35 @@ func TestBotSched_RecoverOrdersAfterAGatewayRestart(t *testing.T) {
 		}
 	}
 }
+
+// A leg stake above 10 000 000 Kč is a bad order: the stake sum could not overflow into a
+// negative number that slips under the day limit and poisons the day's live stake.
+func TestBotSched_LegStakeCapKeepsTheDayLimitSound(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.DryRun, st.PerDay = false, 1000 })
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	startBot(t, srv, code, app)
+	for name, body := range map[string]string{
+		"1e19 + 10":         orderJSON("k", legJSON("tipsport", "s1", 2.1, 1e19), legJSON("betano", "s2", 2, 10)),
+		"just over the cap": orderJSON("k", legJSON("tipsport", "s1", 2.1, 10), legJSON("betano", "s2", 2, 10_000_000.5)),
+	} {
+		if s, b := postOrder(t, srv, token, body); s != 400 || !strings.Contains(b, `"bad_order"`) {
+			t.Errorf("%s: %d %s, want 400 bad_order", name, s, b)
+		}
+	}
+	// At the cap the shape is fine; the day limit refuses it.
+	if s, b := postOrder(t, srv, token, orderJSON("k", legJSON("tipsport", "s1", 2.1, 10_000_000), legJSON("betano", "s2", 2, 10))); s != 409 ||
+		!strings.Contains(b, `"limit_day"`) {
+		t.Fatalf("at the cap: %d %s, want 409 limit_day", s, b)
+	}
+	if v := getView(t, srv, token); v.Today.Orders != 0 || v.Running != 0 || v.Waiting != 0 {
+		t.Fatalf("view: %+v", v)
+	}
+	// The day's live stake is untouched: an order that fits is still sent.
+	if a := postOrderOK(t, srv, token, tipBetOrder("arb-1")); a.State != "sent" {
+		t.Fatalf("order that fits: %+v", a)
+	}
+}
