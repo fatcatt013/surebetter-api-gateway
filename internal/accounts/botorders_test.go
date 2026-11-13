@@ -187,3 +187,38 @@ func TestBotOrders_FlowStakeAndCashedOut(t *testing.T) {
 		t.Fatalf("day: %+v %v", st, err)
 	}
 }
+
+func TestBotOrders_SetLegsOfARunningOrder(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	code, _ := s.CreateCode(user.UserID, "Home PC", KindBot)
+	w := BotOrderRow{ID: "000000000000000a", UserID: user.UserID, ArbKey: "k1", State: "waiting", DryRun: true, Stake: 202,
+		InfoJSON: `{}`, LegsJSON: `[{"bookmaker":"tipsport"}]`, CreatedAt: 1000}
+	if err := s.InsertBotOrder(w); err != nil {
+		t.Fatal(err)
+	}
+	legs := func() string {
+		var js string
+		if err := s.db.QueryRow(`SELECT legs_json FROM bot_orders WHERE id = ?`, w.ID).Scan(&js); err != nil {
+			t.Fatal(err)
+		}
+		return js
+	}
+	// Only a running row changes: not a waiting one, not an ended one.
+	if err := s.SetBotOrderLegs(w.ID, `[{"bookmaker":"x"}]`); err != nil || legs() != `[{"bookmaker":"tipsport"}]` {
+		t.Fatalf("waiting: %s %v", legs(), err)
+	}
+	if err := s.MarkBotOrderSent(w.ID, code.ID, true, `[{"bookmaker":"tipsport","windowId":"tipsport-1"}]`, 1500); err != nil {
+		t.Fatal(err)
+	}
+	released := `[{"bookmaker":"tipsport","windowId":"tipsport-1","placed":false,"released":true}]`
+	if err := s.SetBotOrderLegs(w.ID, released); err != nil || legs() != released {
+		t.Fatalf("running: %s %v", legs(), err)
+	}
+	if err := s.EndBotOrder(w.ID, "placed", "", `[{"bookmaker":"tipsport"}]`, 0, 9000); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetBotOrderLegs(w.ID, released); err != nil || legs() != `[{"bookmaker":"tipsport"}]` {
+		t.Fatalf("ended: %s %v", legs(), err)
+	}
+}

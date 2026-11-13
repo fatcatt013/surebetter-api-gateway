@@ -44,6 +44,13 @@ func (s *Service) MarkBotOrderSent(id string, codeID int64, dryRun bool, legsJSO
 	return err
 }
 
+// SetBotOrderLegs replaces a running order's legs (a leg released by the agent); a waiting or ended
+// order is left alone.
+func (s *Service) SetBotOrderLegs(id, legsJSON string) error {
+	_, err := s.db.Exec(`UPDATE bot_orders SET legs_json = ? WHERE id = ? AND state = 'running'`, legsJSON, id)
+	return err
+}
+
 // EndBotOrder ends a waiting or running order with a final state (placed, stopped, outcome_unknown
 // or cashed_out), its reason, its legs (with their last steps), its stake (the real total when the
 // agent reported the legs) and the end time. An order that already ended is left alone.

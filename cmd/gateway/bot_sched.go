@@ -119,6 +119,9 @@ type storedLeg struct {
 	Step     string `json:"step"`
 	StepAt   int64  `json:"stepAt"` // Unix ms; 0 = no step yet
 	Placed   *bool  `json:"placed"` // nil: not reported (running, or an agent older than Phase 3)
+	// Released: the agent will never play this leg (leg_step "released", rule 5); its window is no
+	// longer reserved and Placed is false.
+	Released bool `json:"released,omitempty"`
 }
 
 // botOrder is a waiting or running order, in memory until its final state.
@@ -471,7 +474,9 @@ func (b *botHub) reservedLocked(userID int64) map[int64]map[string]string {
 			out[o.codeID] = map[string]string{}
 		}
 		for _, l := range o.legs {
-			out[o.codeID][l.WindowID] = o.id
+			if !l.Released { // its window was given back while the order runs
+				out[o.codeID][l.WindowID] = o.id
+			}
 		}
 	}
 	return out
@@ -735,7 +740,7 @@ func (b *botHub) endLocked(o *botOrder, state, reason string, relay bool, fx *ef
 		if p := b.presenceLocked(o.userID, o.codeID); p != nil {
 			p.reservedAt = now
 			for _, l := range o.legs {
-				if p.windowState(l.WindowID) == "idle" {
+				if !l.Released && p.windowState(l.WindowID) == "idle" { // a released window may be another order's by now
 					p.idleSince[l.WindowID] = now
 				}
 			}
@@ -990,8 +995,35 @@ func (o *botOrder) countedStake(state string) int64 {
 	return counted
 }
 
+// stepReleased is the leg_step step of the leg a single-leg pair never plays (rule 5).
+const stepReleased = "released"
+
+// releaseLegLocked gives back the window of o's leg i (leg_step "released"): it is no longer
+// reserved (idle since now if the agent's last status shows it idle), the leg is placed:false (row
+// too) and the app is told ({"type":"bot"}). The caller retries the waiting orders. b.mu must be held.
+func (b *botHub) releaseLegLocked(o *botOrder, i int, fx *effects) {
+	l := &o.legs[i]
+	placed := false
+	l.Released, l.Placed = true, &placed
+	if p := b.presenceLocked(o.userID, o.codeID); p != nil {
+		now := b.now()
+		p.reservedAt = now
+		if p.windowState(l.WindowID) == "idle" {
+			p.idleSince[l.WindowID] = now
+		}
+	}
+	if b.acc != nil {
+		id, legs := o.id, o.legsJSON()
+		fx.write(func() error { return b.acc.SetBotOrderLegs(id, legs) })
+	}
+	fx.notify(o.userID)
+	log.Info().Int64("user", o.userID).Str("order_id", o.id).Str("bookmaker", l.Bookmaker).Str("window", l.WindowID).Msg("bot order leg released")
+}
+
 // event relays one order event, posted by codeID's agent, to the user's non-bot /ws sockets.
-// leg_step records the leg's step and its time; flow keeps the order's last flow (memory and row)
+// leg_step records the leg's step and its time; the step "released" also gives back that leg's
+// window (releaseLegLocked, once) and retries the waiting orders; a "released" step for an unknown
+// order or a bookmaker that is not one of its legs is ignored (nil, nothing relayed). flow keeps the order's last flow (memory and row)
 // and relays it. A final event records the legs it reports (applyFinalLegs), ends the order (row,
 // reservation) and retries the waiting orders. errUnknownOrder: the order is unknown, ended,
 // waiting, another user's, or was sent to another agent. flow must be compactFlow's result.
@@ -1001,16 +1033,29 @@ func (b *botHub) event(userID, codeID int64, in botEventIn, flow string) error {
 	fx := &effects{}
 	b.expireLocked(fx)
 	o := b.orders[in.OrderID]
+	released := in.Event == "leg_step" && in.Step == stepReleased
 	if o == nil || o.userID != userID || o.state != orderRunning || o.codeID != codeID {
 		b.release(fx)
+		if released {
+			return nil
+		}
 		return errUnknownOrder
 	}
+	if released && !slices.ContainsFunc(o.legs, func(l storedLeg) bool { return l.Bookmaker == in.Bookmaker }) {
+		b.release(fx)
+		return nil
+	}
 	ev := botEventMsg{Event: in.Event, Bookmaker: in.Bookmaker, Reason: in.Reason, Step: in.Step}
+	freed := false
 	switch in.Event {
 	case "leg_step":
 		for i := range o.legs {
 			if o.legs[i].Bookmaker == in.Bookmaker {
 				o.legs[i].Step, o.legs[i].StepAt = in.Step, b.now().UnixMilli()
+				if released && !o.legs[i].Released {
+					b.releaseLegLocked(o, i, fx)
+					freed = true
+				}
 			}
 		}
 	case "flow":
@@ -1024,6 +1069,9 @@ func (b *botHub) event(userID, codeID int64, in botEventIn, flow string) error {
 		}
 	}
 	b.relayLocked(fx, o, ev)
+	if freed {
+		b.dispatchLocked(userID, fx)
+	}
 	if botEvents[in.Event] {
 		o.applyFinalLegs(in.Legs)
 		b.endLocked(o, in.Event, in.Reason, false, fx)
