@@ -761,6 +761,8 @@ func main() {
 	}
 	bots := newBotHub(reg, acc)
 	bots.shotsDir = filepath.Join(filepath.Dir(cfg.AccountsDB), "bot-screenshots") // same volume as the DB
+	// Orders the previous process left waiting or running end now (it lost them from memory).
+	bots.recoverOrders()
 	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired, bots: bots}
 
 	hub := NewHub(cfg)

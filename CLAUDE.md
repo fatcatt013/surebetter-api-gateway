@@ -8,7 +8,7 @@ Go WebSocket gateway. Subscribes to `arb.opportunities` on NATS JetStream, maint
 
 ## Structure
 
-The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal, `bot.go`: bot agents' presence, orders, events and the `/api/me/bot*` routes, `bot_agents.go`: agent status and the Fleet list, `bot_logs.go`: agent logs, `bot_shots.go`: screenshots, `bot_prune.go`: 7-day retention, `bot_flows.go`: the agents' Flows, `bot_recordings.go`: each agent's mouse and typing recordings). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state, bot agents with their Flows, bot logs, bot settings, bot orders and the agents' recordings) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
+The hubs, WebSocket handling and routes live in `cmd/gateway/` (`main.go`, `auth.go`: who may open a socket, `conns.go`: open sockets per principal, `bot.go`: bot agents' presence, `GET /api/me/bot` and the `/api/me/bot*` routes, `bot_sched.go`: the order scheduler (checks, window pick and reservation, waiting, expiry, events, pause), `bot_day.go`: the Prague day and bookmaker labels, `bot_agents.go`: agent status and the Fleet list, `bot_logs.go`: agent logs, `bot_shots.go`: screenshots, `bot_prune.go`: 7-day retention, `bot_flows.go`: the agents' Flows, `bot_recordings.go`: each agent's mouse and typing recordings). `internal/accounts` holds accounts (SQLite: users, invites, sessions, reset codes, extension codes, per-user state, bot agents with their Flows, bot logs, bot settings, bot orders and the agents' recordings) and serves `/api/auth`, `/api/me`, `/api/admin`. `internal/telegram` is the Telegram bot.
 
 Key types in that file:
 - `Config` — env vars loaded at startup
@@ -17,7 +17,7 @@ Key types in that file:
 - `Client` — single WebSocket connection with a send channel
 - `ArbOpportunity` / `StakeAllocation` — mirrors the Rust arb-engine structs
 - `WSMessage` / `PatchOp` — WebSocket protocol types (RFC 6902 JSON Patch)
-- `botHub` (`bot.go`) — per user, the bot agents online (one socket per bot code: last status, busy order, idle since) and the sent orders (10 min), in memory; the agent registry and logs are in the accounts DB, screenshots in `bot-screenshots/` next to it
+- `botHub` (`bot.go`) — per user, the bot agents online (one socket per bot code: last status, windows, idle-since per window), the waiting and running orders (`botOrder`, `bot_sched.go`; reservations are derived from the running orders) and the cached settings, in memory; the agent registry, logs, settings and order history are in the accounts DB, screenshots in `bot-screenshots/` next to it
 
 ## Running & Building
 
@@ -55,11 +55,11 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 2. On each NATS message: RFC 6902 patch → `{"type":"patch","ops":[{"op":"replace","path":"/arb/{eventID}:{marketType}:{line:.2f}","value":{...}}]}`
 3. Keepalive: `{"type":"ping"}` every 20s (Chrome stops an idle extension service worker after 30 s)
 4. Bot presence changed: `{"type":"bot"}` to the user's non-bot `/ws` sockets when an agent's online state, books, dry run, busy, version, host name, windows or protocol change, not for CPU/RAM alone (the app re-fetches `GET /api/me/bot`)
-5. Bot order progress: `{"type":"botEvent","order_id","arb_key","event","bookmaker"?,"reason"?}` to the same sockets
+5. Bot order progress: `{"type":"botEvent","order_id","arb_key","event","bookmaker"?,"reason"?,"step"?}` to the same sockets: the agent's events (`accepted`, `leg_ready`, `leg_step` with `step`, `placed`, `stopped`, `outcome_unknown`) and the gateway's own (`waiting` with `reason`, `sent`, and the final ones it decides)
 
 `/ws?cid=<id>` tags a socket with a client id (max 64 chars, `[A-Za-z0-9_-]`); a `PUT /api/me/state/{key}` sent with the same `X-Client-Id` header skips that socket but notifies the user's other sockets (`{"type":"state","key":...}`). `/ws?feed=0` (arb `/ws` only) gets no snapshot or patches, just `state` messages and pings.
 
-`/ws?ticket=…&feed=0&bot=1` is the user's bot socket: only a ticket issued to a bot code (kind `bot`) may open it (403 otherwise); feed always off; one per bot code, several codes (agents) of one user may be online (a new socket with the same code closes the older one with 1000). It receives the orders the gateway picked its agent for (`{"type":"order","order":{…}}` from `POST /api/me/bot/orders`), `{"type":"recordings"}` when the app uploaded a recording for it, and never `bot`/`botEvent`.
+`/ws?ticket=…&feed=0&bot=1` is the user's bot socket: only a ticket issued to a bot code (kind `bot`) may open it (403 otherwise); feed always off; one per bot code, several codes (agents) of one user may be online (a new socket with the same code closes the older one with 1000). It receives the orders the gateway picked its agent for (`{"type":"order","order":{…,"dry_run","legs":[{…,"window_id"}]}}`, only when its last status said `proto` ≥ 2), `{"type":"pause"}` when the user is paused, `{"type":"recordings"}` when the app uploaded a recording for it, and never `bot`/`botEvent`.
 
 Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before broadcasting.
 
@@ -88,8 +88,8 @@ Patches are **batched** in a `BROADCAST_BATCH_MS` (default 50ms) window before b
 - One `writePump` goroutine per connected client (per-client send channel buffer: 64).
 - Two `sync.RWMutex` on `Hub`: one for the client map (`mu`), one for the odds state (`stateMu`). Keep locks short.
 - `connCount` and `msgSent` are `atomic.Int64` — no lock needed.
-- `botHub.mu` guards the agents' presence and the sent orders. The per-user log and screenshot rate limiters (`minuteLimiter`, `bot_logs.go`) have their own mutexes; `botHub.shotsMu` holds a user directory's size check through the screenshot write. `runPrune` (`bot_prune.go`) deletes logs and screenshots older than 7 days at start and hourly, and forgets expired orders every minute. An order's send to the bot socket happens under it (non-blocking); `bot`/`botEvent` sends to the app sockets happen after it is released.
-- An order queued in the microseconds between a bot socket's `writePump` exiting and its `detach` is lost, like on a TCP-dead socket; the app shows "Bot: offline".
+- `botHub.mu` guards the agents' presence, the waiting and running orders and the cached settings. A change collects its database writes, `botEvent`s and `{"type":"bot"}` notices in an `effects` and calls `release`, which takes `botHub.dbMu` before it lets go of `mu`: the writes of successive changes reach SQLite in order, and the app messages go out after both locks. Lock order is always `mu` → `dbMu` (the day-limit query takes `dbMu` under `mu` so it sees every earlier write). Settings are loaded into the cache (`loadSettings`) before `mu` is taken. The per-user log and screenshot rate limiters (`minuteLimiter`, `bot_logs.go`) have their own mutexes; `botHub.shotsMu` holds a user directory's size check through the screenshot write. `runPrune` (`bot_prune.go`) deletes logs and screenshots older than 7 days at start and hourly, and runs the scheduler's `tick` every second (expiry, waiting orders). Order and pause sends to a bot socket happen under `mu` (non-blocking).
+- An order queued in the microseconds between a bot socket's `writePump` exiting and its `detach` is lost, like on a TCP-dead socket; it ends `outcome_unknown` after 10 minutes (or `agent restarted` on the agent's next boot id).
 
 ## Production Image
 

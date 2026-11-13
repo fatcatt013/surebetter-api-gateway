@@ -123,48 +123,44 @@ func statusOf(in botStatusIn) botStatus {
 
 // setStatus stores an agent's last status in memory and its version, host name and windows in the
 // registry. The app is told ({"type":"bot"}) when books, dry run, version, host name, windows or
-// the protocol changed, not for cpu/mem alone. A status with a boot id other than the one the agent had when
-// it was sent a still running order (or with one when that was empty) means the agent process
-// restarted and can never report that order: the order ends as outcome_unknown ("agent
-// restarted"), relayed like a posted final event, and the agent is freed. A status without a boot
-// id ends nothing. false: codeID has no open bot socket.
+// the protocol changed, not for cpu/mem alone. A status with a boot id other than the one the agent
+// had when it was sent a still running order (or with one when that was empty) means the agent
+// process restarted and can never report that order: every such order ends outcome_unknown ("agent
+// restarted"), relayed like a posted final event. A status without a boot id ends nothing. Then the
+// waiting orders are retried. false: codeID has no open bot socket.
 func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
+	b.loadSettings(userID)
 	b.mu.Lock()
 	p := b.presenceLocked(userID, codeID)
 	if p == nil {
 		b.mu.Unlock()
 		return false
 	}
-	freed := b.pruneLocked()
+	fx := &effects{}
+	b.expireLocked(fx)
 	changed := p.dryRun != st.dryRun || !slices.Equal(p.books, st.books) || p.version != st.version ||
 		p.hostName != st.hostName || p.windowsJSON != st.windowsJSON || p.proto != st.proto
 	p.books, p.dryRun, p.version, p.hostName, p.windowsJSON = st.books, st.dryRun, st.version, st.hostName, st.windowsJSON
-	p.windows, p.proto = st.windows, st.proto
-	p.cpu, p.mem, p.boot = st.cpu, st.mem, st.boot
-	var ended []endedOrder
+	p.windows, p.proto, p.cpu, p.mem, p.boot = st.windows, st.proto, st.cpu, st.mem, st.boot
 	if st.boot != "" {
-		for id, o := range b.orders {
-			if o.userID == userID && o.codeID == codeID && o.boot != st.boot {
-				delete(b.orders, id)
-				ended = append(ended, endedOrder{id: id, arbKey: o.arbKey})
-				changed = b.freeLocked(userID, codeID, id) || changed
+		for _, o := range b.ordersLocked(userID, orderRunning) {
+			if o.codeID == codeID && o.boot != st.boot {
+				log.Warn().Int64("user", userID).Int64("code", codeID).Str("order_id", o.id).Msg("bot order ended: agent restarted")
+				b.endLocked(o, "outcome_unknown", "agent restarted", true, fx)
 			}
 		}
 	}
-	b.mu.Unlock()
-	b.notifyAll(freed)
-	for _, o := range ended {
-		log.Warn().Int64("user", userID).Int64("code", codeID).Str("order_id", o.id).Msg("bot order ended: agent restarted")
-		b.relayEvent(userID, o.arbKey, botEventIn{OrderID: o.id, Event: "outcome_unknown", Reason: "agent restarted"})
+	b.refreshIdleLocked(userID, codeID, p)
+	b.dispatchLocked(userID, fx)
+	if changed {
+		fx.notify(userID)
 	}
+	b.release(fx)
 	if b.acc != nil {
 		err := b.acc.SaveBotAgentStatus(userID, codeID, accounts.BotAgentStatus{Version: st.version, HostName: st.hostName, WindowsJSON: st.windowsJSON})
 		if err != nil {
 			log.Error().Err(err).Int64("code", codeID).Msg("bot agent status save failed")
 		}
-	}
-	if changed {
-		b.changed(userID)
 	}
 	return true
 }
@@ -209,7 +205,8 @@ func windowsOf(js string) []botWindow {
 // fleet lists userID's agents for the Fleet: every non-revoked bot code with a registry row,
 // online first, then by name. An online agent shows its last status from memory; an offline one
 // its stored version, host name and windows, each window down ("Agent offline"), cpu/mem null,
-// dry run, not busy. update: online and its last status (or none yet) is older than protocol 2.
+// dry run, not busy. busy: it runs an order (has reserved windows). update: online and its last
+// status (or none yet) is older than protocol 2.
 func (b *botHub) fleet(userID int64) ([]agentView, error) {
 	rows, err := b.acc.ListBotAgents(userID) // by name
 	if err != nil {
@@ -217,11 +214,13 @@ func (b *botHub) fleet(userID int64) ([]agentView, error) {
 	}
 	out := make([]agentView, 0, len(rows))
 	b.mu.Lock()
-	freed := b.pruneLocked()
+	fx := &effects{}
+	b.expireLocked(fx)
+	reserved := b.reservedLocked(userID)
 	for _, row := range rows {
 		v := agentView{ID: row.CodeID, Name: row.Name, LastSeen: row.LastSeenAt}
 		if p := b.presenceLocked(userID, row.CodeID); p != nil {
-			v.Online, v.DryRun, v.Busy, v.Version, v.Update = true, p.dryRun, p.busy != "", p.version, p.proto < botProto
+			v.Online, v.DryRun, v.Busy, v.Version, v.Update = true, p.dryRun, len(reserved[row.CodeID]) > 0, p.version, p.proto < botProto
 			v.Host = botHost{Name: p.hostName, CPU: p.cpu, Mem: p.mem}
 			v.Windows = windowsOf(p.windowsJSON)
 		} else {
@@ -233,8 +232,7 @@ func (b *botHub) fleet(userID int64) ([]agentView, error) {
 		}
 		out = append(out, v)
 	}
-	b.mu.Unlock()
-	b.notifyAll(freed)
+	b.release(fx)
 	slices.SortStableFunc(out, func(x, y agentView) int {
 		switch {
 		case x.Online == y.Online:

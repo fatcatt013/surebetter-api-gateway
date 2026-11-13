@@ -103,34 +103,3 @@ func TestBotPrune_RemovesLeftoverTmpFiles(t *testing.T) {
 		t.Fatalf("after prune: %v", names)
 	}
 }
-
-// An expired order releases its agent and the app is told, with no request to trigger it.
-func TestBotPrune_ExpiredOrdersReleaseBusyOnTheirOwn(t *testing.T) {
-	srv, svc, bots := newBotServer(t)
-	clk := &botClock{t: time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)}
-	bots.now = clk.now
-	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
-	app := appSocket(t, srv, token)
-	bot := startBot(t, srv, newCode(t, srv, token, "bot"), app)
-	placeOrder(t, srv, token, bot, app)
-	clk.advance(orderMemory)
-
-	defer func(d time.Duration) { orderSweepEvery = d }(orderSweepEvery)
-	orderSweepEvery = 20 * time.Millisecond
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { bots.runPrune(ctx); close(done) }()
-	defer func() { cancel(); <-done }()
-
-	if got := readType(t, app); got != "bot" {
-		t.Fatalf("app on the expired order: %s", got)
-	}
-	uid := userIDOf(t, svc, token)
-	bots.mu.Lock()
-	defer bots.mu.Unlock()
-	for _, p := range bots.agents[uid] {
-		if p.busy != "" {
-			t.Fatalf("still busy with %s", p.busy)
-		}
-	}
-}

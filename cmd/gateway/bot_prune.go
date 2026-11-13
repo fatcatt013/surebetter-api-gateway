@@ -15,9 +15,9 @@ import (
 // botRetention is how long bot log lines and screenshots are kept.
 const botRetention = 7 * 24 * time.Hour
 
-// orderSweepEvery is how often expired orders are forgotten without waiting for a request (a var so
-// a test can shorten it).
-var orderSweepEvery = time.Minute
+// orderSweepEvery is the scheduler's beat: waiting orders are retried and expired orders ended
+// without waiting for a request (a var so a test can shorten it).
+var orderSweepEvery = time.Second
 
 // shotTmpMaxAge is how old a screenshot's temporary file must be for prune to treat it as left over.
 const shotTmpMaxAge = 10 * time.Minute
@@ -75,16 +75,8 @@ func pruneFiles(dir string, cutoff, tmpCutoff time.Time) (int, error) {
 	return n, err
 }
 
-// expireOrders forgets expired orders now, so their agents are released and the app told
-// ({"type":"bot"}) without waiting for another request.
-func (b *botHub) expireOrders() {
-	b.mu.Lock()
-	freed := b.pruneLocked()
-	b.mu.Unlock()
-	b.notifyAll(freed)
-}
-
-// runPrune prunes once now, then every hour, and expires orders every orderSweepEvery, until ctx ends.
+// runPrune prunes once now, then every hour, and runs the scheduler's tick every orderSweepEvery,
+// until ctx ends.
 func (b *botHub) runPrune(ctx context.Context) {
 	b.prune()
 	tick := time.NewTicker(time.Hour)
@@ -98,7 +90,7 @@ func (b *botHub) runPrune(ctx context.Context) {
 		case <-tick.C:
 			b.prune()
 		case <-sweep.C:
-			b.expireOrders()
+			b.tick()
 		}
 	}
 }
