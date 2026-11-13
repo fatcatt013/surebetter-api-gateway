@@ -79,7 +79,10 @@ func (in botSettingsIn) apply(st accounts.BotSettings) (accounts.BotSettings, bo
 
 func (b *botHub) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	userID := principalOf(r).UserID
-	b.loadSettings(userID)
+	if err := b.loadSettings(userID); err != nil {
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	}
 	b.mu.Lock()
 	st := b.settingsLocked(userID)
 	b.mu.Unlock()
@@ -96,7 +99,10 @@ func (b *botHub) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := principalOf(r).UserID
-	b.loadSettings(userID)
+	if err := b.loadSettings(userID); err != nil { // never save over a row that could not be read
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	}
 	b.mu.Lock()
 	old := b.settingsLocked(userID)
 	st, ok := in.apply(old)

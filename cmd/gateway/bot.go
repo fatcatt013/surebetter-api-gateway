@@ -80,6 +80,10 @@ type botHub struct {
 	orders map[string]*botOrder             // order id → waiting or running order
 	// settings caches each user's bot settings (loaded by loadSettings before b.mu is taken).
 	settings map[int64]accounts.BotSettings
+	// memPause holds the reason of a pause decided while the user's settings could not be read: the
+	// user is paused in memory only (the stored row is never overwritten with the defaults); the
+	// next successful read applies it to the real settings and stores them.
+	memPause map[int64]string
 	commands map[string]*pendingCommand // window command id → the app request waiting for the agent's answer
 	// dbMu orders the database writes of the hub's changes: release takes it before it lets go of b.mu.
 	dbMu  sync.Mutex
@@ -92,7 +96,7 @@ type botHub struct {
 
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
 	return &botHub{reg: reg, acc: acc, now: time.Now, agents: map[int64]map[int64]*botPresence{}, orders: map[string]*botOrder{},
-		settings: map[int64]accounts.BotSettings{}, commands: map[string]*pendingCommand{},
+		settings: map[int64]accounts.BotSettings{}, memPause: map[int64]string{}, commands: map[string]*pendingCommand{},
 		logs: &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}}
 }
 

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"database/sql"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -172,4 +174,92 @@ func TestBotSettings_PauseReachesAnAgentThatReconnects(t *testing.T) {
 		t.Fatalf("second status: %d %s", s, b)
 	}
 	expectNoMessage(t, bot, "the agent on its second status")
+}
+
+// breakSettingsRead stores userID's settings with maxLeg 500 and then a dry_run value the read
+// cannot scan: reading fails while an UPSERT would still overwrite the row.
+func breakSettingsRead(t *testing.T, svc *accounts.Service, db *sql.DB, userID int64, paused bool) {
+	t.Helper()
+	st := accounts.DefaultBotSettings()
+	st.MaxLeg, st.Paused = 500, paused
+	if paused {
+		st.PausedReason = "Paused"
+	}
+	if err := svc.SaveBotSettings(userID, st); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE bot_settings SET dry_run = 'abc' WHERE user_id = ?`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BotSettings(userID); err == nil {
+		t.Fatal("the read must fail")
+	}
+}
+
+// settingsRow reads the stored row as text: dry_run, paused, paused_reason, max_leg.
+func settingsRow(t *testing.T, db *sql.DB, userID int64) string {
+	t.Helper()
+	var dryRun, reason string
+	var paused, maxLeg int64
+	if err := db.QueryRow(`SELECT CAST(dry_run AS TEXT), paused, paused_reason, max_leg FROM bot_settings WHERE user_id = ?`, userID).
+		Scan(&dryRun, &paused, &reason, &maxLeg); err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("%s/%d/%s/%d", dryRun, paused, reason, maxLeg)
+}
+
+// A settings read that fails is never replaced by the defaults: GET and PUT answer 500 and the
+// stored row stays as it was; a new order is refused too.
+func TestBotSettings_ReadFailureNeverSavesDefaults(t *testing.T) {
+	srv, svc, _, db := newBotServerDB(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	breakSettingsRead(t, svc, db, uid, true)
+	for _, body := range []string{`{"limits":{"maxOrder":100}}`, `{"paused":false}`} {
+		if s, b := putSettings(t, srv, token, body); s != 500 || !strings.Contains(b, `"internal"`) {
+			t.Fatalf("PUT %s: %d %s, want 500 internal", body, s, b)
+		}
+	}
+	if s, b := request(t, srv, "GET", "/api/me/bot/settings", token, "", nil); s != 500 || !strings.Contains(b, `"internal"`) {
+		t.Fatalf("GET: %d %s, want 500 internal", s, b)
+	}
+	if s, b := postOrder(t, srv, token, tipBetOrder("arb-1")); s != 500 || !strings.Contains(b, `"internal"`) {
+		t.Fatalf("order: %d %s, want 500 internal", s, b)
+	}
+	if got := settingsRow(t, db, uid); got != "abc/1/Paused/500" {
+		t.Fatalf("stored row changed: %s", got)
+	}
+}
+
+// An automatic pause while the settings cannot be read pauses in memory only; once the row reads
+// again, the pause is applied to the real settings (not the defaults) and stored.
+func TestBotSettings_AutoPauseWithUnreadableSettingsKeepsTheRow(t *testing.T) {
+	srv, svc, bots, db := newBotServerDB(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	breakSettingsRead(t, svc, db, uid, false)
+	if err := svc.InsertBotOrder(accounts.BotOrderRow{ID: "00000000000000b2", UserID: uid, ArbKey: "k", State: "waiting", DryRun: true, Stake: 1,
+		InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.MarkBotOrderSent("00000000000000b2", 0, true, "[]", 2); err != nil {
+		t.Fatal(err)
+	}
+	bots.recoverOrders()
+	if got := settingsRow(t, db, uid); got != "abc/0//500" {
+		t.Fatalf("stored row overwritten: %s", got)
+	}
+	if v := getView(t, srv, token); !v.Paused || v.PausedReason != "Outcome unknown · order 00000000" {
+		t.Fatalf("in memory: %+v, want paused", v)
+	}
+	if _, err := db.Exec(`UPDATE bot_settings SET dry_run = 1 WHERE user_id = ?`, uid); err != nil {
+		t.Fatal(err)
+	}
+	s, b := request(t, srv, "GET", "/api/me/bot/settings", token, "", nil)
+	if s != 200 || !strings.Contains(b, `"paused":true,"pausedReason":"Outcome unknown · order 00000000"`) || !strings.Contains(b, `"maxLeg":500`) {
+		t.Fatalf("GET after the row reads again: %d %s", s, b)
+	}
+	if got := settingsRow(t, db, uid); got != "1/1/Outcome unknown · order 00000000/500" {
+		t.Fatalf("stored row: %s", got)
+	}
 }

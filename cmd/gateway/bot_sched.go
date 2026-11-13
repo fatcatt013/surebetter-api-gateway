@@ -144,36 +144,54 @@ func (b *botHub) release(fx *effects) {
 	}
 }
 
-// loadSettings caches userID's settings (call without b.mu). A database error leaves them
-// uncached: settingsLocked then answers the defaults (dry run).
-func (b *botHub) loadSettings(userID int64) {
+// loadSettings caches userID's settings (call without b.mu). A database error is returned and
+// leaves them uncached: they are never replaced by the defaults (a settings PUT answers 500, a new
+// order is refused). A pause decided while they were unreadable (memPause) is applied to the
+// settings read here and stored.
+func (b *botHub) loadSettings(userID int64) error {
 	b.mu.Lock()
 	_, ok := b.settings[userID]
 	b.mu.Unlock()
 	if ok {
-		return
+		return nil
 	}
 	st := accounts.DefaultBotSettings()
 	if b.acc != nil {
 		var err error
 		if st, err = b.acc.BotSettings(userID); err != nil {
 			log.Error().Err(err).Int64("user", userID).Msg("bot settings read failed")
-			return
+			return err
 		}
 	}
 	b.mu.Lock()
-	if _, ok := b.settings[userID]; !ok {
+	if _, ok := b.settings[userID]; ok {
+		b.mu.Unlock()
+		return nil
+	}
+	fx := &effects{}
+	if reason, ok := b.memPause[userID]; ok {
+		delete(b.memPause, userID)
+		st.Paused, st.PausedReason = true, reason
+		b.saveSettingsLocked(userID, st, fx)
+		log.Warn().Int64("user", userID).Str("reason", reason).Msg("bots pause stored once the settings could be read")
+	} else {
 		b.settings[userID] = st
 	}
-	b.mu.Unlock()
+	b.release(fx)
+	return nil
 }
 
-// settingsLocked is userID's cached settings, or the defaults. b.mu must be held.
+// settingsLocked is userID's cached settings, or the defaults with a pause decided in memory while
+// they were unreadable (memPause). b.mu must be held.
 func (b *botHub) settingsLocked(userID int64) accounts.BotSettings {
 	if st, ok := b.settings[userID]; ok {
 		return st
 	}
-	return accounts.DefaultBotSettings()
+	st := accounts.DefaultBotSettings()
+	if reason, ok := b.memPause[userID]; ok {
+		st.Paused, st.PausedReason = true, reason
+	}
+	return st
 }
 
 // saveSettingsLocked caches st and queues its write. b.mu must be held.
@@ -238,7 +256,9 @@ type submitted struct {
 // submit takes a valid order: the checks (paused, same arb key, limits, agents) in the contract's
 // order, then the row, then it goes now or waits.
 func (b *botHub) submit(userID int64, in botOrderIn) (submitted, error) {
-	b.loadSettings(userID)
+	if err := b.loadSettings(userID); err != nil {
+		return submitted{}, err // never decided on the defaults
+	}
 	b.mu.Lock()
 	fx := &effects{}
 	b.expireLocked(fx)
@@ -612,11 +632,16 @@ var pauseMsg = []byte(`{"type":"pause"}`)
 
 // pauseLocked pauses userID with reason: the setting is saved, every waiting order ends stopped ·
 // "Paused", and each protocol-2 agent socket gets {"type":"pause"} (the agent stops the pairs that
-// have not committed). New orders are refused while paused. b.mu must be held.
+// have not committed). New orders are refused while paused. Settings that could not be read are
+// not overwritten: the pause is kept in memory (memPause) until they can. b.mu must be held.
 func (b *botHub) pauseLocked(userID int64, reason string, fx *effects) {
-	st := b.settingsLocked(userID)
-	st.Paused, st.PausedReason = true, reason
-	b.saveSettingsLocked(userID, st, fx)
+	if st, ok := b.settings[userID]; ok {
+		st.Paused, st.PausedReason = true, reason
+		b.saveSettingsLocked(userID, st, fx)
+	} else {
+		b.memPause[userID] = reason
+		log.Warn().Int64("user", userID).Str("reason", reason).Msg("bots paused in memory only: settings unreadable")
+	}
 	for _, o := range b.ordersLocked(userID, orderWaiting) {
 		b.endLocked(o, "stopped", "Paused", true, fx)
 	}
