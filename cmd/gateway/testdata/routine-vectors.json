@@ -1,0 +1,107 @@
+{
+  "_comment": "Shared test vectors for the bot routine (human mode Phase A contract §2). Canonical copy; the gateway, the agent and the app copy this file byte for byte into their tests. 'at' is an instant; resolution uses the Europe/Prague wall clock of that instant.",
+  "base": {
+    "version": 1,
+    "tz": "Europe/Prague",
+    "sleep": [
+      {"days": [1, 2, 3, 4, 5], "from": "23:30", "to": "08:00"},
+      {"days": [6, 7], "from": "23:00", "to": "10:00"}
+    ],
+    "windows": {
+      "tipsport-1": {"blocks": [
+        {"id": "b1", "days": [1, 2, 3, 4, 5], "from": "08:00", "to": "09:00", "activity": "prematch", "sport": "football"},
+        {"id": "b2", "days": [1, 2, 3, 4, 5], "from": "12:00", "to": "14:30", "activity": "live", "sport": "tennis"},
+        {"id": "b3", "days": [1, 2, 3, 4, 5], "from": "21:00", "to": "22:00", "activity": "community"},
+        {"id": "b4", "days": [6], "from": "10:00", "to": "10:30", "activity": "mybets"},
+        {"id": "b5", "days": [7], "from": "22:00", "to": "24:00", "activity": "inactive"}
+      ]},
+      "fortuna-1": {"blocks": [
+        {"id": "b1", "days": [2], "from": "10:00", "to": "11:00", "activity": "mybets"}
+      ]}
+    },
+    "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}
+  },
+  "resolve": [
+    {"name": "human mode off", "humanMode": false, "routine": "base", "window": "tipsport-1", "at": "2026-11-17T08:30:00+01:00", "expect": {"activity": "open"}},
+    {"name": "no routine", "humanMode": true, "routine": null, "window": "tipsport-1", "at": "2026-11-17T08:30:00+01:00", "expect": {"activity": "open"}},
+    {"name": "block", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-17T08:30:00+01:00", "expect": {"activity": "prematch", "sport": "football"}},
+    {"name": "block from is inclusive, sleep to is exclusive", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-17T08:00:00+01:00", "expect": {"activity": "prematch", "sport": "football"}},
+    {"name": "block to is exclusive", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-17T09:00:00+01:00", "expect": {"activity": "open"}},
+    {"name": "weekday sleep crossing midnight", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-17T07:59:00+01:00", "expect": {"activity": "inactive", "reason": "sleep"}},
+    {"name": "Sunday sleep runs into Monday and beats a block", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-16T08:30:00+01:00", "expect": {"activity": "inactive", "reason": "sleep"}},
+    {"name": "Sunday sleep ends Monday 10:00", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-16T10:00:00+01:00", "expect": {"activity": "open"}},
+    {"name": "sleep start is inclusive", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-17T23:30:00+01:00", "expect": {"activity": "inactive", "reason": "sleep"}},
+    {"name": "sleep covers every window", "humanMode": true, "routine": "base", "window": "betano-1", "at": "2026-11-17T23:45:00+01:00", "expect": {"activity": "inactive", "reason": "sleep"}},
+    {"name": "Saturday block", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-21T10:15:00+01:00", "expect": {"activity": "mybets"}},
+    {"name": "Saturday morning after Friday's sleep", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-21T09:00:00+01:00", "expect": {"activity": "open"}},
+    {"name": "Saturday's own sleep", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-21T23:30:00+01:00", "expect": {"activity": "inactive", "reason": "sleep"}},
+    {"name": "inactive block", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-22T22:30:00+01:00", "expect": {"activity": "inactive", "reason": "inactive"}},
+    {"name": "sleep beats an inactive block", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-22T23:30:00+01:00", "expect": {"activity": "inactive", "reason": "sleep"}},
+    {"name": "block of another window", "humanMode": true, "routine": "base", "window": "fortuna-1", "at": "2026-11-17T10:15:00+01:00", "expect": {"activity": "mybets"}},
+    {"name": "window without blocks", "humanMode": true, "routine": "base", "window": "betano-1", "at": "2026-11-17T12:00:00+01:00", "expect": {"activity": "open"}},
+    {"name": "live block end", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-18T14:29:00+01:00", "expect": {"activity": "live", "sport": "tennis"}},
+    {"name": "live block end exclusive", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-18T14:30:00+01:00", "expect": {"activity": "open"}},
+    {"name": "UTC instant in winter (CET)", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2026-11-17T07:30:00Z", "expect": {"activity": "prematch", "sport": "football"}},
+    {"name": "UTC instant in summer (CEST)", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2027-06-15T06:30:00Z", "expect": {"activity": "prematch", "sport": "football"}},
+    {"name": "after the spring clock change", "humanMode": true, "routine": "base", "window": "tipsport-1", "at": "2027-03-30T08:30:00+02:00", "expect": {"activity": "prematch", "sport": "football"}}
+  ],
+  "valid": [
+    {"name": "base", "routine": "base"},
+    {"name": "touching blocks", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1], "from": "08:00", "to": "09:00", "activity": "mybets"},
+      {"id": "b", "days": [1], "from": "09:00", "to": "10:00", "activity": "live", "sport": "any"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": false, "minMin": 1, "maxMin": 60}}}},
+    {"name": "same times on different days", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1, 2], "from": "08:00", "to": "09:00", "activity": "open"},
+      {"id": "b", "days": [3], "from": "08:00", "to": "09:00", "activity": "inactive"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 3, "maxMin": 3}}}},
+    {"name": "no windows, sleep to midnight", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [{"days": [7], "from": "22:00", "to": "24:00"}], "windows": {}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}}
+  ],
+  "invalid": [
+    {"name": "overlapping blocks on a shared day", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1], "from": "08:00", "to": "09:00", "activity": "mybets"},
+      {"id": "b", "days": [1, 2], "from": "08:30", "to": "10:00", "activity": "open"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "from not before to", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1], "from": "09:00", "to": "09:00", "activity": "mybets"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "to after 24:00", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1], "from": "23:00", "to": "24:30", "activity": "mybets"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "malformed time", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1], "from": "8:00", "to": "09:00", "activity": "mybets"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "day 0", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [0], "from": "08:00", "to": "09:00", "activity": "mybets"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "no days", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [], "from": "08:00", "to": "09:00", "activity": "mybets"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "repeated day", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1, 1], "from": "08:00", "to": "09:00", "activity": "mybets"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "unknown activity", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1], "from": "08:00", "to": "09:00", "activity": "bet"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "sport on mybets", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1], "from": "08:00", "to": "09:00", "activity": "mybets", "sport": "football"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "prematch without sport", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1], "from": "08:00", "to": "09:00", "activity": "prematch"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "bad block id", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "B1", "days": [1], "from": "08:00", "to": "09:00", "activity": "mybets"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "duplicate block id", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"tipsport-1": {"blocks": [
+      {"id": "a", "days": [1], "from": "08:00", "to": "09:00", "activity": "mybets"},
+      {"id": "a", "days": [2], "from": "08:00", "to": "09:00", "activity": "mybets"}
+    ]}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "bad window id", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {"Tipsport 1": {"blocks": []}}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "minMin above maxMin", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 6, "maxMin": 5}}}},
+    {"name": "maxMin above 60", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 61}}}},
+    {"name": "version 2", "routine": {"version": 2, "tz": "Europe/Prague", "sleep": [], "windows": {}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "other zone", "routine": {"version": 1, "tz": "UTC", "sleep": [], "windows": {}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "sleep from equals to", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [{"days": [1], "from": "23:00", "to": "23:00"}], "windows": {}, "triggers": {"afterBetCheckMyBets": {"on": true, "minMin": 2, "maxMin": 5}}}},
+    {"name": "missing triggers", "routine": {"version": 1, "tz": "Europe/Prague", "sleep": [], "windows": {}}}
+  ]
+}
