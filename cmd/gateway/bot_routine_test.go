@@ -3,10 +3,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/surebetter/api-gateway/internal/accounts"
 )
 
 // routineVectors is testdata/routine-vectors.json, a byte-for-byte copy of the shared vectors
@@ -268,5 +271,188 @@ func TestRoutine_Encoding(t *testing.T) {
 		`{"id":"b","days":[2],"from":"08:00","to":"09:00","activity":"open"}]},"w2":{"blocks":[]}},"triggers":{"afterBetCheckMyBets":{"on":true,"minMin":2,"maxMin":5}}}`
 	if got := mustJSON(r); got != want {
 		t.Fatalf("encoded:\n got %s\nwant %s", got, want)
+	}
+}
+
+func routinePath(agent int64) string { return fmt.Sprintf("/api/me/bot/agents/%d/routine", agent) }
+
+// routineRequest is request with the body's trailing newline trimmed.
+func routineRequest(t *testing.T, srv *httptest.Server, method, path, token, body string) (int, string) {
+	t.Helper()
+	s, b := request(t, srv, method, path, token, body, nil)
+	return s, strings.TrimSpace(b)
+}
+
+// tipBetIdleP4 is a protocol-4 status with tipsport-1 and betano-1 idle.
+var tipBetIdleP4 = strings.Replace(tipBetIdle, `"proto":2`, `"proto":4`, 1)
+
+func TestBotRoutine_GetPut(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code, id := newBotCode(t, srv, token, "Home PC")
+	_, neverID := newBotCode(t, srv, token, "Never connected")
+	_, otherID := newBotCode(t, srv, newUser(t, svc, "o@example.com", accounts.RoleUser), "Other")
+	startBot(t, srv, code, app)
+	v := loadRoutineVectors(t)
+
+	if s, b := routineRequest(t, srv, "GET", routinePath(id), token, ""); s != 200 || b != `{"humanMode":false,"routine":null}` {
+		t.Fatalf("new agent: %d %s", s, b)
+	}
+	r, _ := routineOf(v.Base)
+	want := `{"humanMode":true,"routine":` + mustJSON(r) + `}`
+	if s, b := routineRequest(t, srv, "PUT", routinePath(id), token, `{"humanMode":true,"routine":`+string(v.Base)+`}`); s != 200 || b != want {
+		t.Fatalf("PUT base: %d %s", s, b)
+	}
+	if s, b := routineRequest(t, srv, "GET", routinePath(id), token, ""); s != 200 || b != want {
+		t.Fatalf("GET after PUT: %d %s", s, b)
+	}
+	expectNoMessage(t, app, "app (a routine change sends nothing to the app)")
+	for _, c := range v.Valid {
+		if s, b := routineRequest(t, srv, "PUT", routinePath(id), token, `{"humanMode":false,"routine":`+string(v.routineJSON(c.Routine))+`}`); s != 200 {
+			t.Errorf("valid %q: %d %s", c.Name, s, b)
+		}
+	}
+	// A null routine is stored as none; the switch stays as sent.
+	if s, b := routineRequest(t, srv, "PUT", routinePath(id), token, `{"humanMode":true,"routine":null}`); s != 200 || b != `{"humanMode":true,"routine":null}` {
+		t.Fatalf("PUT null: %d %s", s, b)
+	}
+	if s, b := routineRequest(t, srv, "GET", routinePath(id), token, ""); b != `{"humanMode":true,"routine":null}` {
+		t.Fatalf("GET after null: %d %s", s, b)
+	}
+
+	bad := map[string]string{
+		"not JSON":         `{"humanMode":true`,
+		"no humanMode":     `{"routine":null}`,
+		"humanMode null":   `{"humanMode":null,"routine":null}`,
+		"humanMode string": `{"humanMode":"true","routine":null}`,
+		"no routine":       `{"humanMode":true}`,
+		"routine an array": `{"humanMode":true,"routine":[]}`,
+		"over 256 KiB":     `{"humanMode":true,"routine":null,"pad":"` + strings.Repeat("x", 256<<10) + `"}`,
+	}
+	for _, c := range v.Invalid {
+		bad["invalid vector "+c.Name] = `{"humanMode":true,"routine":` + string(c.Routine) + `}`
+	}
+	for name, body := range bad {
+		if s, b := request(t, srv, "PUT", routinePath(id), token, body, nil); s != 400 || !strings.Contains(b, `"bad_routine"`) {
+			t.Errorf("%s: %d %.100s, want 400 bad_routine", name, s, b)
+		}
+	}
+	if _, b := routineRequest(t, srv, "GET", routinePath(id), token, ""); b != `{"humanMode":true,"routine":null}` {
+		t.Fatalf("changed by a refused PUT: %s", b)
+	}
+	// At 256 KiB: accepted (the limit is the whole body).
+	pad := 256<<10 - len(`{"humanMode":true,"routine":null,"pad":""}`)
+	if s, b := request(t, srv, "PUT", routinePath(id), token, `{"humanMode":true,"routine":null,"pad":"`+strings.Repeat("x", pad)+`"}`, nil); s != 200 {
+		t.Fatalf("256 KiB: %d %.100s", s, b)
+	}
+
+	// Not the user's agent, a code that never connected, or no number: 404 unknown_agent.
+	for _, path := range []string{routinePath(otherID), routinePath(neverID), "/api/me/bot/agents/home/routine"} {
+		for _, method := range []string{"GET", "PUT"} {
+			if s, b := request(t, srv, method, path, token, `{"humanMode":false,"routine":null}`, nil); s != 404 || !strings.Contains(b, `"unknown_agent"`) {
+				t.Errorf("%s %s: %d %s, want 404 unknown_agent", method, path, s, b)
+			}
+		}
+	}
+	// A session only; PUT behind CSRF.
+	if s, b := request(t, srv, "GET", routinePath(id), "", "", bearer(code)); s != 403 || !strings.Contains(b, `"session_required"`) {
+		t.Fatalf("GET with a bot code: %d %s", s, b)
+	}
+	if s, b := request(t, srv, "PUT", routinePath(id), token, `{"humanMode":false,"routine":null}`, map[string]string{"Origin": "http://evil.example"}); s != 403 ||
+		!strings.Contains(b, `"bad_origin"`) {
+		t.Fatalf("cross-site PUT: %d %s", s, b)
+	}
+}
+
+// {"type":"routine"} goes to the agent's bot socket after a PUT, only when it speaks protocol 4.
+func TestBotRoutine_MessageOnlyToProto4(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	oldCode, oldID := newBotCode(t, srv, token, "Old PC")
+	code, id := newBotCode(t, srv, token, "Home PC")
+	old := startAgentWith(t, srv, oldCode, tipBetIdleP3, app)
+	bot := startAgentWith(t, srv, code, tipBetIdleP4, app)
+
+	body := `{"humanMode":true,"routine":null}`
+	if s, b := request(t, srv, "PUT", routinePath(oldID), token, body, nil); s != 200 {
+		t.Fatalf("PUT old: %d %s", s, b)
+	}
+	if s, b := request(t, srv, "PUT", routinePath(id), token, body, nil); s != 200 {
+		t.Fatalf("PUT: %d %s", s, b)
+	}
+	if got := readType(t, bot); got != "routine" {
+		t.Fatalf("protocol-4 agent got %s, want routine", got)
+	}
+	// expectNoMessage closes the socket it waited on (nhooyr closes a connection whose read is
+	// cancelled), and an agent's close tells the app: the app goes first.
+	expectNoMessage(t, app, "app")
+	expectNoMessage(t, old, "protocol-3 agent")
+	expectNoMessage(t, bot, "protocol-4 agent after its one message")
+}
+
+// GET /api/me/bot/routine is the calling agent's own routine plus the ids of its orders the user
+// marked checked that ended within the last 30 days.
+func TestBotRoutine_Own(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	clk := &botClock{t: time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	app := appSocket(t, srv, token)
+	code, id := newBotCode(t, srv, token, "Home PC")
+	vps, vpsID := newBotCode(t, srv, token, "VPS")
+	startAgentWith(t, srv, code, tipBetIdleP4, app)
+	startAgentWith(t, srv, vps, tipBetIdleP4, app)
+
+	own := func(code string) (int, string) {
+		t.Helper()
+		s, b := request(t, srv, "GET", "/api/me/bot/routine", "", "", bearer(code))
+		return s, strings.TrimSpace(b)
+	}
+	if s, b := own(code); s != 200 || b != `{"humanMode":false,"routine":null,"checked":[]}` {
+		t.Fatalf("new agent: %d %s", s, b)
+	}
+	v := loadRoutineVectors(t)
+	r, _ := routineOf(v.Base)
+	if s, b := request(t, srv, "PUT", routinePath(id), token, `{"humanMode":true,"routine":`+string(v.Base)+`}`, nil); s != 200 {
+		t.Fatalf("PUT: %d %s", s, b)
+	}
+	now := clk.now().UnixMilli()
+	day := int64(24 * 60 * 60 * 1000)
+	ended := func(orderID string, codeID, endedAt int64, checked bool) {
+		t.Helper()
+		if err := svc.InsertBotOrder(accounts.BotOrderRow{ID: orderID, UserID: uid, ArbKey: orderID, State: "waiting", InfoJSON: "{}", LegsJSON: "[]",
+			CreatedAt: endedAt - 1000}); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.MarkBotOrderSent(orderID, codeID, false, "[]", endedAt-500); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.EndBotOrder(orderID, "outcome_unknown", "", "[]", 0, endedAt); err != nil {
+			t.Fatal(err)
+		}
+		if checked {
+			if _, err := svc.MarkBotOrderChecked(uid, orderID, now); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	ended("00000000000000a1", id, now-day, true)
+	ended("00000000000000a2", id, now-30*day, true)   // the 30-day edge: in
+	ended("00000000000000a3", id, now-30*day-1, true) // just older: out
+	ended("00000000000000a4", id, now-day, false)     // not checked
+	ended("00000000000000a5", vpsID, now-day, true)   // another agent's
+	want := `{"humanMode":true,"routine":` + mustJSON(r) + `,"checked":["00000000000000a1","00000000000000a2"]}`
+	if s, b := own(code); s != 200 || b != want {
+		t.Fatalf("own:\n got %d %s\nwant %s", s, b, want)
+	}
+	if s, b := own(vps); s != 200 || b != `{"humanMode":false,"routine":null,"checked":["00000000000000a5"]}` {
+		t.Fatalf("vps: %d %s", s, b)
+	}
+	// A bot code only.
+	if s, b := request(t, srv, "GET", "/api/me/bot/routine", token, "", nil); s != 403 || !strings.Contains(b, `"bot_code_required"`) {
+		t.Fatalf("with a session: %d %s", s, b)
 	}
 }

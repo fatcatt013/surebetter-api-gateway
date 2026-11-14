@@ -1,8 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"net/http"
 	"regexp"
+	"time"
+
+	"github.com/rs/zerolog/log"
+
+	"github.com/surebetter/api-gateway/internal/accounts"
 )
 
 // Human mode Phase A (contract 2026-11-14-bot-human-mode-a-contract.md §2, §3): each agent's
@@ -160,4 +167,126 @@ func routineOf(raw []byte) (*routine, bool) {
 		}
 	}
 	return &r, true
+}
+
+// humanProto is the agent protocol that runs a routine: only such an agent gets {"type":"routine"}.
+const humanProto = 4
+
+// routineMsg tells an agent to re-read GET /api/me/bot/routine.
+var routineMsg = []byte(`{"type":"routine"}`)
+
+// checkedWindow is how far back GET /api/me/bot/routine lists checked orders (by their end).
+const checkedWindow = 30 * 24 * time.Hour
+
+// sendRoutineLocked sends {"type":"routine"} to agent codeID's bot socket when it is online with
+// protocol 4 or later. b.mu must be held.
+func (b *botHub) sendRoutineLocked(userID, codeID int64) {
+	if p := b.presenceLocked(userID, codeID); p != nil && p.proto >= humanProto {
+		p.client.trySend(routineMsg)
+	}
+}
+
+// routineView is the GET and PUT /api/me/bot/agents/{agentId}/routine body; routine null = none.
+type routineView struct {
+	HumanMode bool            `json:"humanMode"`
+	Routine   json.RawMessage `json:"routine"`
+}
+
+// routineJSONOf is a stored routine as the API answers it: "" → null.
+func routineJSONOf(stored string) json.RawMessage {
+	if stored == "" {
+		return json.RawMessage("null")
+	}
+	return json.RawMessage(stored)
+}
+
+// handleGetRoutine is GET /api/me/bot/agents/{agentId}/routine: {"humanMode", "routine"}. 404
+// unknown_agent: not one of the user's agents (a bot code that never connected has none).
+func (b *botHub) handleGetRoutine(w http.ResponseWriter, r *http.Request) {
+	codeID, ok := b.limitAgent(w, r)
+	if !ok {
+		return
+	}
+	js, on, found, err := b.acc.BotAgentRoutine(principalOf(r).UserID, codeID)
+	if err != nil {
+		log.Error().Err(err).Msg("bot routine read failed")
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if !found {
+		accounts.WriteError(w, http.StatusNotFound, "unknown_agent")
+		return
+	}
+	accounts.WriteJSON(w, http.StatusOK, routineView{HumanMode: on, Routine: routineJSONOf(js)})
+}
+
+// handlePutRoutine is PUT /api/me/bot/agents/{agentId}/routine {"humanMode", "routine"}: it replaces
+// both (routine null = none), answers them as stored, and tells the agent ({"type":"routine"}) when
+// it is online with protocol 4. 400 bad_routine: not that shape, a body over 256 KiB or a routine
+// routineOf refuses; 404 unknown_agent.
+func (b *botHub) handlePutRoutine(w http.ResponseWriter, r *http.Request) {
+	codeID, ok := agentParam(r)
+	if !ok {
+		accounts.WriteError(w, http.StatusNotFound, "unknown_agent")
+		return
+	}
+	var in struct {
+		HumanMode *bool           `json:"humanMode"`
+		Routine   json.RawMessage `json:"routine"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRoutineBody)).Decode(&in); err != nil || in.HumanMode == nil || in.Routine == nil {
+		accounts.WriteError(w, http.StatusBadRequest, "bad_routine")
+		return
+	}
+	stored := ""
+	if !bytes.Equal(in.Routine, []byte("null")) {
+		rt, valid := routineOf(in.Routine)
+		if !valid {
+			accounts.WriteError(w, http.StatusBadRequest, "bad_routine")
+			return
+		}
+		stored = mustJSON(rt)
+	}
+	if codeID, ok = b.limitAgent(w, r); !ok {
+		return
+	}
+	userID := principalOf(r).UserID
+	found, err := b.acc.SaveBotAgentRoutine(userID, codeID, stored, *in.HumanMode)
+	if err != nil {
+		log.Error().Err(err).Msg("bot routine save failed")
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if !found {
+		accounts.WriteError(w, http.StatusNotFound, "unknown_agent")
+		return
+	}
+	b.mu.Lock()
+	b.sendRoutineLocked(userID, codeID)
+	b.mu.Unlock()
+	accounts.WriteJSON(w, http.StatusOK, routineView{HumanMode: *in.HumanMode, Routine: routineJSONOf(stored)})
+}
+
+// ownRoutineView is the GET /api/me/bot/routine body.
+type ownRoutineView struct {
+	routineView
+	Checked []string `json:"checked"`
+}
+
+// handleOwnRoutine is GET /api/me/bot/routine for the calling agent: its human-mode switch and
+// routine (off and null when it has no agent row yet) and the ids of its orders the user marked
+// checked that ended within the last 30 days.
+func (b *botHub) handleOwnRoutine(w http.ResponseWriter, r *http.Request) {
+	p := principalOf(r)
+	js, on, _, err := b.acc.BotAgentRoutine(p.UserID, p.CodeID)
+	var checked []string
+	if err == nil {
+		checked, err = b.acc.CheckedBotOrderIDs(p.UserID, p.CodeID, b.now().Add(-checkedWindow).UnixMilli())
+	}
+	if err != nil {
+		log.Error().Err(err).Int64("code", p.CodeID).Msg("bot own routine read failed")
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	accounts.WriteJSON(w, http.StatusOK, ownRoutineView{routineView{HumanMode: on, Routine: routineJSONOf(js)}, checked})
 }
