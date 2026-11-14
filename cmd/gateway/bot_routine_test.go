@@ -436,7 +436,7 @@ func TestBotRoutine_Own(t *testing.T) {
 			CreatedAt: endedAt - 1000}); err != nil {
 			t.Fatal(err)
 		}
-		if err := svc.MarkBotOrderSent(orderID, codeID, false, "[]", endedAt-500); err != nil {
+		if err := svc.MarkBotOrderSent(orderID, codeID, false, "strict", "[]", endedAt-500); err != nil {
 			t.Fatal(err)
 		}
 		if err := svc.EndBotOrder(orderID, "outcome_unknown", "", "[]", 0, endedAt); err != nil {

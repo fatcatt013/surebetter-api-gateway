@@ -48,8 +48,19 @@ type botLeg struct {
 	LimitLevel *int `json:"limit_level,omitempty"`
 }
 
+// botBankroll is the app's bankroll settings when the owner sent the order (odds drop), passed to the
+// agent as received: with odds drop "rearb" it sizes the stakes again from them.
+type botBankroll struct {
+	Mode       string  `json:"mode"`        // "split" or "maxleg"
+	Total      float64 `json:"total"`       // Kč, split mode
+	MaxLeg     float64 `json:"max_leg"`     // Kč, maxleg mode
+	AnchorBook *string `json:"anchor_book"` // maxleg: the bookmaker that gets max_leg; null = the favourite
+	Rounding   int     `json:"rounding"`    // 1, 10 or 100
+}
+
 // botOrderIn is the POST /api/me/bot/orders body. match, market, live and profit_pct are for display
-// only; market_type, line, is_live, sport and rounding go to the agent (its rules), all optional.
+// only; market_type, line, is_live, sport and rounding go to the agent (its rules), all optional;
+// min_profit_pct and bankroll go to the agent too (odds drop), optional.
 type botOrderIn struct {
 	ArbKey     string   `json:"arb_key"`
 	Legs       []botLeg `json:"legs"`
@@ -62,6 +73,10 @@ type botOrderIn struct {
 	IsLive     bool     `json:"is_live"`
 	Sport      string   `json:"sport"`
 	Rounding   *int     `json:"rounding"` // 1, 10 or 100; nil = 1
+	// MinProfitPct is the profit % the order must keep when the odds drop (the app's filter minimum,
+	// else 2); nil = none (an older app: the order goes strict).
+	MinProfitPct *float64     `json:"min_profit_pct"`
+	Bankroll     *botBankroll `json:"bankroll"` // nil = none (an older app: the order goes strict)
 }
 
 // agentLeg is a leg as the agent receives it: the app's leg plus the window the gateway reserved.
@@ -71,7 +86,8 @@ type agentLeg struct {
 }
 
 // botOrderMsg is the order the agent's bot socket receives ({"type":"order","order":…}). dry_run,
-// max_leg and rules_on are the user's settings when it is sent.
+// max_leg, rules_on, max_order and odds_drop are the user's settings when it is sent (odds_drop strict
+// for an order without min_profit_pct or bankroll).
 type botOrderMsg struct {
 	OrderID    string     `json:"order_id"`
 	ArbKey     string     `json:"arb_key"`
@@ -85,6 +101,12 @@ type botOrderMsg struct {
 	Rounding   int        `json:"rounding"`
 	MaxLeg     int64      `json:"max_leg"`  // Kč, 0 = no limit
 	RulesOn    []string   `json:"rules_on"` // never null
+	// Odds drop: the mode (oddsDropOf), the order's minimum profit % and bankroll (absent when the app
+	// sent none) and the settings' maxOrder (Kč, 0 = no limit).
+	OddsDrop     string       `json:"odds_drop"`
+	MinProfitPct *float64     `json:"min_profit_pct,omitempty"`
+	Bankroll     *botBankroll `json:"bankroll,omitempty"`
+	MaxOrder     int64        `json:"max_order"`
 }
 
 // orderInfo is an order's display fields and the arb's fields the agent gets (bot_orders.info_json).
@@ -98,16 +120,34 @@ type orderInfo struct {
 	IsLive     bool     `json:"isLive"`
 	Sport      string   `json:"sport"`
 	Rounding   int      `json:"rounding"` // 0 in rows older than Phase 3
+	// Bankroll is the app's bankroll settings (odds drop); nil = none. MinProfitPct is the order's
+	// minimum profit % (0 = none), kept in its own column (bot_orders.min_profit_pct), not in info_json.
+	Bankroll     *botBankroll `json:"bankroll,omitempty"`
+	MinProfitPct float64      `json:"-"`
 }
 
-// infoOf is in's display and arb fields as info_json keeps them (rounding 1 when absent).
+// infoOf is in's display and arb fields as info_json keeps them (rounding 1 when absent), with its
+// odds-drop fields.
 func infoOf(in botOrderIn) orderInfo {
 	rounding := 1
 	if in.Rounding != nil {
 		rounding = *in.Rounding
 	}
-	return orderInfo{Match: in.Match, Market: in.Market, Live: in.Live, ProfitPct: in.ProfitPct, MarketType: in.MarketType, Line: in.Line,
-		IsLive: in.IsLive, Sport: in.Sport, Rounding: rounding}
+	info := orderInfo{Match: in.Match, Market: in.Market, Live: in.Live, ProfitPct: in.ProfitPct, MarketType: in.MarketType, Line: in.Line,
+		IsLive: in.IsLive, Sport: in.Sport, Rounding: rounding, Bankroll: in.Bankroll}
+	if in.MinProfitPct != nil {
+		info.MinProfitPct = *in.MinProfitPct
+	}
+	return info
+}
+
+// oddsDropOf is the odds-drop mode an order with info goes with under st: the setting, but strict
+// when the order lacks min_profit_pct or bankroll (an older app).
+func oddsDropOf(st accounts.BotSettings, info orderInfo) string {
+	if oddsDropMode(st.OddsDrop) == oddsDropRearb && info.MinProfitPct > 0 && info.Bankroll != nil {
+		return oddsDropRearb
+	}
+	return oddsDropStrict
 }
 
 // storedLeg is a leg as bot_orders.legs_json keeps it: the app's leg, its window and its last step.
@@ -126,19 +166,21 @@ type storedLeg struct {
 
 // botOrder is a waiting or running order, in memory until its final state.
 type botOrder struct {
-	id      string
-	userID  int64
-	codeID  int64 // the agent it was sent to; only it may post the order's events. 0 while waiting
-	arbKey  string
-	boot    string // that agent's boot id when the order was sent; "" = none
-	state   string // orderWaiting or orderRunning
-	reason  string // why it waits
-	dryRun  bool   // the setting when it was sent (while waiting: when it was posted)
-	stake   int64  // Kč, the legs' stakes summed, rounded
-	info    orderInfo
-	legs    []storedLeg
-	created time.Time
-	sent    time.Time
+	id     string
+	userID int64
+	codeID int64 // the agent it was sent to; only it may post the order's events. 0 while waiting
+	arbKey string
+	boot   string // that agent's boot id when the order was sent; "" = none
+	state  string // orderWaiting or orderRunning
+	reason string // why it waits
+	dryRun bool   // the setting when it was sent (while waiting: when it was posted)
+	// oddsDrop: the odds-drop mode it was sent with (oddsDropOf; while waiting: when it was posted)
+	oddsDrop string
+	stake    int64 // Kč, the legs' stakes summed, rounded
+	info     orderInfo
+	legs     []storedLeg
+	created  time.Time
+	sent     time.Time
 	// deadline: a running order without a final event by then ends outcome_unknown (send +
 	// orderMemory, pushed to at least now + orderMemory by each flow event).
 	deadline time.Time
@@ -157,7 +199,11 @@ func (o *botOrder) legsJSON() string {
 func (o *botOrder) message(st accounts.BotSettings, windows [2]string, levels [2]int) botOrderMsg {
 	msg := botOrderMsg{OrderID: o.id, ArbKey: o.arbKey, DryRun: st.DryRun, MarketType: o.info.MarketType, Line: o.info.Line,
 		IsLive: o.info.IsLive, Sport: o.info.Sport, Match: o.info.Match, Rounding: o.info.Rounding, MaxLeg: st.MaxLeg,
-		RulesOn: rulesOnList(st.RulesOn)}
+		RulesOn: rulesOnList(st.RulesOn), OddsDrop: oddsDropOf(st, o.info), Bankroll: o.info.Bankroll, MaxOrder: st.MaxOrder}
+	if o.info.MinProfitPct > 0 {
+		min := o.info.MinProfitPct
+		msg.MinProfitPct = &min
+	}
 	for i, l := range o.legs {
 		l.LimitLevel = &levels[i]
 		msg.Legs = append(msg.Legs, agentLeg{botLeg: l.botLeg, WindowID: windows[i]})
@@ -311,10 +357,10 @@ func validOrder(o botOrderIn) bool {
 // the selection ids): an arb key of at most 256 bytes, exactly 2 legs at different bookmakers
 // (non-empty, no surrounding spaces), each with odds above 1 and a stake above 0 and at most maxKc
 // (so stake sums never overflow); match and market at most 200 characters, a finite profit_pct and
-// the arb fields (validArbFields).
+// the arb fields (validArbFields) and the odds-drop fields (validOddsDropFields).
 func validTry(o botOrderIn) bool {
 	if len(o.ArbKey) > 256 || len(o.Legs) != 2 || o.Legs[0].Bookmaker == o.Legs[1].Bookmaker || runeLen(o.Match) > 200 ||
-		runeLen(o.Market) > 200 || math.IsNaN(o.ProfitPct) || math.IsInf(o.ProfitPct, 0) || !validArbFields(o) {
+		runeLen(o.Market) > 200 || math.IsNaN(o.ProfitPct) || math.IsInf(o.ProfitPct, 0) || !validArbFields(o) || !validOddsDropFields(o) {
 		return false
 	}
 	for _, l := range o.Legs {
@@ -338,6 +384,22 @@ func validArbFields(o botOrderIn) bool {
 		}
 	}
 	return true
+}
+
+// validOddsDropFields checks the odds-drop fields (each optional, null = absent): min_profit_pct
+// above 0 and at most 100; bankroll with mode split or maxleg, total and max_leg 0–10 000 000 (not
+// necessarily whole: the agent checks them again), anchor_book null or at most 64 characters and
+// rounding 1, 10 or 100.
+func validOddsDropFields(o botOrderIn) bool {
+	if p := o.MinProfitPct; p != nil && !(*p > 0 && *p <= 100) {
+		return false
+	}
+	br := o.Bankroll
+	if br == nil {
+		return true
+	}
+	return (br.Mode == "split" || br.Mode == "maxleg") && br.Total >= 0 && br.Total <= maxKc && br.MaxLeg >= 0 && br.MaxLeg <= maxKc &&
+		(br.AnchorBook == nil || runeLen(*br.AnchorBook) <= 64) && (br.Rounding == 1 || br.Rounding == 10 || br.Rounding == 100)
 }
 
 // submitted is the 202 answer to a new order.
@@ -409,6 +471,7 @@ func (b *botHub) submitLocked(userID int64, in botOrderIn, fx *effects) (submitt
 	}
 	o := &botOrder{id: newOrderID(), userID: userID, arbKey: in.ArbKey, state: orderWaiting, dryRun: st.DryRun, stake: stake,
 		info: infoOf(in), created: now, dayChecked: dayChecked}
+	o.oddsDrop = oddsDropOf(st, o.info)
 	for _, l := range in.Legs {
 		l.LimitLevel = nil // set from the chosen agent's limit index when it is sent
 		o.legs = append(o.legs, storedLeg{botLeg: l})
@@ -416,7 +479,7 @@ func (b *botHub) submitLocked(userID int64, in botOrderIn, fx *effects) (submitt
 	b.orders[o.id] = o
 	if b.acc != nil {
 		row := accounts.BotOrderRow{ID: o.id, UserID: userID, ArbKey: o.arbKey, State: orderWaiting, DryRun: o.dryRun, Stake: stake,
-			InfoJSON: mustJSON(o.info), LegsJSON: o.legsJSON(), CreatedAt: now.UnixMilli()}
+			InfoJSON: mustJSON(o.info), LegsJSON: o.legsJSON(), CreatedAt: now.UnixMilli(), OddsDrop: o.oddsDrop, MinProfitPct: o.info.MinProfitPct}
 		fx.write(func() error { return b.acc.InsertBotOrder(row) })
 	}
 	fx.notify(userID)
@@ -612,6 +675,7 @@ func (b *botHub) startLocked(o *botOrder, fx *effects) bool {
 		}
 		now := b.now()
 		o.state, o.codeID, o.boot, o.sent, o.dryRun, o.reason = orderRunning, codeID, p.boot, now, st.DryRun, ""
+		o.oddsDrop = oddsDropOf(st, o.info)
 		o.deadline = now.Add(orderMemory)
 		for i := range o.legs {
 			o.legs[i].WindowID, o.legs[i].LimitLevel = wins[i], &levels[i]
@@ -619,8 +683,8 @@ func (b *botHub) startLocked(o *botOrder, fx *effects) bool {
 		}
 		p.reservedAt = now
 		if b.acc != nil {
-			id, dryRun, legs := o.id, o.dryRun, o.legsJSON()
-			fx.write(func() error { return b.acc.MarkBotOrderSent(id, codeID, dryRun, legs, now.UnixMilli()) })
+			id, dryRun, oddsDrop, legs := o.id, o.dryRun, o.oddsDrop, o.legsJSON()
+			fx.write(func() error { return b.acc.MarkBotOrderSent(id, codeID, dryRun, oddsDrop, legs, now.UnixMilli()) })
 		}
 		b.relayLocked(fx, o, botEventMsg{Event: "sent"})
 		fx.notify(o.userID)

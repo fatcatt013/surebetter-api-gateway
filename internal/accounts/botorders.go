@@ -23,6 +23,10 @@ type BotOrderRow struct {
 	SentAt    int64
 	EndedAt   int64
 	CheckedAt int64 // when the user marked it checked (human mode); 0 = not checked
+	// OddsDrop is the odds-drop mode it went with ("strict" or "rearb"; while waiting, the one it
+	// would have had when posted); MinProfitPct its minimum profit % (0 = none).
+	OddsDrop     string
+	MinProfitPct float64
 }
 
 // BotOrderDayStats sums a user's orders created in one day: all orders, the placed ones, and the
@@ -37,16 +41,17 @@ type BotOrderDayStats struct {
 // InsertBotOrder stores a new order (Agent is ignored).
 func (s *Service) InsertBotOrder(r BotOrderRow) error {
 	_, err := s.db.Exec(`INSERT INTO bot_orders (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json,
-			flow_json, created_at, sent_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.UserID, r.ArbKey, r.CodeID, r.State, r.Reason, r.DryRun, r.Stake, r.InfoJSON, r.LegsJSON, r.FlowJSON, r.CreatedAt, r.SentAt, r.EndedAt)
+			flow_json, created_at, sent_at, ended_at, odds_drop, min_profit_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.UserID, r.ArbKey, r.CodeID, r.State, r.Reason, r.DryRun, r.Stake, r.InfoJSON, r.LegsJSON, r.FlowJSON, r.CreatedAt, r.SentAt, r.EndedAt,
+		r.OddsDrop, r.MinProfitPct)
 	return err
 }
 
-// MarkBotOrderSent moves a waiting order to running: the agent, the mode it was sent in, its legs
-// (now with window ids) and the send time. Other states are left alone.
-func (s *Service) MarkBotOrderSent(id string, codeID int64, dryRun bool, legsJSON string, sentAt int64) error {
-	_, err := s.db.Exec(`UPDATE bot_orders SET state = 'running', reason = '', code_id = ?, dry_run = ?, legs_json = ?, sent_at = ?
-		WHERE id = ? AND state = 'waiting'`, codeID, dryRun, legsJSON, sentAt, id)
+// MarkBotOrderSent moves a waiting order to running: the agent, the mode (dry run) and odds-drop
+// mode it was sent in, its legs (now with window ids) and the send time. Other states are left alone.
+func (s *Service) MarkBotOrderSent(id string, codeID int64, dryRun bool, oddsDrop, legsJSON string, sentAt int64) error {
+	_, err := s.db.Exec(`UPDATE bot_orders SET state = 'running', reason = '', code_id = ?, dry_run = ?, odds_drop = ?, legs_json = ?, sent_at = ?
+		WHERE id = ? AND state = 'waiting'`, codeID, dryRun, oddsDrop, legsJSON, sentAt, id)
 	return err
 }
 
@@ -73,13 +78,13 @@ func (s *Service) SetBotOrderFlow(id, flowJSON string) error {
 }
 
 const botOrderColumns = `o.id, o.user_id, o.arb_key, o.code_id, COALESCE(c.name, ''), o.state, o.reason, o.dry_run, o.stake,
-	o.info_json, o.legs_json, o.flow_json, o.created_at, o.sent_at, o.ended_at, o.checked_at`
+	o.info_json, o.legs_json, o.flow_json, o.created_at, o.sent_at, o.ended_at, o.checked_at, o.odds_drop, o.min_profit_pct`
 
 // scanBotOrder reads one row of botOrderColumns.
 func scanBotOrder(row interface{ Scan(...any) error }) (BotOrderRow, error) {
 	var r BotOrderRow
 	err := row.Scan(&r.ID, &r.UserID, &r.ArbKey, &r.CodeID, &r.Agent, &r.State, &r.Reason, &r.DryRun, &r.Stake,
-		&r.InfoJSON, &r.LegsJSON, &r.FlowJSON, &r.CreatedAt, &r.SentAt, &r.EndedAt, &r.CheckedAt)
+		&r.InfoJSON, &r.LegsJSON, &r.FlowJSON, &r.CreatedAt, &r.SentAt, &r.EndedAt, &r.CheckedAt, &r.OddsDrop, &r.MinProfitPct)
 	return r, err
 }
 

@@ -17,7 +17,7 @@ func putSettings(t *testing.T, srv *httptest.Server, token, body string) (int, s
 	return request(t, srv, "PUT", "/api/me/bot/settings", token, body, nil)
 }
 
-const defaultSettingsJSON = `{"dryRun":true,"paused":false,"pausedReason":"","limits":{"maxOrder":0,"maxLeg":0,"perDay":0,"ordersAtOnce":1,"pauseOnUnknown":true},"rulesOn":[]}`
+const defaultSettingsJSON = `{"dryRun":true,"paused":false,"pausedReason":"","limits":{"maxOrder":0,"maxLeg":0,"perDay":0,"ordersAtOnce":1,"pauseOnUnknown":true},"rulesOn":[],"oddsDrop":"strict"}`
 
 func TestBotSettings_GetPutAndValidation(t *testing.T) {
 	srv, svc, _ := newBotServer(t)
@@ -46,7 +46,7 @@ func TestBotSettings_GetPutAndValidation(t *testing.T) {
 	}
 	// A subset changes only what it names and answers the full settings.
 	s, b := putSettings(t, srv, token, `{"dryRun":false,"limits":{"maxOrder":10000000,"ordersAtOnce":20,"pauseOnUnknown":false}}`)
-	want := `{"dryRun":false,"paused":false,"pausedReason":"","limits":{"maxOrder":10000000,"maxLeg":0,"perDay":0,"ordersAtOnce":20,"pauseOnUnknown":false},"rulesOn":[]}`
+	want := `{"dryRun":false,"paused":false,"pausedReason":"","limits":{"maxOrder":10000000,"maxLeg":0,"perDay":0,"ordersAtOnce":20,"pauseOnUnknown":false},"rulesOn":[],"oddsDrop":"strict"}`
 	if s != 200 || strings.TrimSpace(b) != want {
 		t.Fatalf("put: %d %s", s, b)
 	}
@@ -242,7 +242,7 @@ func TestBotSettings_AutoPauseWithUnreadableSettingsKeepsTheRow(t *testing.T) {
 		InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.MarkBotOrderSent("00000000000000b2", 0, true, "[]", 2); err != nil {
+	if err := svc.MarkBotOrderSent("00000000000000b2", 0, true, "strict", "[]", 2); err != nil {
 		t.Fatal(err)
 	}
 	bots.recoverOrders()
@@ -289,7 +289,7 @@ func TestBotSettings_RulesOn(t *testing.T) {
 	}
 	// PUT replaces the list; an unknown id is kept (an agent may know it); a repeated id is kept once.
 	s, b := putSettings(t, srv, token, `{"rulesOn":["totals-over-first","unknown-rule","totals-over-first"]}`)
-	if s != 200 || !strings.HasSuffix(strings.TrimSpace(b), `"rulesOn":["totals-over-first","unknown-rule"]}`) {
+	if s != 200 || !strings.HasSuffix(strings.TrimSpace(b), `"rulesOn":["totals-over-first","unknown-rule"],"oddsDrop":"strict"}`) {
 		t.Fatalf("put: %d %s", s, b)
 	}
 	expectBot(t, app, "on switching rules on")
@@ -302,7 +302,7 @@ func TestBotSettings_RulesOn(t *testing.T) {
 			t.Fatalf("put %s: %d %s", body, s, b)
 		}
 	}
-	if s, b := putSettings(t, srv, token, `{"rulesOn":[]}`); s != 200 || !strings.HasSuffix(strings.TrimSpace(b), `"rulesOn":[]}`) {
+	if s, b := putSettings(t, srv, token, `{"rulesOn":[]}`); s != 200 || !strings.HasSuffix(strings.TrimSpace(b), `"rulesOn":[],"oddsDrop":"strict"}`) {
 		t.Fatalf("every rule off: %d %s", s, b)
 	}
 	expectBot(t, app, "on switching every rule off")
@@ -310,4 +310,40 @@ func TestBotSettings_RulesOn(t *testing.T) {
 		t.Fatalf("stored after off: %+v", st)
 	}
 	expectNoMessage(t, app, "app after the puts that changed nothing")
+}
+
+func TestBotSettings_OddsDrop(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	app := appSocket(t, srv, token)
+	for name, body := range map[string]string{
+		"unknown mode": `{"oddsDrop":"fast"}`,
+		"empty":        `{"oddsDrop":""}`,
+		"upper case":   `{"oddsDrop":"Rearb"}`,
+		"a number":     `{"oddsDrop":1}`,
+	} {
+		if s, b := putSettings(t, srv, token, body); s != 400 || !strings.Contains(b, `"bad_settings"`) {
+			t.Errorf("%s: %d %s, want 400 bad_settings", name, s, b)
+		}
+	}
+	s, b := putSettings(t, srv, token, `{"oddsDrop":"rearb"}`)
+	if s != 200 || !strings.HasSuffix(strings.TrimSpace(b), `"rulesOn":[],"oddsDrop":"rearb"}`) {
+		t.Fatalf("put: %d %s", s, b)
+	}
+	expectBot(t, app, "on the odds drop change")
+	if st, _ := svc.BotSettings(uid); st.OddsDrop != "rearb" {
+		t.Fatalf("stored: %+v", st)
+	}
+	if s, b := putSettings(t, srv, token, `{"oddsDrop":"strict"}`); s != 200 || !strings.Contains(b, `"oddsDrop":"strict"`) {
+		t.Fatalf("back to strict: %d %s", s, b)
+	}
+	expectBot(t, app, "on the switch back")
+	if s, b := putSettings(t, srv, token, `{"oddsDrop":"strict","dryRun":true}`); s != 200 || !strings.Contains(b, `"oddsDrop":"strict"`) {
+		t.Fatalf("same again: %d %s", s, b)
+	}
+	if s, b := putSettings(t, srv, token, `{"oddsDrop":null}`); s != 200 || !strings.Contains(b, `"oddsDrop":"strict"`) {
+		t.Fatalf("null = unchanged: %d %s", s, b)
+	}
+	expectNoMessage(t, app, "app after puts that changed nothing")
 }

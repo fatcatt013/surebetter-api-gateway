@@ -25,11 +25,26 @@ type botSettingsView struct {
 	PausedReason string    `json:"pausedReason"`
 	Limits       botLimits `json:"limits"`
 	RulesOn      []string  `json:"rulesOn"`
+	OddsDrop     string    `json:"oddsDrop"` // "strict" or "rearb"
 }
 
 func settingsView(st accounts.BotSettings) botSettingsView {
 	return botSettingsView{DryRun: st.DryRun, Paused: st.Paused, PausedReason: st.PausedReason, Limits: botLimits{MaxOrder: st.MaxOrder,
-		MaxLeg: st.MaxLeg, PerDay: st.PerDay, OrdersAtOnce: st.OrdersAtOnce, PauseOnUnknown: st.PauseOnUnknown}, RulesOn: rulesOnList(st.RulesOn)}
+		MaxLeg: st.MaxLeg, PerDay: st.PerDay, OrdersAtOnce: st.OrdersAtOnce, PauseOnUnknown: st.PauseOnUnknown}, RulesOn: rulesOnList(st.RulesOn),
+		OddsDrop: oddsDropMode(st.OddsDrop)}
+}
+
+const (
+	oddsDropStrict = "strict" // stop the pair when a leg's odds drop (the behaviour before odds drop)
+	oddsDropRearb  = "rearb"  // size the stakes again and go on while the order's minimum profit holds
+)
+
+// oddsDropMode is a stored odds-drop mode as the API shows it: "rearb", anything else (empty) "strict".
+func oddsDropMode(s string) string {
+	if s == oddsDropRearb {
+		return oddsDropRearb
+	}
+	return oddsDropStrict
 }
 
 // rulePattern is a rule id; maxRulesOn the most ids a user may switch on.
@@ -48,10 +63,11 @@ func rulesOnList(js string) []string {
 
 // botSettingsIn is a PUT body: any subset of the fields (absent or null = unchanged).
 type botSettingsIn struct {
-	DryRun  *bool     `json:"dryRun"`
-	Paused  *bool     `json:"paused"`
-	RulesOn *[]string `json:"rulesOn"`
-	Limits  *struct {
+	DryRun   *bool     `json:"dryRun"`
+	Paused   *bool     `json:"paused"`
+	RulesOn  *[]string `json:"rulesOn"`
+	OddsDrop *string   `json:"oddsDrop"`
+	Limits   *struct {
 		MaxOrder       *int64 `json:"maxOrder"`
 		MaxLeg         *int64 `json:"maxLeg"`
 		PerDay         *int64 `json:"perDay"`
@@ -64,7 +80,8 @@ type botSettingsIn struct {
 const maxKc = 10_000_000
 
 // apply returns st with in's fields, false when one is out of range (Kč 0–10 000 000, ordersAtOnce
-// 1–20, rulesOn at most 20 ids of [a-z0-9-]{1,40}; a repeated id is kept once). paused is left to the caller.
+// 1–20, rulesOn at most 20 ids of [a-z0-9-]{1,40}; a repeated id is kept once; oddsDrop "strict" or
+// "rearb"). paused is left to the caller.
 func (in botSettingsIn) apply(st accounts.BotSettings) (accounts.BotSettings, bool) {
 	if in.DryRun != nil {
 		st.DryRun = *in.DryRun
@@ -83,6 +100,12 @@ func (in botSettingsIn) apply(st accounts.BotSettings) (accounts.BotSettings, bo
 			}
 		}
 		st.RulesOn = mustJSON(ids)
+	}
+	if in.OddsDrop != nil {
+		if *in.OddsDrop != oddsDropStrict && *in.OddsDrop != oddsDropRearb {
+			return st, false
+		}
+		st.OddsDrop = *in.OddsDrop
 	}
 	if l := in.Limits; l != nil {
 		for _, kc := range []struct {

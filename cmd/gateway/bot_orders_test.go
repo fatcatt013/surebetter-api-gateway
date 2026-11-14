@@ -75,7 +75,7 @@ func TestBotOrders_RunningWaitingAndHistory(t *testing.T) {
 	sent := clk.now().Add(-time.Second).UnixMilli()
 	normal := 0 // the leg's level in the agent's limit index when it was sent
 	want := orderView{ID: running.OrderID, ArbKey: "arb-2", State: "running", DryRun: true, AgentID: codeID, Agent: "Home PC",
-		Match: "Lyon – Lille", Market: "Corners 10.5", Live: true, ProfitPct: 2.4, Stake: 202, CreatedAt: sent, SentAt: sent, Rounding: 1,
+		Match: "Lyon – Lille", Market: "Corners 10.5", Live: true, ProfitPct: 2.4, Stake: 202, CreatedAt: sent, SentAt: sent, Rounding: 1, OddsDrop: "strict",
 		Legs: []orderLegView{{Bookmaker: "tipsport", WindowID: "tipsport-1", Odds: 2.1, Stake: 100, LimitLevel: &normal},
 			{Bookmaker: "betano", WindowID: "betano-2", Odds: 2.05, Stake: 102.4, Step: "checkOdds", StepAt: clk.now().UnixMilli(), LimitLevel: &normal}}}
 	if rj, wj := mustJSON(r), mustJSON(want); rj != wj {
@@ -91,7 +91,8 @@ func TestBotOrders_RunningWaitingAndHistory(t *testing.T) {
 	}
 	// Another day: its history only; running and waiting are always now.
 	got = getOrders(t, srv, token, "?day=2026-11-12")
-	if len(got.History) != 1 || got.History[0].ID != "00000000000000aa" || got.History[0].Match != "Old" || len(got.Running) != 1 ||
+	if len(got.History) != 1 || got.History[0].ID != "00000000000000aa" || got.History[0].Match != "Old" || got.History[0].OddsDrop != "strict" ||
+		got.History[0].MinProfitPct != 0 || len(got.Running) != 1 ||
 		got.Today.Orders != 3 {
 		t.Fatalf("yesterday: %+v", got)
 	}
@@ -205,5 +206,26 @@ func TestBotOrders_FlowRuleAndPlacedInTheViews(t *testing.T) {
 		h.Legs[1].Stake != 1040 || h.Legs[0].Placed == nil || !*h.Legs[0].Placed || h.Legs[1].Placed == nil || !*h.Legs[1].Placed ||
 		h.MarketType != "TOTAL_CORNERS" || h.Rounding != 10 || h.Legs[1].OutcomeID != "UNDER" || h.Legs[1].FairOdds == nil || *h.Legs[1].FairOdds != 1.95 {
 		t.Fatalf("history: %s", mustJSON(h))
+	}
+}
+
+func TestBotOrders_OddsDropAndMinimum(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.OddsDrop = "rearb" })
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	bot := startBot(t, srv, code, app)
+	a := postOrderOK(t, srv, token, strings.TrimSuffix(tipBetOrder("arb-1"), "}")+`,"min_profit_pct":4.5,"bankroll":`+bankrollJSON+`}`)
+	readOrder(t, bot)
+	if r := getOrders(t, srv, token, "").Running; len(r) != 1 || r[0].OddsDrop != "rearb" || r[0].MinProfitPct != 4.5 {
+		t.Fatalf("running: %+v", r)
+	}
+	if s, b := postEvent(t, srv, code, `{"order_id":"`+a.OrderID+`","event":"placed"}`); s != 204 {
+		t.Fatalf("final: %d %s", s, b)
+	}
+	if h := getOrders(t, srv, token, "").History; len(h) != 1 || h[0].OddsDrop != "rearb" || h[0].MinProfitPct != 4.5 {
+		t.Fatalf("history: %+v", h)
 	}
 }

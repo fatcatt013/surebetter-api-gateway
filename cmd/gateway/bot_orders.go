@@ -28,30 +28,34 @@ type orderLegView struct {
 
 // orderView is one order in GET /api/me/bot/orders.
 type orderView struct {
-	ID         string          `json:"id"`
-	ArbKey     string          `json:"arbKey"`
-	State      string          `json:"state"`
-	Reason     string          `json:"reason"`
-	DryRun     bool            `json:"dryRun"`
-	AgentID    int64           `json:"agentId"`
-	Agent      string          `json:"agent"`
-	Match      string          `json:"match"`
-	Market     string          `json:"market"`
-	Live       bool            `json:"live"`
-	ProfitPct  float64         `json:"profitPct"`
-	Stake      int64           `json:"stake"`
-	CreatedAt  int64           `json:"createdAt"`
-	SentAt     int64           `json:"sentAt"`
-	EndedAt    int64           `json:"endedAt"`
-	Legs       []orderLegView  `json:"legs"`
-	MarketType string          `json:"marketType"`
-	Line       *float64        `json:"line"`
-	IsLive     bool            `json:"isLive"`
-	Sport      string          `json:"sport"`
-	Rounding   int             `json:"rounding"`
-	Rule       string          `json:"rule"`     // from the last flow; "" = none
-	Playbook   string          `json:"playbook"` // from the last flow; "" = none
-	Flow       json.RawMessage `json:"flow"`     // the agent's last flow object; null = none
+	ID         string         `json:"id"`
+	ArbKey     string         `json:"arbKey"`
+	State      string         `json:"state"`
+	Reason     string         `json:"reason"`
+	DryRun     bool           `json:"dryRun"`
+	AgentID    int64          `json:"agentId"`
+	Agent      string         `json:"agent"`
+	Match      string         `json:"match"`
+	Market     string         `json:"market"`
+	Live       bool           `json:"live"`
+	ProfitPct  float64        `json:"profitPct"`
+	Stake      int64          `json:"stake"`
+	CreatedAt  int64          `json:"createdAt"`
+	SentAt     int64          `json:"sentAt"`
+	EndedAt    int64          `json:"endedAt"`
+	Legs       []orderLegView `json:"legs"`
+	MarketType string         `json:"marketType"`
+	Line       *float64       `json:"line"`
+	IsLive     bool           `json:"isLive"`
+	Sport      string         `json:"sport"`
+	Rounding   int            `json:"rounding"`
+	// OddsDrop is the odds-drop mode it went with ("strict" or "rearb"; while waiting, the one it
+	// would have had when posted); MinProfitPct its minimum profit % (0 = none).
+	OddsDrop     string          `json:"oddsDrop"`
+	MinProfitPct float64         `json:"minProfitPct"`
+	Rule         string          `json:"rule"`     // from the last flow; "" = none
+	Playbook     string          `json:"playbook"` // from the last flow; "" = none
+	Flow         json.RawMessage `json:"flow"`     // the agent's last flow object; null = none
 	// Checkable: ended, real (not a dry run) and outcome_unknown or with a stuck flow: the user can
 	// mark it checked (human mode). CheckedAt: when they did (Unix ms); 0 = not checked.
 	Checkable bool  `json:"checkable"`
@@ -105,7 +109,7 @@ func (v orderView) withDetails(info orderInfo, flow string) orderView {
 func (o *botOrder) viewOf(names map[int64]string) orderView {
 	v := orderView{ID: o.id, ArbKey: o.arbKey, State: o.state, Reason: o.reason, DryRun: o.dryRun, AgentID: o.codeID, Agent: names[o.codeID],
 		Match: o.info.Match, Market: o.info.Market, Live: o.info.Live, ProfitPct: o.info.ProfitPct, Stake: o.stake,
-		CreatedAt: o.created.UnixMilli(), Legs: legViews(o.legs)}
+		CreatedAt: o.created.UnixMilli(), Legs: legViews(o.legs), OddsDrop: oddsDropMode(o.oddsDrop), MinProfitPct: o.info.MinProfitPct}
 	if o.state == orderRunning {
 		v.SentAt = o.sent.UnixMilli()
 	}
@@ -121,7 +125,7 @@ func rowView(r accounts.BotOrderRow) orderView {
 	return orderView{ID: r.ID, ArbKey: r.ArbKey, State: r.State, Reason: r.Reason, DryRun: r.DryRun, AgentID: r.CodeID, Agent: r.Agent,
 		Match: info.Match, Market: info.Market, Live: info.Live, ProfitPct: info.ProfitPct, Stake: r.Stake, CreatedAt: r.CreatedAt,
 		SentAt: r.SentAt, EndedAt: r.EndedAt, Legs: legViews(legs), Checkable: checkableOf(r.State, r.DryRun, r.FlowJSON),
-		CheckedAt: r.CheckedAt}.withDetails(info, r.FlowJSON)
+		CheckedAt: r.CheckedAt, OddsDrop: oddsDropMode(r.OddsDrop), MinProfitPct: r.MinProfitPct}.withDetails(info, r.FlowJSON)
 }
 
 // ordersView is the GET /api/me/bot/orders body.

@@ -66,3 +66,19 @@ func TestBotSettings_RulesOn(t *testing.T) {
 		t.Fatalf("after switching every rule off: %+v", got)
 	}
 }
+
+func TestBotSettings_OddsDrop(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	if d := DefaultBotSettings(); d.OddsDrop != "strict" {
+		t.Fatalf("default odds drop: %q", d.OddsDrop)
+	}
+	st := DefaultBotSettings()
+	st.OddsDrop = "rearb"
+	if err := s.SaveBotSettings(user.UserID, st); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.BotSettings(user.UserID); err != nil || got != st {
+		t.Fatalf("after save: %+v %v", got, err)
+	}
+}

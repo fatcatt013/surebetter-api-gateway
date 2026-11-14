@@ -218,6 +218,12 @@ var migrations = []string{
 	`ALTER TABLE bot_agents ADD COLUMN routine_json TEXT NOT NULL DEFAULT '';
 	ALTER TABLE bot_agents ADD COLUMN human_mode INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE bot_orders ADD COLUMN checked_at INTEGER NOT NULL DEFAULT 0;`,
+	// 10: odds drop (keep a pair while it is still an arb): the user's setting ('strict' = stop the
+	// pair on any drop, 'rearb' = size the stakes again while the order's minimum profit holds) and,
+	// on each order, the mode it went with and its minimum profit % (0 = none).
+	`ALTER TABLE bot_settings ADD COLUMN odds_drop TEXT NOT NULL DEFAULT 'strict';
+	ALTER TABLE bot_orders ADD COLUMN odds_drop TEXT NOT NULL DEFAULT 'strict';
+	ALTER TABLE bot_orders ADD COLUMN min_profit_pct REAL NOT NULL DEFAULT 0;`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

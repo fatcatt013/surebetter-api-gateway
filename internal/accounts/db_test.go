@@ -364,8 +364,8 @@ func TestMigrate_HumanMode(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 9 || version != len(migrations) {
-		t.Fatalf("user_version = %d (err %v), want 9", version, err)
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want %d", version, err, len(migrations))
 	}
 	var agent string
 	if err := db.QueryRow(`SELECT code_id || '/' || limit_index_json || '/' || routine_json || '/' || human_mode FROM bot_agents`).Scan(&agent); err != nil ||
@@ -375,6 +375,46 @@ func TestMigrate_HumanMode(t *testing.T) {
 	var order string
 	if err := db.QueryRow(`SELECT id || '/' || state || '/' || ended_at || '/' || checked_at FROM bot_orders`).Scan(&order); err != nil ||
 		order != `00000000000000aa/outcome_unknown/3/0` {
+		t.Fatalf("order after the migration: %q (err %v)", order, err)
+	}
+}
+
+func TestMigrate_OddsDrop(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The schema as shipped with human mode Phase A (version 9), one user's settings and one ended order.
+	steps := append(append([]string{}, migrations[:9]...), `PRAGMA user_version = 9`,
+		`INSERT INTO users (id, email, password_hash, role, created_at) VALUES (1, 'u@example.com', 'x', 'user', 0)`,
+		`INSERT INTO bot_settings (user_id, dry_run, max_leg, updated_at) VALUES (1, 0, 3000, 5)`,
+		`INSERT INTO bot_orders (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json, created_at, sent_at, ended_at)
+			VALUES ('00000000000000aa', 1, 'k', 0, 'placed', '', 0, 10, '{}', '[]', 1, 2, 3)`)
+	for _, q := range steps {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%.60s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 10 || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want 10", version, err)
+	}
+	var settings string
+	if err := db.QueryRow(`SELECT dry_run || '/' || max_leg || '/' || odds_drop FROM bot_settings`).Scan(&settings); err != nil ||
+		settings != `0/3000/strict` {
+		t.Fatalf("settings after the migration: %q (err %v)", settings, err)
+	}
+	var order string
+	if err := db.QueryRow(`SELECT id || '/' || state || '/' || odds_drop || '/' || min_profit_pct FROM bot_orders`).Scan(&order); err != nil ||
+		order != `00000000000000aa/placed/strict/0.0` {
 		t.Fatalf("order after the migration: %q (err %v)", order, err)
 	}
 }

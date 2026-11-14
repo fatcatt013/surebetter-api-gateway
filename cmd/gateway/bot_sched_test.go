@@ -906,7 +906,7 @@ func TestBotSched_RecoverOrdersAfterAGatewayRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := svc.MarkBotOrderSent("00000000000000b2", 0, true, "[]", 2); err != nil {
+	if err := svc.MarkBotOrderSent("00000000000000b2", 0, true, "strict", "[]", 2); err != nil {
 		t.Fatal(err)
 	}
 	bots.recoverOrders()
@@ -1131,6 +1131,12 @@ func TestBotSched_OrderWithoutTheNewFields(t *testing.T) {
 	}
 	if leg := o["legs"].([]any)[0].(map[string]any); leg["outcome_id"] != "" || leg["fair_odds"] != nil {
 		t.Fatalf("leg: %v", leg)
+	}
+	// Odds drop: strict, max_order always sent, no minimum or bankroll.
+	_, hasMin := o["min_profit_pct"]
+	_, hasBankroll := o["bankroll"]
+	if o["odds_drop"] != "strict" || o["max_order"] != float64(0) || hasMin || hasBankroll {
+		t.Fatalf("odds drop fields: %v", o)
 	}
 }
 
@@ -1401,5 +1407,141 @@ func TestBotSched_FlowExtendsTheDeadline(t *testing.T) {
 	expectEvent(t, app, o.OrderID, "outcome_unknown", "No result from the agent")
 	if state, _, _, _, _ := orderRow(t, db, o.OrderID); state != "outcome_unknown" {
 		t.Fatalf("10 min after the flow: %s, want outcome_unknown", state)
+	}
+}
+
+// bankrollJSON is a valid bankroll in max-on-one-leg mode.
+const bankrollJSON = `{"mode":"maxleg","total":5000,"max_leg":3000,"anchor_book":"betano","rounding":10}`
+
+func TestBotSched_OddsDropFieldsValidation(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	with := func(extra string) string {
+		return `{"arb_key":"k","legs":[` + legJSON("tipsport", "s1", 2.1, 100) + `,` + legJSON("betano", "s2", 2.05, 102) + `],` + extra + `}`
+	}
+	br := func(fields string) string { return with(`"min_profit_pct":4,"bankroll":{` + fields + `}`) }
+	bad := map[string]string{
+		"min_profit_pct 0":        with(`"min_profit_pct":0`),
+		"min_profit_pct negative": with(`"min_profit_pct":-1`),
+		"min_profit_pct over 100": with(`"min_profit_pct":100.5`),
+		"min_profit_pct a string": with(`"min_profit_pct":"4"`),
+		"bankroll not an object":  with(`"bankroll":5`),
+		"mode unknown":            br(`"mode":"all","total":5000,"max_leg":3000,"anchor_book":null,"rounding":1`),
+		"mode missing":            br(`"total":5000,"max_leg":3000,"anchor_book":null,"rounding":1`),
+		"total negative":          br(`"mode":"split","total":-1,"max_leg":3000,"anchor_book":null,"rounding":1`),
+		"total over 10M":          br(`"mode":"split","total":10000001,"max_leg":3000,"anchor_book":null,"rounding":1`),
+		"max_leg negative":        br(`"mode":"maxleg","total":5000,"max_leg":-5,"anchor_book":null,"rounding":1`),
+		"max_leg a string":        br(`"mode":"maxleg","total":5000,"max_leg":"3000","anchor_book":null,"rounding":1`),
+		"anchor_book a number":    br(`"mode":"maxleg","total":5000,"max_leg":3000,"anchor_book":5,"rounding":1`),
+		"anchor_book over 64":     br(`"mode":"maxleg","total":5000,"max_leg":3000,"anchor_book":"` + strings.Repeat("b", 65) + `","rounding":1`),
+		"rounding missing":        br(`"mode":"split","total":5000,"max_leg":3000,"anchor_book":null`),
+		"rounding 5":              br(`"mode":"split","total":5000,"max_leg":3000,"anchor_book":null,"rounding":5`),
+		"rounding 10.5":           br(`"mode":"split","total":5000,"max_leg":3000,"anchor_book":null,"rounding":10.5`),
+	}
+	for name, body := range bad {
+		if s, b := postOrder(t, srv, token, body); s != 400 || !strings.Contains(b, `"bad_order"`) {
+			t.Errorf("%s: %d %s, want 400 bad_order", name, s, b)
+		}
+	}
+	for name, body := range map[string]string{
+		"both":               with(`"min_profit_pct":4,"bankroll":` + bankrollJSON),
+		"limits":             br(`"mode":"split","total":10000000,"max_leg":0,"anchor_book":"` + strings.Repeat("b", 64) + `","rounding":100`),
+		"min_profit_pct 100": with(`"min_profit_pct":100`),
+		"min_profit_pct 0.5": with(`"min_profit_pct":0.5`),
+		"nulls":              with(`"min_profit_pct":null,"bankroll":null`),
+		"anchor_book null":   br(`"mode":"maxleg","total":5000,"max_leg":3000,"anchor_book":null,"rounding":1`),
+		"bankroll only":      with(`"bankroll":` + bankrollJSON),
+	} {
+		if s, b := postOrder(t, srv, token, body); s != 409 || !strings.Contains(b, `"bot_offline"`) {
+			t.Errorf("%s: %d %s, want 409 bot_offline", name, s, b)
+		}
+	}
+}
+
+// The odds-drop fields: the order waits under strict, the owner switches to rearb, and the order
+// goes with the setting at send time, its minimum, its bankroll and maxOrder; the row keeps the mode
+// (strict while it waited, rearb once sent), the minimum and (info_json) the bankroll.
+func TestBotSched_OddsDropReachesTheAgent(t *testing.T) {
+	srv, svc, bots, db := newBotServerDB(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.MaxLeg, st.MaxOrder = 3000, 20000 })
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	bot := startAgentWith(t, srv, code, p2Status("", win("tipsport", 1, "idle"), win("betano", 1, "busy")), app)
+	body := strings.TrimSuffix(totalsOrder("arb-1"), "}") + `,"min_profit_pct":4,"bankroll":` + bankrollJSON + `}`
+	a := postOrderOK(t, srv, token, body)
+	expectEvent(t, app, a.OrderID, "waiting", "Needs a free Betano window")
+	expectBot(t, app, "on the waiting order")
+	oddsDropRow := func() string {
+		var mode string
+		var min float64
+		if err := db.QueryRow(`SELECT odds_drop, min_profit_pct FROM bot_orders WHERE id = ?`, a.OrderID).Scan(&mode, &min); err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Sprintf("%s/%v", mode, min)
+	}
+	if got := oddsDropRow(); got != "strict/4" {
+		t.Fatalf("waiting row: %s", got)
+	}
+	if s, b := putSettings(t, srv, token, `{"oddsDrop":"rearb"}`); s != 200 {
+		t.Fatalf("settings: %d %s", s, b)
+	}
+	expectBot(t, app, "on the settings change")
+	if s, b := postStatus(t, srv, code, tipBetIdle); s != 204 {
+		t.Fatalf("status: %d %s", s, b)
+	}
+	o := readOrderJSON(t, bot)
+	got, _ := json.Marshal(map[string]any{"odds_drop": o["odds_drop"], "min_profit_pct": o["min_profit_pct"], "bankroll": o["bankroll"],
+		"max_order": o["max_order"], "max_leg": o["max_leg"], "rounding": o["rounding"]})
+	if string(got) != `{"bankroll":{"anchor_book":"betano","max_leg":3000,"mode":"maxleg","rounding":10,"total":5000},"max_leg":3000,`+
+		`"max_order":20000,"min_profit_pct":4,"odds_drop":"rearb","rounding":10}` {
+		t.Fatalf("order: %s", got)
+	}
+	expectEvent(t, app, a.OrderID, "sent", "")
+	if got := oddsDropRow(); got != "rearb/4" {
+		t.Fatalf("sent row: %s", got)
+	}
+	var info string
+	db.QueryRow(`SELECT info_json FROM bot_orders WHERE id = ?`, a.OrderID).Scan(&info)
+	if !strings.HasSuffix(info, `"rounding":10,"bankroll":`+bankrollJSON+`}`) {
+		t.Fatalf("info_json: %s", info)
+	}
+}
+
+// rearb is only for orders with both fields: without the minimum or the bankroll the order goes
+// strict (an older app); whatever it has is still passed on, and max_order always is.
+func TestBotSched_OddsDropStrictWithoutTheFields(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	setSettings(t, svc, bots, uid, func(st *accounts.BotSettings) { st.OddsDrop = "rearb" })
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	bot := startBot(t, srv, code, app)
+	for i, c := range []struct{ extra, keys string }{
+		{``, `[]`},
+		{`,"min_profit_pct":4`, `["min_profit_pct"]`},
+		{`,"bankroll":` + bankrollJSON, `["bankroll"]`},
+	} {
+		a := postOrderOK(t, srv, token, strings.TrimSuffix(tipBetOrder(fmt.Sprintf("arb-%d", i)), "}")+c.extra+"}")
+		o := readOrderJSON(t, bot)
+		keys := []string{}
+		for _, k := range []string{"min_profit_pct", "bankroll"} {
+			if _, ok := o[k]; ok {
+				keys = append(keys, k)
+			}
+		}
+		if got, _ := json.Marshal(keys); o["odds_drop"] != "strict" || o["max_order"] != float64(0) || string(got) != c.keys {
+			t.Fatalf("%q: odds_drop %v, max_order %v, keys %s", c.extra, o["odds_drop"], o["max_order"], got)
+		}
+		expectEvent(t, app, a.OrderID, "sent", "")
+		expectBot(t, app, "on the sent order")
+		// Ended before the next one, so ordersAtOnce 1 lets the next go at once.
+		if s, b := postEvent(t, srv, code, `{"order_id":"`+a.OrderID+`","event":"stopped"}`); s != 204 {
+			t.Fatalf("final: %d %s", s, b)
+		}
+		expectEvent(t, app, a.OrderID, "stopped", "")
+		expectBot(t, app, "after the final event")
 	}
 }

@@ -18,11 +18,11 @@ func TestBotOrders_Lifecycle(t *testing.T) {
 	code, _ := s.CreateCode(user.UserID, "Home PC", KindBot)
 
 	w := BotOrderRow{ID: "000000000000000a", UserID: user.UserID, ArbKey: "k1", State: "waiting", DryRun: true, Stake: 202,
-		InfoJSON: `{"match":"A – B"}`, LegsJSON: `[{"bookmaker":"tipsport"}]`, CreatedAt: 1000}
+		InfoJSON: `{"match":"A – B"}`, LegsJSON: `[{"bookmaker":"tipsport"}]`, CreatedAt: 1000, OddsDrop: "strict", MinProfitPct: 4}
 	if err := s.InsertBotOrder(w); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkBotOrderSent(w.ID, code.ID, false, `[{"bookmaker":"tipsport","windowId":"tipsport-2"}]`, 1500); err != nil {
+	if err := s.MarkBotOrderSent(w.ID, code.ID, false, "rearb", `[{"bookmaker":"tipsport","windowId":"tipsport-2"}]`, 1500); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.EndBotOrder(w.ID, "placed", "", `[{"bookmaker":"tipsport","windowId":"tipsport-2","step":"placeBet"}]`, 202, 9000); err != nil {
@@ -38,7 +38,7 @@ func TestBotOrders_Lifecycle(t *testing.T) {
 	}
 	want := BotOrderRow{ID: w.ID, UserID: user.UserID, ArbKey: "k1", CodeID: code.ID, Agent: "Home PC", State: "placed", DryRun: false, Stake: 202,
 		InfoJSON: `{"match":"A – B"}`, LegsJSON: `[{"bookmaker":"tipsport","windowId":"tipsport-2","step":"placeBet"}]`,
-		CreatedAt: 1000, SentAt: 1500, EndedAt: 9000}
+		CreatedAt: 1000, SentAt: 1500, EndedAt: 9000, OddsDrop: "rearb", MinProfitPct: 4}
 	if rows[0] != want {
 		t.Fatalf("row:\n got %+v\nwant %+v", rows[0], want)
 	}
@@ -56,7 +56,7 @@ func TestBotOrders_EndedListAndDayStats(t *testing.T) {
 		}
 		switch state {
 		case "running":
-			if err := s.MarkBotOrderSent(id, 0, dryRun, "[]", created+1); err != nil {
+			if err := s.MarkBotOrderSent(id, 0, dryRun, "strict", "[]", created+1); err != nil {
 				t.Fatal(err)
 			}
 		case "placed", "stopped", "outcome_unknown":
@@ -107,7 +107,7 @@ func TestBotOrders_CloseOpen(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.MarkBotOrderSent("r1", 0, true, "[]", 1001); err != nil {
+	if err := s.MarkBotOrderSent("r1", 0, true, "strict", "[]", 1001); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.EndBotOrder("p1", "placed", "", "[]", 1, 1002); err != nil {
@@ -157,7 +157,7 @@ func TestBotOrders_FlowStakeAndCashedOut(t *testing.T) {
 	if err := s.SetBotOrderFlow("00000000000000c1", `{"phase":0}`); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkBotOrderSent("00000000000000c1", 0, false, "[]", 1001); err != nil {
+	if err := s.MarkBotOrderSent("00000000000000c1", 0, false, "strict", "[]", 1001); err != nil {
 		t.Fatal(err)
 	}
 	flow := `{"rule":"totals-over-first","playbook":"overFirst","phase":1,"stuck":null}`
@@ -208,7 +208,7 @@ func TestBotOrders_SetLegsOfARunningOrder(t *testing.T) {
 	if err := s.SetBotOrderLegs(w.ID, `[{"bookmaker":"x"}]`); err != nil || legs() != `[{"bookmaker":"tipsport"}]` {
 		t.Fatalf("waiting: %s %v", legs(), err)
 	}
-	if err := s.MarkBotOrderSent(w.ID, code.ID, true, `[{"bookmaker":"tipsport","windowId":"tipsport-1"}]`, 1500); err != nil {
+	if err := s.MarkBotOrderSent(w.ID, code.ID, true, "strict", `[{"bookmaker":"tipsport","windowId":"tipsport-1"}]`, 1500); err != nil {
 		t.Fatal(err)
 	}
 	released := `[{"bookmaker":"tipsport","windowId":"tipsport-1","placed":false,"released":true}]`
@@ -235,7 +235,7 @@ func TestBotOrders_Checked(t *testing.T) {
 			CreatedAt: 1}); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.MarkBotOrderSent(id, code, false, "[]", 2); err != nil {
+		if err := s.MarkBotOrderSent(id, code, false, "strict", "[]", 2); err != nil {
 			t.Fatal(err)
 		}
 		if err := s.SetBotOrderFlow(id, `{"stuck":{}}`); err != nil {
