@@ -307,7 +307,7 @@ func TestBotRoutine_GetPut(t *testing.T) {
 	if s, b := routineRequest(t, srv, "GET", routinePath(id), token, ""); s != 200 || b != want {
 		t.Fatalf("GET after PUT: %d %s", s, b)
 	}
-	expectNoMessage(t, app, "app (a routine change sends nothing to the app)")
+	expectBot(t, app, "after a routine PUT (another open Fleet re-reads humanMode)")
 	for _, c := range v.Valid {
 		if s, b := routineRequest(t, srv, "PUT", routinePath(id), token, `{"humanMode":false,"routine":`+string(v.routineJSON(c.Routine))+`}`); s != 200 {
 			t.Errorf("valid %q: %d %s", c.Name, s, b)
@@ -322,13 +322,16 @@ func TestBotRoutine_GetPut(t *testing.T) {
 	}
 
 	bad := map[string]string{
-		"not JSON":         `{"humanMode":true`,
-		"no humanMode":     `{"routine":null}`,
-		"humanMode null":   `{"humanMode":null,"routine":null}`,
-		"humanMode string": `{"humanMode":"true","routine":null}`,
-		"no routine":       `{"humanMode":true}`,
-		"routine an array": `{"humanMode":true,"routine":[]}`,
-		"over 256 KiB":     `{"humanMode":true,"routine":null,"pad":"` + strings.Repeat("x", 256<<10) + `"}`,
+		"not JSON":                            `{"humanMode":true`,
+		"no humanMode":                        `{"routine":null}`,
+		"humanMode null":                      `{"humanMode":null,"routine":null}`,
+		"humanMode string":                    `{"humanMode":"true","routine":null}`,
+		"no routine":                          `{"humanMode":true}`,
+		"routine an array":                    `{"humanMode":true,"routine":[]}`,
+		"over 256 KiB":                        `{"humanMode":true,"routine":null,"pad":"` + strings.Repeat("x", 256<<10) + `"}`,
+		"trailing garbage":                    `{"humanMode":true,"routine":null}garbage`,
+		"a second value":                      `{"humanMode":true,"routine":null} {}`,
+		"padded over 256 KiB with whitespace": `{"humanMode":true,"routine":null}` + strings.Repeat(" ", 256<<10),
 	}
 	for _, c := range v.Invalid {
 		bad["invalid vector "+c.Name] = `{"humanMode":true,"routine":` + string(c.Routine) + `}`
@@ -347,12 +350,16 @@ func TestBotRoutine_GetPut(t *testing.T) {
 		t.Fatalf("256 KiB: %d %.100s", s, b)
 	}
 
-	// Not the user's agent, a code that never connected, or no number: 404 unknown_agent.
+	// Not the user's agent, a code that never connected, or no number: 404 unknown_agent, also with
+	// a bad body (the agent is checked first).
 	for _, path := range []string{routinePath(otherID), routinePath(neverID), "/api/me/bot/agents/home/routine"} {
 		for _, method := range []string{"GET", "PUT"} {
 			if s, b := request(t, srv, method, path, token, `{"humanMode":false,"routine":null}`, nil); s != 404 || !strings.Contains(b, `"unknown_agent"`) {
 				t.Errorf("%s %s: %d %s, want 404 unknown_agent", method, path, s, b)
 			}
+		}
+		if s, b := request(t, srv, "PUT", path, token, `{"humanMode":"x"}`, nil); s != 404 || !strings.Contains(b, `"unknown_agent"`) {
+			t.Errorf("PUT %s with a bad body: %d %s, want 404 unknown_agent", path, s, b)
 		}
 	}
 	// A session only; PUT behind CSRF.
@@ -382,6 +389,8 @@ func TestBotRoutine_MessageOnlyToProto4(t *testing.T) {
 	if s, b := request(t, srv, "PUT", routinePath(id), token, body, nil); s != 200 {
 		t.Fatalf("PUT: %d %s", s, b)
 	}
+	expectBot(t, app, "after the first PUT")
+	expectBot(t, app, "after the second PUT")
 	if got := readType(t, bot); got != "routine" {
 		t.Fatalf("protocol-4 agent got %s, want routine", got)
 	}

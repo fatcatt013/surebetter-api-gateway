@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"regexp"
 	"time"
@@ -221,12 +222,21 @@ func (b *botHub) handleGetRoutine(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePutRoutine is PUT /api/me/bot/agents/{agentId}/routine {"humanMode", "routine"}: it replaces
-// both (routine null = none), answers them as stored, and tells the agent ({"type":"routine"}) when
-// it is online with protocol 4. 400 bad_routine: not that shape, a body over 256 KiB or a routine
-// routineOf refuses; 404 unknown_agent.
+// both (routine null = none), answers them as stored, tells the agent ({"type":"routine"}) when it is
+// online with protocol 4 and the app ({"type":"bot"}: another open Fleet shows the new switch). 404
+// unknown_agent (checked first); 400 bad_routine: a body over 256 KiB, not exactly one JSON object
+// of that shape, or a routine routineOf refuses.
 func (b *botHub) handlePutRoutine(w http.ResponseWriter, r *http.Request) {
-	codeID, ok := agentParam(r)
+	codeID, ok := b.limitAgent(w, r)
 	if !ok {
+		return
+	}
+	userID := principalOf(r).UserID
+	if _, _, found, err := b.acc.BotAgentRoutine(userID, codeID); err != nil {
+		log.Error().Err(err).Msg("bot routine read failed")
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	} else if !found { // a bot code that never connected has no agent row
 		accounts.WriteError(w, http.StatusNotFound, "unknown_agent")
 		return
 	}
@@ -234,7 +244,8 @@ func (b *botHub) handlePutRoutine(w http.ResponseWriter, r *http.Request) {
 		HumanMode *bool           `json:"humanMode"`
 		Routine   json.RawMessage `json:"routine"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRoutineBody)).Decode(&in); err != nil || in.HumanMode == nil || in.Routine == nil {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRoutineBody))
+	if err != nil || json.Unmarshal(body, &in) != nil || in.HumanMode == nil || in.Routine == nil {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_routine")
 		return
 	}
@@ -247,10 +258,6 @@ func (b *botHub) handlePutRoutine(w http.ResponseWriter, r *http.Request) {
 		}
 		stored = mustJSON(rt)
 	}
-	if codeID, ok = b.limitAgent(w, r); !ok {
-		return
-	}
-	userID := principalOf(r).UserID
 	found, err := b.acc.SaveBotAgentRoutine(userID, codeID, stored, *in.HumanMode)
 	if err != nil {
 		log.Error().Err(err).Msg("bot routine save failed")
@@ -264,6 +271,7 @@ func (b *botHub) handlePutRoutine(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	b.sendRoutineLocked(userID, codeID)
 	b.mu.Unlock()
+	b.changed(userID)
 	accounts.WriteJSON(w, http.StatusOK, routineView{HumanMode: *in.HumanMode, Routine: routineJSONOf(stored)})
 }
 

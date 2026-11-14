@@ -84,18 +84,19 @@ func validPercent(p *int) bool { return p == nil || (*p >= 0 && *p <= 100) }
 // ([a-z0-9-]{1,40}), a bookmaker (1–40 chars), number ≥ 1, a known device and state, proxy ≤ 100
 // chars, reason ≤ 200 chars and mode empty, bot, login or stopped, boot empty or 16 lowercase hex,
 // proto 0–99, a window's human with an activity of 1–16 chars, sport ≤ 40, detail ≤ 120 and since
-// ≥ 0, and humanActivities of at most 20 bookmakers ([a-z0-9]{1,40}) with names of routine activities.
+// ≥ 0, and humanActivities of at most 20 bookmakers ([a-z0-9]{1,40}), each with at most 6 distinct
+// names of routine activities.
 func validStatus(in botStatusIn) bool {
 	if len(in.Books) > 64 || len(in.Windows) > 32 || runeLen(in.Version) > 64 || (in.Boot != "" && !bootPattern.MatchString(in.Boot)) ||
 		in.Proto < 0 || in.Proto > 99 || len(in.HumanActivities) > 20 {
 		return false
 	}
 	for book, acts := range in.HumanActivities {
-		if !bookmakerPattern.MatchString(book) {
+		if !bookmakerPattern.MatchString(book) || len(acts) > len(routineActivities) {
 			return false
 		}
-		for _, a := range acts {
-			if !routineActivities[a] {
+		for i, a := range acts {
+			if !routineActivities[a] || slices.Contains(acts[:i], a) {
 				return false
 			}
 		}

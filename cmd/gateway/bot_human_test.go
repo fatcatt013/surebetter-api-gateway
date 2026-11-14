@@ -52,6 +52,8 @@ func TestBotStatus_HumanValidation(t *testing.T) {
 		"acts unknown activity":  acts(`{"fortuna":["bet"]}`),
 		"acts not an array":      acts(`{"fortuna":"mybets"}`),
 		"acts an array":          acts(`["mybets"]`),
+		"acts 7 names":           acts(`{"fortuna":["prematch","live","community","mybets","open","inactive","open"]}`),
+		"acts a repeated name":   acts(`{"fortuna":["mybets","mybets"]}`),
 	}
 	for name, body := range bad {
 		if s, b := postStatus(t, srv, code, body); s != 400 || !strings.Contains(b, `"bad_status"`) {
@@ -183,6 +185,7 @@ func TestBotAgents_FleetHumanFields(t *testing.T) {
 		t.Fatalf("PUT routine: %d %s", s, b)
 	}
 	readType(t, bot) // {"type":"routine"}
+	expectBot(t, app, "after the routine PUT")
 
 	_, body := request(t, srv, "GET", "/api/me/bot/agents", token, "", nil)
 	for _, part := range []string{`"proto":4`, `"humanMode":true`, `"humanActivities":{"betano":[],"fortuna":["mybets"],"tipsport":[]}`,
