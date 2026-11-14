@@ -167,3 +167,45 @@ func TestBotSched_OffWindowsNeverPicked(t *testing.T) {
 		t.Fatalf("order sent: %+v, want betano-2", o)
 	}
 }
+
+// The Fleet shows each agent's protocol, human-mode switch and humanActivities, and each window's
+// human; an offline agent has protocol 0, no humanActivities and its windows down without human.
+func TestBotAgents_FleetHumanFields(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code, id := newBotCode(t, srv, token, "Home PC")
+	bot := startAgentWith(t, srv, code, p4Status(fortunaMybets,
+		humanWin("fortuna-1", "idle", "", `,"human":{"activity":"mybets","detail":"ticket 18:02","since":5}`),
+		humanWin("tipsport-1", "off", "sleep", "")), app)
+	if s, b := request(t, srv, "PUT", routinePath(id), token, `{"humanMode":true,"routine":null}`, nil); s != 200 {
+		t.Fatalf("PUT routine: %d %s", s, b)
+	}
+	readType(t, bot) // {"type":"routine"}
+
+	_, body := request(t, srv, "GET", "/api/me/bot/agents", token, "", nil)
+	for _, part := range []string{`"proto":4`, `"humanMode":true`, `"humanActivities":{"betano":[],"fortuna":["mybets"],"tipsport":[]}`,
+		`"human":{"activity":"mybets","detail":"ticket 18:02","since":5}`, `"state":"off"`} {
+		if !strings.Contains(body, part) {
+			t.Fatalf("online fleet has no %s: %s", part, body)
+		}
+	}
+	if strings.Count(body, `"human":`) != 1 {
+		t.Fatalf("a window without human shows one: %s", body)
+	}
+
+	bot.Close(1000, "")
+	expectBot(t, app, "on disconnect")
+	a := getFleet(t, srv, token)
+	if len(a) != 1 || a[0].Online || a[0].Proto != 0 || !a[0].HumanMode || a[0].HumanActivities == nil || len(a[0].HumanActivities) != 0 {
+		t.Fatalf("offline agent: %+v", a)
+	}
+	for _, w := range a[0].Windows {
+		if w.Human != nil || w.State != "down" {
+			t.Fatalf("offline window: %+v", w)
+		}
+	}
+	if _, body := request(t, srv, "GET", "/api/me/bot/agents", token, "", nil); !strings.Contains(body, `"proto":0,"humanMode":true,"humanActivities":{}`) {
+		t.Fatalf("offline JSON: %s", body)
+	}
+}

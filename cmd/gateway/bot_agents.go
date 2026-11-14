@@ -239,17 +239,22 @@ func (b *botHub) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // agentView is one agent in the GET /api/me/bot/agents body.
 type agentView struct {
-	ID       int64       `json:"id"`
-	Name     string      `json:"name"`
-	Online   bool        `json:"online"`
-	Version  string      `json:"version"`
-	Host     botHost     `json:"host"`
-	LastSeen int64       `json:"lastSeen"`
-	DryRun   bool        `json:"dryRun"`
-	Busy     bool        `json:"busy"`
-	Update   bool        `json:"update"`  // online with an agent older than protocol 2: never sent orders or commands
-	FlowsAt  int64       `json:"flowsAt"` // when its Flows last changed (Unix ms); 0 = no Flows
-	Windows  []botWindow `json:"windows"`
+	ID       int64   `json:"id"`
+	Name     string  `json:"name"`
+	Online   bool    `json:"online"`
+	Version  string  `json:"version"`
+	Host     botHost `json:"host"`
+	LastSeen int64   `json:"lastSeen"`
+	DryRun   bool    `json:"dryRun"`
+	Busy     bool    `json:"busy"`
+	Update   bool    `json:"update"`  // online with an agent older than protocol 2: never sent orders or commands
+	FlowsAt  int64   `json:"flowsAt"` // when its Flows last changed (Unix ms); 0 = no Flows
+	Proto    int     `json:"proto"`   // its last status's protocol; 0 = offline or none yet
+	// HumanMode is its human-mode switch; HumanActivities what its last status said it can run
+	// (bookmaker → activities beyond open/inactive; {} when none or offline).
+	HumanMode       bool                `json:"humanMode"`
+	HumanActivities map[string][]string `json:"humanActivities"`
+	Windows         []botWindow         `json:"windows"`
 }
 
 // windowsOf decodes a stored windows array; anything unreadable is no windows.
@@ -266,7 +271,9 @@ func windowsOf(js string) []botWindow {
 // its stored version, host name and windows, each window down ("Agent offline"), cpu/mem null,
 // dry run, not busy. busy: it runs an order (has reserved windows). update: online and its last
 // status (or none yet) is older than protocol 2. A window reserved for an order shows state busy,
-// the order's id and that leg's last step. flowsAt: when its Flows last changed (0 = none).
+// the order's id and that leg's last step. flowsAt: when its Flows last changed (0 = none). proto,
+// humanActivities and each window's human are the last status's (0, {} and none when offline);
+// humanMode is the stored switch.
 func (b *botHub) fleet(userID int64) ([]agentView, error) {
 	rows, err := b.acc.ListBotAgents(userID) // by name
 	if err != nil {
@@ -278,10 +285,14 @@ func (b *botHub) fleet(userID int64) ([]agentView, error) {
 	b.expireLocked(fx)
 	reserved := b.reservedLocked(userID)
 	for _, row := range rows {
-		v := agentView{ID: row.CodeID, Name: row.Name, LastSeen: row.LastSeenAt, FlowsAt: row.FlowsAt}
+		v := agentView{ID: row.CodeID, Name: row.Name, LastSeen: row.LastSeenAt, FlowsAt: row.FlowsAt, HumanMode: row.HumanMode,
+			HumanActivities: map[string][]string{}}
 		if p := b.presenceLocked(userID, row.CodeID); p != nil {
 			v.Online, v.DryRun, v.Busy, v.Version, v.Update = true, p.dryRun, len(reserved[row.CodeID]) > 0, p.version, p.proto < botProto
-			v.Host = botHost{Name: p.hostName, CPU: p.cpu, Mem: p.mem}
+			v.Host, v.Proto = botHost{Name: p.hostName, CPU: p.cpu, Mem: p.mem}, p.proto
+			if p.humanActs != nil {
+				v.HumanActivities = p.humanActs
+			}
 			v.Windows = windowsOf(p.windowsJSON)
 			for i := range v.Windows {
 				if o := b.orders[reserved[row.CodeID][v.Windows[i].ID]]; o != nil {
@@ -297,7 +308,7 @@ func (b *botHub) fleet(userID int64) ([]agentView, error) {
 			v.DryRun, v.Version, v.Host = true, row.Version, botHost{Name: row.HostName}
 			v.Windows = windowsOf(row.WindowsJSON)
 			for i := range v.Windows {
-				v.Windows[i].State, v.Windows[i].Reason = "down", "Agent offline"
+				v.Windows[i].State, v.Windows[i].Reason, v.Windows[i].Human = "down", "Agent offline", nil
 			}
 		}
 		out = append(out, v)

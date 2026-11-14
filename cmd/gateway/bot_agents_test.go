@@ -195,10 +195,12 @@ func TestBotAgents_Fleet(t *testing.T) {
 	want := []agentView{
 		// Online first, then by name ignoring case: attic, Home PC; then the offline VPS Praha.
 		// Both online agents speak protocol 1 (no "proto" in their status): they need an update.
-		{ID: atticID, Name: "attic", Online: true, Host: botHost{}, DryRun: true, Update: true, Windows: []botWindow{}},
+		{ID: atticID, Name: "attic", Online: true, Host: botHost{}, DryRun: true, Update: true, Windows: []botWindow{},
+			HumanActivities: map[string][]string{}},
 		{ID: homeID, Name: "Home PC", Online: true, Version: "0.9.0+e9ed9d2", Host: botHost{Name: "home-pc", CPU: intp(23), Mem: intp(41)},
-			DryRun: false, Update: true, Windows: windowsOf(fullWindowsJSON)},
-		{ID: vpsID, Name: "VPS Praha", Online: false, Version: "0.8.0", Host: botHost{Name: "home-pc"}, DryRun: true, Windows: down},
+			DryRun: false, Update: true, Windows: windowsOf(fullWindowsJSON), HumanActivities: map[string][]string{}},
+		{ID: vpsID, Name: "VPS Praha", Online: false, Version: "0.8.0", Host: botHost{Name: "home-pc"}, DryRun: true, Windows: down,
+			HumanActivities: map[string][]string{}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		gj, _ := json.Marshal(got)
