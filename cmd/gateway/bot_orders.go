@@ -52,6 +52,25 @@ type orderView struct {
 	Rule       string          `json:"rule"`     // from the last flow; "" = none
 	Playbook   string          `json:"playbook"` // from the last flow; "" = none
 	Flow       json.RawMessage `json:"flow"`     // the agent's last flow object; null = none
+	// Checkable: ended, real (not a dry run) and outcome_unknown or with a stuck flow: the user can
+	// mark it checked (human mode). CheckedAt: when they did (Unix ms); 0 = not checked.
+	Checkable bool  `json:"checkable"`
+	CheckedAt int64 `json:"checkedAt"`
+}
+
+// checkableOf: an ended (final state), real order that ended outcome_unknown or whose last flow has
+// a non-null stuck.
+func checkableOf(state string, dryRun bool, flow string) bool {
+	if dryRun || !botEvents[state] {
+		return false
+	}
+	if state == "outcome_unknown" {
+		return true
+	}
+	var f struct {
+		Stuck json.RawMessage `json:"stuck"`
+	}
+	return flow != "" && json.Unmarshal([]byte(flow), &f) == nil && len(f.Stuck) > 0 && string(f.Stuck) != "null"
 }
 
 func legViews(legs []storedLeg) []orderLegView {
@@ -101,7 +120,8 @@ func rowView(r accounts.BotOrderRow) orderView {
 	json.Unmarshal([]byte(r.LegsJSON), &legs)
 	return orderView{ID: r.ID, ArbKey: r.ArbKey, State: r.State, Reason: r.Reason, DryRun: r.DryRun, AgentID: r.CodeID, Agent: r.Agent,
 		Match: info.Match, Market: info.Market, Live: info.Live, ProfitPct: info.ProfitPct, Stake: r.Stake, CreatedAt: r.CreatedAt,
-		SentAt: r.SentAt, EndedAt: r.EndedAt, Legs: legViews(legs)}.withDetails(info, r.FlowJSON)
+		SentAt: r.SentAt, EndedAt: r.EndedAt, Legs: legViews(legs), Checkable: checkableOf(r.State, r.DryRun, r.FlowJSON),
+		CheckedAt: r.CheckedAt}.withDetails(info, r.FlowJSON)
 }
 
 // ordersView is the GET /api/me/bot/orders body.
@@ -196,4 +216,34 @@ func (b *botHub) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// handleOrderChecked is POST /api/me/bot/orders/{id}/checked: the user checked an ended order that
+// needed a check (checkableOf) on the bookmaker's site. It stores checked_at once (a second call
+// keeps the first time) and answers {"checkedAt"}; the order's agent is told ({"type":"routine"},
+// protocol 4: it re-reads its checked ids and clears the window's needs-check flag), then the app
+// ({"type":"bot"}). 404 unknown_order: unknown or another user's; 409 not_checkable.
+func (b *botHub) handleOrderChecked(w http.ResponseWriter, r *http.Request) {
+	userID := principalOf(r).UserID
+	row, found, err := b.acc.BotOrderByID(userID, r.PathValue("id"))
+	if err == nil && found && checkableOf(row.State, row.DryRun, row.FlowJSON) {
+		row.CheckedAt, err = b.acc.MarkBotOrderChecked(userID, row.ID, b.now().UnixMilli())
+	}
+	switch {
+	case err != nil:
+		log.Error().Err(err).Msg("bot order checked failed")
+		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	case !found:
+		accounts.WriteError(w, http.StatusNotFound, "unknown_order")
+		return
+	case row.CheckedAt == 0:
+		accounts.WriteError(w, http.StatusConflict, "not_checkable")
+		return
+	}
+	b.mu.Lock()
+	b.sendRoutineLocked(userID, row.CodeID)
+	b.mu.Unlock()
+	b.changed(userID)
+	accounts.WriteJSON(w, http.StatusOK, map[string]int64{"checkedAt": row.CheckedAt})
 }

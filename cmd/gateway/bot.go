@@ -259,6 +259,7 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("GET /api/me/bot", acc.RequireSession(http.HandlerFunc(b.handleGet)))
 	mux.Handle("POST /api/me/bot/orders", acc.RequireSession(http.HandlerFunc(b.handleOrder)))
 	mux.Handle("GET /api/me/bot/orders", acc.RequireSession(http.HandlerFunc(b.handleGetOrders)))
+	mux.Handle("POST /api/me/bot/orders/{id}/checked", acc.RequireSession(http.HandlerFunc(b.handleOrderChecked)))
 	mux.Handle("DELETE /api/me/bot/orders/{id}", acc.RequireSession(http.HandlerFunc(b.handleCancelOrder)))
 	mux.Handle("POST /api/me/bot/status", acc.RequireBotCode(http.HandlerFunc(b.handleStatus)))
 	mux.Handle("POST /api/me/bot/events", acc.RequireBotCode(http.HandlerFunc(b.handleEvent)))

@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/surebetter/api-gateway/internal/accounts"
 )
@@ -207,5 +208,106 @@ func TestBotAgents_FleetHumanFields(t *testing.T) {
 	}
 	if _, body := request(t, srv, "GET", "/api/me/bot/agents", token, "", nil); !strings.Contains(body, `"proto":0,"humanMode":true,"humanActivities":{}`) {
 		t.Fatalf("offline JSON: %s", body)
+	}
+}
+
+func checkedPath(id string) string { return "/api/me/bot/orders/" + id + "/checked" }
+
+// Ended real orders that ended outcome_unknown or with a stuck flow are checkable; Checked marks one
+// once, tells its agent ({"type":"routine"}) and the app ({"type":"bot"}).
+func TestBotOrders_Checked(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	clk := &botClock{t: time.Date(2026, 11, 14, 11, 0, 0, 0, time.UTC)} // 12:00 in Prague
+	bots.now = clk.now
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	uid := userIDOf(t, svc, token)
+	otherToken := newUser(t, svc, "o@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code, codeID := newBotCode(t, srv, token, "Home PC")
+	bot := startAgentWith(t, srv, code, tipBetIdleP4, app)
+
+	now := clk.now().UnixMilli()
+	insert := func(id, state string, dryRun bool, flow string) {
+		t.Helper()
+		if err := svc.InsertBotOrder(accounts.BotOrderRow{ID: id, UserID: uid, ArbKey: id, CodeID: codeID, State: state, DryRun: dryRun,
+			InfoJSON: `{"match":"A – B"}`, LegsJSON: "[]", FlowJSON: flow, CreatedAt: now - 60_000, SentAt: now - 50_000, EndedAt: now - 40_000}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stuck := `{"rule":"r1","playbook":"p1","phase":2,"stuck":{"since":1}}`
+	insert("00000000000000c1", "outcome_unknown", false, "")
+	insert("00000000000000c2", "stopped", false, stuck)
+	insert("00000000000000c3", "stopped", false, `{"rule":"r1","playbook":"p1","phase":2,"stuck":null}`)
+	insert("00000000000000c4", "outcome_unknown", true, "")
+	insert("00000000000000c5", "placed", false, `{"rule":"r1","playbook":"p1","phase":2}`)
+	insert("00000000000000c6", "cashed_out", false, stuck)
+	insert("00000000000000c7", "running", false, stuck) // not ended (a row only: not in the history)
+
+	checkable := func() map[string]bool {
+		t.Helper()
+		out := map[string]bool{}
+		for _, o := range getOrders(t, srv, token, "").History {
+			out[o.ID] = o.Checkable
+			if o.CheckedAt != 0 {
+				t.Fatalf("%s checked before any POST: %+v", o.ID, o)
+			}
+		}
+		return out
+	}
+	want := map[string]bool{"00000000000000c1": true, "00000000000000c2": true, "00000000000000c3": false, "00000000000000c4": false,
+		"00000000000000c5": false, "00000000000000c6": true}
+	if got := checkable(); len(got) != len(want) {
+		t.Fatalf("history: %v", got)
+	} else {
+		for id, w := range want {
+			if got[id] != w {
+				t.Errorf("%s checkable = %v, want %v", id, got[id], w)
+			}
+		}
+	}
+	if _, b := request(t, srv, "GET", "/api/me/bot/orders", token, "", nil); !strings.Contains(b, `"checkable":true,"checkedAt":0`) {
+		t.Fatalf("orders JSON: %s", b)
+	}
+
+	// Not checkable: 409; another user's or unknown: 404; cross-site: 403.
+	for _, id := range []string{"00000000000000c3", "00000000000000c4", "00000000000000c5", "00000000000000c7"} {
+		if s, b := request(t, srv, "POST", checkedPath(id), token, "", nil); s != 409 || !strings.Contains(b, `"not_checkable"`) {
+			t.Errorf("%s: %d %s, want 409 not_checkable", id, s, b)
+		}
+	}
+	for _, c := range []struct{ token, id string }{{otherToken, "00000000000000c1"}, {token, "ffffffffffffffff"}} {
+		if s, b := request(t, srv, "POST", checkedPath(c.id), c.token, "", nil); s != 404 || !strings.Contains(b, `"unknown_order"`) {
+			t.Errorf("%s: %d %s, want 404 unknown_order", c.id, s, b)
+		}
+	}
+	if s, b := request(t, srv, "POST", checkedPath("00000000000000c1"), token, "", map[string]string{"Origin": "http://evil.example"}); s != 403 ||
+		!strings.Contains(b, `"bad_origin"`) {
+		t.Fatalf("cross-site: %d %s", s, b)
+	}
+
+	if s, b := request(t, srv, "POST", checkedPath("00000000000000c1"), token, "", nil); s != 200 ||
+		strings.TrimSpace(b) != `{"checkedAt":`+itoa(now)+`}` {
+		t.Fatalf("checked: %d %s", s, b)
+	}
+	if got := readType(t, bot); got != "routine" {
+		t.Fatalf("agent got %s, want routine", got)
+	}
+	expectBot(t, app, "after Checked")
+	// Again later: the first time stays (and both are told again).
+	clk.advance(time.Minute)
+	if s, b := request(t, srv, "POST", checkedPath("00000000000000c1"), token, "", nil); s != 200 ||
+		strings.TrimSpace(b) != `{"checkedAt":`+itoa(now)+`}` {
+		t.Fatalf("checked again: %d %s", s, b)
+	}
+	readType(t, bot)
+	expectBot(t, app, "after Checked again")
+	for _, o := range getOrders(t, srv, token, "").History {
+		if (o.ID == "00000000000000c1") != (o.CheckedAt == now) || (o.ID == "00000000000000c1" && !o.Checkable) {
+			t.Fatalf("history after Checked: %+v", o)
+		}
+	}
+	// The agent's own routine lists it.
+	if _, b := request(t, srv, "GET", "/api/me/bot/routine", "", "", bearer(code)); !strings.Contains(b, `"checked":["00000000000000c1"]`) {
+		t.Fatalf("own routine: %s", b)
 	}
 }
