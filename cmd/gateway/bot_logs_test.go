@@ -394,3 +394,42 @@ func TestBotLogs_DetailKeepsTheStuckDecision(t *testing.T) {
 		t.Fatalf("a number as a string: %d %s", s, b)
 	}
 }
+
+// step= filters on the exact step (the Human logs: step=human), with the other filters.
+func TestBotLogs_StepParam(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	home, _ := newBotCode(t, srv, token, "Home PC")
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	body := `{"lines":[` + strings.Join([]string{
+		logLine(base+1000, "info", "fortuna-1", "", "human", "Fortuna 1 · check my bets · ticket 2026-11-14 18:02"),
+		logLine(base+2000, "info", "tipsport-1", "", "human", "Tipsport 1 · mybets not available · page open"),
+		logLine(base+3000, "warn", "fortuna-1", "", "humans", "not this step"),
+		logLine(base+4000, "warn", "fortuna-1", "", "human", "Fortuna 1 · refused · https://example.com/"),
+		logLine(base+5000, "info", "fortuna-1", "", "navigate", "human in a message"),
+	}, ",") + `]}`
+	if s, b := postLogs(t, srv, home, body); s != 204 {
+		t.Fatalf("post: %d %s", s, b)
+	}
+	cases := map[string][]string{
+		"?step=human": {"Fortuna 1 · refused · https://example.com/", "Tipsport 1 · mybets not available · page open",
+			"Fortuna 1 · check my bets · ticket 2026-11-14 18:02"},
+		"?step=human&window=fortuna-1":     {"Fortuna 1 · refused · https://example.com/", "Fortuna 1 · check my bets · ticket 2026-11-14 18:02"},
+		"?step=human&problems=1":           {"Fortuna 1 · refused · https://example.com/"},
+		"?step=human&q=ticket":             {"Fortuna 1 · check my bets · ticket 2026-11-14 18:02"},
+		"?step=" + strings.Repeat("s", 40): {},
+		"?step=":                           {"human in a message", "Fortuna 1 · refused · https://example.com/", "not this step", "Tipsport 1 · mybets not available · page open", "Fortuna 1 · check my bets · ticket 2026-11-14 18:02"},
+	}
+	for q, want := range cases {
+		if got := msgs(getLogs(t, srv, token, q)); !slices.Equal(got, want) && !(len(got) == 0 && len(want) == 0) {
+			t.Errorf("%s: %v, want %v", q, got, want)
+		}
+	}
+	if s, b := request(t, srv, "GET", "/api/me/bot/logs?step="+strings.Repeat("s", 41), token, "", nil); s != 400 || !strings.Contains(b, `"bad_query"`) {
+		t.Fatalf("step over 40: %d %s", s, b)
+	}
+	if s, b := request(t, srv, "GET", "/api/me/bot/logs.txt?step=human", token, "", nil); s != 200 || strings.Count(b, "\n") != 3 ||
+		strings.Contains(b, "human in a message") {
+		t.Fatalf("logs.txt step=human: %d %s", s, b)
+	}
+}

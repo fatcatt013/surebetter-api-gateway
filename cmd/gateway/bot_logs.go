@@ -178,12 +178,12 @@ func positiveInt(v string) (int64, bool) {
 }
 
 // logFilterOf reads the GET /api/me/bot/logs query: agent (code id), window (≤ 40 chars), order
-// (≤ 32), problems=1, q (≤ 100 chars), after or before (log ids, not both), limit (1–500, default
+// (≤ 32), step (exact, ≤ 40; step=human is the Human logs), problems=1, q (≤ 100 chars), after or before (log ids, not both), limit (1–500, default
 // 200). With after the lines come oldest first, else newest first. false: bad_query.
 func logFilterOf(q url.Values) (accounts.BotLogFilter, bool) {
-	f := accounts.BotLogFilter{WindowID: q.Get("window"), OrderID: q.Get("order"), Problems: q.Get("problems") == "1",
+	f := accounts.BotLogFilter{WindowID: q.Get("window"), OrderID: q.Get("order"), Step: q.Get("step"), Problems: q.Get("problems") == "1",
 		Query: q.Get("q"), Limit: 200}
-	if runeLen(f.WindowID) > 40 || runeLen(f.OrderID) > 32 || runeLen(f.Query) > 100 {
+	if runeLen(f.WindowID) > 40 || runeLen(f.OrderID) > 32 || runeLen(f.Step) > 40 || runeLen(f.Query) > 100 {
 		return f, false
 	}
 	var ok bool
