@@ -61,7 +61,10 @@ type botPresence struct {
 	hostName    string
 	cpu, mem    *int                 // percent; nil = not reported
 	windowsJSON string               // the last status's windows, as a JSON array
+	windowsKey  string               // the same without each window's human (setStatus's change check)
 	windows     []botWindow          // the same, decoded
+	humanActs   map[string][]string  // the last status's humanActivities; nil = none yet
+	humanJSON   string               // the same as JSON; "" = none yet
 	boot        string               // the last status's boot id (agent process); "" = not sent
 	proto       int                  // the last status's protocol; 0 = none yet or a Phase 1 agent
 	idleSince   map[string]time.Time // window id → when the gateway first saw it idle and not reserved
@@ -199,7 +202,7 @@ func (b *botHub) attach(c *Client) {
 		b.agents[userID] = map[int64]*botPresence{}
 	}
 	old := b.agents[userID][codeID]
-	b.agents[userID][codeID] = &botPresence{client: c, books: []botBook{}, dryRun: true, windowsJSON: "[]",
+	b.agents[userID][codeID] = &botPresence{client: c, books: []botBook{}, dryRun: true, windowsJSON: "[]", windowsKey: "[]", humanJSON: "{}",
 		idleSince: map[string]time.Time{}, reservedAt: b.now()}
 	b.dispatchLocked(userID, fx)
 	b.release(fx)

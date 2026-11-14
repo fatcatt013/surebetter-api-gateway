@@ -24,9 +24,21 @@ type botWindow struct {
 	Proxy     *string `json:"proxy"`
 	Reason    string  `json:"reason"`
 	Mode      string  `json:"mode,omitempty"` // bot, login or stopped (protocol 2); absent for older agents
+	// Human is what the window does in human mode (protocol 4); nil = nothing (Page open).
+	Human *botHuman `json:"human,omitempty"`
 	// Set by the gateway on the Fleet for a window reserved for an order (never taken from a status).
 	OrderID string `json:"orderId,omitempty"`
 	Step    string `json:"step,omitempty"` // that leg's last step
+}
+
+// botHuman is a window's human-mode activity as its agent reports it: activity (e.g. mybets, or
+// check for a window that needs a check), sport, detail (e.g. a ticket or an order id) and since
+// (Unix ms). The Fleet shows it; a change of it alone does not tell the app.
+type botHuman struct {
+	Activity string `json:"activity"`
+	Sport    string `json:"sport,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+	Since    int64  `json:"since"`
 }
 
 // botHost is the agent's machine. cpu and mem (percent) are kept in memory only.
@@ -45,6 +57,8 @@ type botStatusIn struct {
 	Windows []botWindow `json:"windows"`
 	Boot    string      `json:"boot"`  // 16 lowercase hex, random per agent process; "" = not sent
 	Proto   int         `json:"proto"` // agent protocol: 2 takes orders with window ids and commands; 0 = not sent (Phase 1)
+	// HumanActivities: bookmaker → the activities beyond open/inactive the agent can run there (protocol 4).
+	HumanActivities map[string][]string `json:"humanActivities"`
 }
 
 // botProto is the agent protocol the gateway sends orders and window commands to (and above).
@@ -54,8 +68,9 @@ var (
 	bootPattern     = regexp.MustCompile(`^[0-9a-f]{16}$`)
 	windowIDPattern = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
 	windowDevices   = map[string]bool{"desktop": true, "phone": true}
-	// logged_out and blocked are reserved for later agent versions, accepted and shown already.
-	windowStates = map[string]bool{"idle": true, "busy": true, "down": true, "logged_out": true, "blocked": true}
+	// logged_out and blocked are reserved for later agent versions, accepted and shown already. off:
+	// inactive by the routine (reason sleep or inactive), neither ready nor usable.
+	windowStates = map[string]bool{"idle": true, "busy": true, "down": true, "logged_out": true, "blocked": true, "off": true}
 	// "" = an older agent that does not report modes.
 	windowModes = map[string]bool{"": true, "bot": true, "login": true, "stopped": true}
 )
@@ -68,11 +83,22 @@ func validPercent(p *int) bool { return p == nil || (*p >= 0 && *p <= 100) }
 // ≤ 64 chars, host name ≤ 64 chars, cpu and mem 0–100, at most 32 windows with unique ids
 // ([a-z0-9-]{1,40}), a bookmaker (1–40 chars), number ≥ 1, a known device and state, proxy ≤ 100
 // chars, reason ≤ 200 chars and mode empty, bot, login or stopped, boot empty or 16 lowercase hex,
-// and proto 0–99.
+// proto 0–99, a window's human with an activity of 1–16 chars, sport ≤ 40, detail ≤ 120 and since
+// ≥ 0, and humanActivities of at most 20 bookmakers ([a-z0-9]{1,40}) with names of routine activities.
 func validStatus(in botStatusIn) bool {
 	if len(in.Books) > 64 || len(in.Windows) > 32 || runeLen(in.Version) > 64 || (in.Boot != "" && !bootPattern.MatchString(in.Boot)) ||
-		in.Proto < 0 || in.Proto > 99 {
+		in.Proto < 0 || in.Proto > 99 || len(in.HumanActivities) > 20 {
 		return false
+	}
+	for book, acts := range in.HumanActivities {
+		if !bookmakerPattern.MatchString(book) {
+			return false
+		}
+		for _, a := range acts {
+			if !routineActivities[a] {
+				return false
+			}
+		}
 	}
 	for _, b := range in.Books {
 		if b.Bookmaker == "" || runeLen(b.Bookmaker) > 40 {
@@ -86,12 +112,16 @@ func validStatus(in botStatusIn) bool {
 	for _, w := range in.Windows {
 		if !windowIDPattern.MatchString(w.ID) || seen[w.ID] || w.Bookmaker == "" || runeLen(w.Bookmaker) > 40 || w.Number < 1 ||
 			!windowDevices[w.Device] || !windowStates[w.State] || runeLen(w.Reason) > 200 || (w.Proxy != nil && runeLen(*w.Proxy) > 100) ||
-			!windowModes[w.Mode] {
+			!windowModes[w.Mode] || (w.Human != nil && !validHuman(*w.Human)) {
 			return false
 		}
 		seen[w.ID] = true
 	}
 	return true
+}
+
+func validHuman(h botHuman) bool {
+	return h.Activity != "" && runeLen(h.Activity) <= 16 && runeLen(h.Sport) <= 40 && runeLen(h.Detail) <= 120 && h.Since >= 0
 }
 
 // botStatus is a validated status as the hub keeps it.
@@ -102,9 +132,12 @@ type botStatus struct {
 	hostName    string
 	cpu, mem    *int
 	windowsJSON string
+	windowsKey  string // windowsJSON without each window's human: what the change check compares
 	windows     []botWindow
 	boot        string
 	proto       int
+	humanActs   map[string][]string // never nil
+	humanJSON   string              // humanActs as JSON ("{}" when none)
 }
 
 func statusOf(in botStatusIn) botStatus {
@@ -122,14 +155,26 @@ func statusOf(in botStatusIn) botStatus {
 		in.Windows[i].OrderID, in.Windows[i].Step = "", "" // the gateway's overlay, not the agent's
 	}
 	st.windows = in.Windows
-	js, _ := json.Marshal(in.Windows) // plain structs: cannot fail
-	st.windowsJSON = string(js)
+	st.windowsJSON = mustJSON(in.Windows)
+	bare := slices.Clone(in.Windows)
+	for i := range bare {
+		bare[i].Human = nil
+	}
+	st.windowsKey = mustJSON(bare)
+	st.humanActs = map[string][]string{}
+	for book, acts := range in.HumanActivities {
+		if acts == nil {
+			acts = []string{}
+		}
+		st.humanActs[book] = acts
+	}
+	st.humanJSON = mustJSON(st.humanActs) // map keys sorted: the same set is the same JSON
 	return st
 }
 
 // setStatus stores an agent's last status in memory and its version, host name and windows in the
-// registry. The app is told ({"type":"bot"}) when books, dry run, version, host name, windows or
-// the protocol changed, not for cpu/mem alone. A status with a boot id other than the one the agent
+// registry. The app is told ({"type":"bot"}) when books, dry run, version, host name, windows (not
+// counting their human), humanActivities or the protocol changed, not for cpu/mem or human alone. A status with a boot id other than the one the agent
 // had when it was sent a still running order (or with one when that was empty) means the agent
 // process restarted and can never report that order: every such order ends outcome_unknown ("agent
 // restarted"), relayed like a posted final event. A status without a boot id ends nothing. Then the
@@ -146,7 +191,7 @@ func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 	fx := &effects{}
 	b.expireLocked(fx)
 	changed := p.dryRun != st.dryRun || !slices.Equal(p.books, st.books) || p.version != st.version ||
-		p.hostName != st.hostName || p.windowsJSON != st.windowsJSON || p.proto != st.proto
+		p.hostName != st.hostName || p.windowsKey != st.windowsKey || p.humanJSON != st.humanJSON || p.proto != st.proto
 	// While the user is paused, a socket's first protocol-2 status gets {"type":"pause"}: the agent may
 	// have been disconnected when the pause was sent, with pairs still before their barrier.
 	if p.proto < botProto && st.proto >= botProto && b.settingsLocked(userID).Paused {
@@ -154,6 +199,7 @@ func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 	}
 	p.books, p.dryRun, p.version, p.hostName, p.windowsJSON = st.books, st.dryRun, st.version, st.hostName, st.windowsJSON
 	p.windows, p.proto, p.cpu, p.mem, p.boot = st.windows, st.proto, st.cpu, st.mem, st.boot
+	p.windowsKey, p.humanActs, p.humanJSON = st.windowsKey, st.humanActs, st.humanJSON
 	if st.boot != "" {
 		for _, o := range b.ordersLocked(userID, orderRunning) {
 			if o.codeID == codeID && o.boot != st.boot {
