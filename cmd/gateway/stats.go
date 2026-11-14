@@ -26,6 +26,7 @@ const (
 	statsMaxRangeMs  = 400 * 24 * 3600 * 1000
 	statsMaxPoints   = 2000
 	statsMaxBooks    = 20
+	statsMaxSports   = 20
 	statsDefaultDays = 14
 )
 
@@ -42,8 +43,9 @@ type statsFilter struct {
 	include, exclude     map[string]bool
 	only                 bool // mode=only: every leg at an included book (default any: at least one)
 	minProfit, maxProfit *float64
-	minLife, maxLife     *float64 // seconds; either set leaves out unknown lifetimes
-	sport, market        string
+	minLife, maxLife     *float64        // seconds; either set leaves out unknown lifetimes
+	sports, exSports     map[string]bool // sport ids; "esports" covers every esports-<game>
+	market               string
 	live                 string // "" (all), "live", "prematch"
 	bucket               string // hour, day, week
 	hasCursor            bool
@@ -108,7 +110,10 @@ func parseStatsQuery(q url.Values, now time.Time) (statsFilter, bool) {
 		f.minLife != nil && f.maxLife != nil && *f.minLife > *f.maxLife {
 		return f, false
 	}
-	if f.sport = q.Get("sport"); f.sport != "" && !statsSportRe.MatchString(f.sport) {
+	if f.sports, ok = statsIDs(q.Get("sport"), statsSportRe, statsMaxSports); !ok {
+		return f, false
+	}
+	if f.exSports, ok = statsIDs(q.Get("exSport"), statsSportRe, statsMaxSports); !ok {
 		return f, false
 	}
 	if f.market = q.Get("market"); f.market != "" && !statsMarketRe.MatchString(f.market) {
@@ -145,16 +150,21 @@ func parseStatsQuery(q url.Values, now time.Time) (statsFilter, bool) {
 
 // statsBooks reads a comma-separated bookmaker list; "" = nil (not set).
 func statsBooks(s string) (map[string]bool, bool) {
+	return statsIDs(s, statsBookRe, statsMaxBooks)
+}
+
+// statsIDs reads a comma-separated id list; "" = nil, a bad id or more than max = false.
+func statsIDs(s string, re *regexp.Regexp, max int) (map[string]bool, bool) {
 	if s == "" {
 		return nil, true
 	}
 	parts := strings.Split(s, ",")
-	if len(parts) > statsMaxBooks {
+	if len(parts) > max {
 		return nil, false
 	}
 	m := make(map[string]bool, len(parts))
 	for _, p := range parts {
-		if !statsBookRe.MatchString(p) {
+		if !re.MatchString(p) {
 			return nil, false
 		}
 		m[p] = true
@@ -211,9 +221,22 @@ func statsLifeS(r accounts.TelegramStatRow) (float64, bool) {
 	return float64(r.EndedAt-r.FirstDetectedAt) / 1000, true
 }
 
+// statsSportGroup is the sport the page shows: every esports game (esports-cs2, …) is "esports".
+func statsSportGroup(sport string) string {
+	if strings.HasPrefix(sport, "esports-") {
+		return "esports"
+	}
+	return sport
+}
+
+// statsSportIn: the sport, or its group (esports), is in the set.
+func statsSportIn(set map[string]bool, sport string) bool {
+	return set[sport] || set[statsSportGroup(sport)]
+}
+
 // keep reports whether a row in the range passes the filters (the cursor is not a filter).
 func (f statsFilter) keep(r accounts.TelegramStatRow) bool {
-	if f.sport != "" && r.Sport != f.sport && !(f.sport == "esports" && strings.HasPrefix(r.Sport, "esports-")) {
+	if statsSportIn(f.exSports, r.Sport) || f.sports != nil && !statsSportIn(f.sports, r.Sport) {
 		return false
 	}
 	if f.market != "" && r.MarketType != f.market {
@@ -483,10 +506,11 @@ func computeStats(f statsFilter, rows []accounts.TelegramStatRow, seen map[strin
 		local := time.UnixMilli(r.SentAt).In(prague)
 		a.Heatmap[(int(local.Weekday())+6)%7][local.Hour()]++
 
-		key := [2]string{r.MarketType, r.Sport}
+		sport := statsSportGroup(r.Sport)
+		key := [2]string{r.MarketType, sport}
 		m := markets[key]
 		if m == nil {
-			m = &statsMarket{MarketType: r.MarketType, Sport: r.Sport}
+			m = &statsMarket{MarketType: r.MarketType, Sport: sport}
 			markets[key] = m
 		}
 		m.Arbs++

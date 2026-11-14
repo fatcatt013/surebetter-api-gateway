@@ -58,10 +58,11 @@ func itoa(v int64) string { return strconv.FormatInt(v, 10) }
 func TestStatsQuery_AllParameters(t *testing.T) {
 	now := pragueAt(2026, 11, 13, 12, 30)
 	f := mustQuery(t, "from=1000&to=2000&include=tipsport,betano&exclude=fortuna&mode=only&minProfit=1.5&maxProfit=0.5e1"+
-		"&minLife=0&maxLife=600&sport=esports&market=TOTAL_GAMES&live=prematch&bucket=week&cursor=1500.7", now)
+		"&minLife=0&maxLife=600&sport=esports,tennis&exSport=football&market=TOTAL_GAMES&live=prematch&bucket=week&cursor=1500.7", now)
 	want := statsFilter{from: 1000, to: 2000, include: map[string]bool{"tipsport": true, "betano": true},
 		exclude: map[string]bool{"fortuna": true}, only: true, minProfit: fptr(1.5), maxProfit: fptr(5),
-		minLife: fptr(0), maxLife: fptr(600), sport: "esports", market: "TOTAL_GAMES", live: "prematch", bucket: "week",
+		minLife: fptr(0), maxLife: fptr(600), sports: map[string]bool{"esports": true, "tennis": true}, exSports: map[string]bool{"football": true},
+		market: "TOTAL_GAMES", live: "prematch", bucket: "week",
 		hasCursor: true, cursorAt: 1500, cursorID: 7}
 	if !reflect.DeepEqual(f, want) {
 		t.Fatalf("got %+v\nwant %+v", f, want)
@@ -82,7 +83,8 @@ func TestStatsQuery_BadValues(t *testing.T) {
 		"include=Tipsport", "include=a,,b", "include=x_y", "exclude=" + long(41),
 		"include=a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17,a18,a19,a20,a21",
 		"mode=all", "minProfit=x", "maxProfit=NaN", "minProfit=Inf", "minProfit=5&maxProfit=4",
-		"minLife=-1", "maxLife=y", "minLife=10&maxLife=5", "sport=Tennis", "sport=" + long(41), "market=total goals",
+		"minLife=-1", "maxLife=y", "minLife=10&maxLife=5", "sport=Tennis", "sport=" + long(41), "sport=tennis,,football", "exSport=Football",
+		"sport=a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17,a18,a19,a20,a21", "market=total goals",
 		"live=yes", "bucket=month", "cursor=x", "cursor=1.", "cursor=.5", "cursor=1.-5",
 		"from=0&to=" + itoa(2001*3600_000) + "&bucket=hour", // more than 2000 points
 	} {
@@ -160,6 +162,13 @@ func TestStatsFilter_Keep(t *testing.T) {
 		{"sport=esports-cs2", cs2, true},
 		{"sport=esports-lol", cs2, false},
 		{"sport=esports", base, false},
+		{"sport=football,tennis", base, true},
+		{"sport=football,esports", cs2, true},
+		{"sport=football,esports", base, false},
+		{"exSport=esports", cs2, false},
+		{"exSport=esports", base, true},
+		{"exSport=tennis", base, false},
+		{"sport=tennis,esports&exSport=esports", cs2, false},
 		{"market=TOTAL_GAMES", base, true},
 		{"market=TOTAL_GOALS", base, false},
 		{"live=live", base, true},
@@ -344,6 +353,8 @@ func TestStats_MarketsHistogramsReasonsPairsBooks(t *testing.T) {
 	rows[0].MarketType, rows[0].Sport = "TOTAL_GOALS", "football"
 	rows[1].MarketType, rows[1].Sport = "TOTAL_GOALS", "football"
 	rows[2].MarketType = "TOTAL_GOALS" // tennis
+	rows[3].MarketType, rows[3].Sport = "MATCH_WINNER", "esports-cs2" // the esports games are one sport
+	rows[4].MarketType, rows[4].Sport = "MATCH_WINNER", "esports-lol"
 
 	a := compute(t, "", now, rows, "pinnacle")
 	var ph, lh []int
@@ -363,7 +374,8 @@ func TestStats_MarketsHistogramsReasonsPairsBooks(t *testing.T) {
 	if got := jsonOf(t, a.EndReasons); got != `{"removed":4,"evicted":1,"redetected":1,"absent":1,"unknown":1,"open":1}` {
 		t.Fatalf("reasons %s", got)
 	}
-	if got := jsonOf(t, a.Markets); got != `[{"marketType":"TOTAL_GAMES","sport":"tennis","arbs":6,"avgProfitPct":9.32},`+
+	if got := jsonOf(t, a.Markets); got != `[{"marketType":"TOTAL_GAMES","sport":"tennis","arbs":4,"avgProfitPct":10.5},`+
+		`{"marketType":"MATCH_WINNER","sport":"esports","arbs":2,"avgProfitPct":6.95},`+
 		`{"marketType":"TOTAL_GOALS","sport":"football","arbs":2,"avgProfitPct":0.75},`+
 		`{"marketType":"TOTAL_GOALS","sport":"tennis","arbs":1,"avgProfitPct":5.99}]` {
 		t.Fatalf("markets %s", got)
