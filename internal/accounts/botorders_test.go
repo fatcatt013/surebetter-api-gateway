@@ -222,3 +222,70 @@ func TestBotOrders_SetLegsOfARunningOrder(t *testing.T) {
 		t.Fatalf("ended: %s %v", legs(), err)
 	}
 }
+
+func TestBotOrders_Checked(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	other, _ := mustUser(t, s, "other@example.com", RoleUser)
+	home, _ := s.CreateCode(user.UserID, "Home PC", KindBot)
+	vps, _ := s.CreateCode(user.UserID, "VPS", KindBot)
+	ended := func(id string, code int64, endedAt int64) {
+		t.Helper()
+		if err := s.InsertBotOrder(BotOrderRow{ID: id, UserID: user.UserID, ArbKey: id, State: "waiting", InfoJSON: "{}", LegsJSON: "[]",
+			CreatedAt: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.MarkBotOrderSent(id, code, false, "[]", 2); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetBotOrderFlow(id, `{"stuck":{}}`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.EndBotOrder(id, "outcome_unknown", "", "[]", 0, endedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ended("000000000000000a", home.ID, 5000)
+	ended("000000000000000b", home.ID, 900) // ended before the window
+	ended("000000000000000c", vps.ID, 5000) // another agent
+	ended("000000000000000d", home.ID, 6000)
+
+	r, found, err := s.BotOrderByID(user.UserID, "000000000000000a")
+	if err != nil || !found || r.State != "outcome_unknown" || r.DryRun || r.CodeID != home.ID || r.FlowJSON != `{"stuck":{}}` ||
+		r.CheckedAt != 0 || r.EndedAt != 5000 || r.Agent != "Home PC" {
+		t.Fatalf("by id: %+v %v %v", r, found, err)
+	}
+	if _, found, err := s.BotOrderByID(other.UserID, "000000000000000a"); err != nil || found {
+		t.Fatalf("another user's order: %v %v", found, err)
+	}
+	if _, found, err := s.BotOrderByID(user.UserID, "ffffffffffffffff"); err != nil || found {
+		t.Fatalf("unknown order: %v %v", found, err)
+	}
+	// Checked once: a second mark keeps the first time; another user's mark changes nothing.
+	for _, id := range []string{"000000000000000a", "000000000000000b", "000000000000000c"} {
+		if at, err := s.MarkBotOrderChecked(user.UserID, id, 100); err != nil || at != 100 {
+			t.Fatalf("mark %s: %d %v", id, at, err)
+		}
+	}
+	if at, err := s.MarkBotOrderChecked(user.UserID, "000000000000000a", 200); err != nil || at != 100 {
+		t.Fatalf("second mark: %d %v", at, err)
+	}
+	if at, err := s.MarkBotOrderChecked(other.UserID, "000000000000000d", 300); err != nil || at != 0 {
+		t.Fatalf("another user's mark: %d %v", at, err)
+	}
+	ids, err := s.CheckedBotOrderIDs(user.UserID, home.ID, 1000)
+	if err != nil || len(ids) != 1 || ids[0] != "000000000000000a" {
+		t.Fatalf("checked ids: %v %v", ids, err)
+	}
+	if ids, err := s.CheckedBotOrderIDs(other.UserID, home.ID, 0); err != nil || ids == nil || len(ids) != 0 {
+		t.Fatalf("another user's checked ids: %#v %v", ids, err)
+	}
+	rows, _ := s.EndedBotOrders(user.UserID, 0, 10, 10)
+	at := map[string]int64{}
+	for _, r := range rows {
+		at[r.ID] = r.CheckedAt
+	}
+	if at["000000000000000a"] != 100 || at["000000000000000d"] != 0 {
+		t.Fatalf("ended rows checked_at: %v", at)
+	}
+}

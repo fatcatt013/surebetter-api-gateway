@@ -1,5 +1,10 @@
 package accounts
 
+import (
+	"database/sql"
+	"errors"
+)
+
 // BotOrderRow is one bot order in the history (bot_orders). Times are Unix ms; Stake is whole Kč.
 type BotOrderRow struct {
 	ID        string
@@ -17,6 +22,7 @@ type BotOrderRow struct {
 	CreatedAt int64
 	SentAt    int64
 	EndedAt   int64
+	CheckedAt int64 // when the user marked it checked (human mode); 0 = not checked
 }
 
 // BotOrderDayStats sums a user's orders created in one day: all orders, the placed ones, and the
@@ -67,7 +73,59 @@ func (s *Service) SetBotOrderFlow(id, flowJSON string) error {
 }
 
 const botOrderColumns = `o.id, o.user_id, o.arb_key, o.code_id, COALESCE(c.name, ''), o.state, o.reason, o.dry_run, o.stake,
-	o.info_json, o.legs_json, o.flow_json, o.created_at, o.sent_at, o.ended_at`
+	o.info_json, o.legs_json, o.flow_json, o.created_at, o.sent_at, o.ended_at, o.checked_at`
+
+// scanBotOrder reads one row of botOrderColumns.
+func scanBotOrder(row interface{ Scan(...any) error }) (BotOrderRow, error) {
+	var r BotOrderRow
+	err := row.Scan(&r.ID, &r.UserID, &r.ArbKey, &r.CodeID, &r.Agent, &r.State, &r.Reason, &r.DryRun, &r.Stake,
+		&r.InfoJSON, &r.LegsJSON, &r.FlowJSON, &r.CreatedAt, &r.SentAt, &r.EndedAt, &r.CheckedAt)
+	return r, err
+}
+
+// BotOrderByID returns userID's order id (any state); found false when it is unknown or another user's.
+func (s *Service) BotOrderByID(userID int64, id string) (BotOrderRow, bool, error) {
+	r, err := scanBotOrder(s.db.QueryRow(`SELECT `+botOrderColumns+` FROM bot_orders o LEFT JOIN extension_codes c ON c.id = o.code_id
+		WHERE o.id = ? AND o.user_id = ?`, id, userID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return BotOrderRow{}, false, nil
+	}
+	return r, err == nil, err
+}
+
+// MarkBotOrderChecked sets userID's order id checked at at, unless it already is, and returns its
+// checked time (the first one; 0 when it is not userID's order).
+func (s *Service) MarkBotOrderChecked(userID int64, id string, at int64) (int64, error) {
+	if _, err := s.db.Exec(`UPDATE bot_orders SET checked_at = ? WHERE id = ? AND user_id = ? AND checked_at = 0`, at, id, userID); err != nil {
+		return 0, err
+	}
+	var got int64
+	err := s.db.QueryRow(`SELECT checked_at FROM bot_orders WHERE id = ? AND user_id = ?`, id, userID).Scan(&got)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return got, err
+}
+
+// CheckedBotOrderIDs returns the ids of userID's orders sent to codeID that are checked and ended at
+// or after since, by id (never nil).
+func (s *Service) CheckedBotOrderIDs(userID, codeID, since int64) ([]string, error) {
+	rows, err := s.db.Query(`SELECT id FROM bot_orders WHERE user_id = ? AND code_id = ? AND checked_at > 0 AND ended_at >= ?
+		ORDER BY id`, userID, codeID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
 
 // EndedBotOrders returns userID's orders created in [from, to) that ended (placed, stopped,
 // outcome_unknown or cashed_out), newest first, at most limit.
@@ -81,9 +139,8 @@ func (s *Service) EndedBotOrders(userID, from, to int64, limit int) ([]BotOrderR
 	defer rows.Close()
 	out := []BotOrderRow{}
 	for rows.Next() {
-		var r BotOrderRow
-		if err := rows.Scan(&r.ID, &r.UserID, &r.ArbKey, &r.CodeID, &r.Agent, &r.State, &r.Reason, &r.DryRun, &r.Stake,
-			&r.InfoJSON, &r.LegsJSON, &r.FlowJSON, &r.CreatedAt, &r.SentAt, &r.EndedAt); err != nil {
+		r, err := scanBotOrder(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)

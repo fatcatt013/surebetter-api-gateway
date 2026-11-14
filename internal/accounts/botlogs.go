@@ -35,6 +35,7 @@ type BotLogFilter struct {
 	AgentID   int64  // code id
 	WindowID  string // exact
 	OrderID   string // exact
+	Step      string // exact
 	Problems  bool   // warn and error only
 	Query     string // substring of msg or step, case-insensitive (ASCII letters)
 	Since     int64  // ts at or after (Unix ms); 0 = no bound
@@ -81,6 +82,10 @@ func botLogsQuery(userID int64, f BotLogFilter) (string, []any) {
 	if f.OrderID != "" {
 		q += ` AND l.order_id = ?`
 		args = append(args, f.OrderID)
+	}
+	if f.Step != "" {
+		q += ` AND l.step = ?`
+		args = append(args, f.Step)
 	}
 	if f.Problems {
 		q += ` AND l.level <> 'info'` // the exact term of the partial index bot_logs_problems

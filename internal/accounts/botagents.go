@@ -21,6 +21,7 @@ type BotAgentRow struct {
 	LastSeenAt  int64
 	HasFlows    bool  // the agent has uploaded its Flows
 	FlowsAt     int64 // when its Flows last changed; 0 = never
+	HumanMode   bool  // the agent's human-mode switch
 }
 
 // TouchBotAgent records that codeID's agent is connected (or just disconnected): it inserts the
@@ -50,7 +51,7 @@ func (s *Service) SaveBotAgentStatus(userID, codeID int64, st BotAgentStatus) er
 // ListBotAgents returns userID's agents: its non-revoked bot codes that have an agent row, by name.
 func (s *Service) ListBotAgents(userID int64) ([]BotAgentRow, error) {
 	rows, err := s.db.Query(`SELECT a.code_id, c.name, a.version, a.host_name, a.windows_json, a.first_seen_at, a.last_seen_at,
-			a.flows_json <> '', a.flows_at
+			a.flows_json <> '', a.flows_at, a.human_mode
 		FROM bot_agents a JOIN extension_codes c ON c.id = a.code_id
 		WHERE a.user_id = ? AND c.user_id = a.user_id AND c.kind = 'bot' AND c.revoked_at IS NULL
 		ORDER BY c.name COLLATE NOCASE, a.code_id`, userID)
@@ -61,7 +62,7 @@ func (s *Service) ListBotAgents(userID int64) ([]BotAgentRow, error) {
 	out := []BotAgentRow{}
 	for rows.Next() {
 		var a BotAgentRow
-		if err := rows.Scan(&a.CodeID, &a.Name, &a.Version, &a.HostName, &a.WindowsJSON, &a.FirstSeenAt, &a.LastSeenAt, &a.HasFlows, &a.FlowsAt); err != nil {
+		if err := rows.Scan(&a.CodeID, &a.Name, &a.Version, &a.HostName, &a.WindowsJSON, &a.FirstSeenAt, &a.LastSeenAt, &a.HasFlows, &a.FlowsAt, &a.HumanMode); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -110,6 +111,29 @@ func (s *Service) BotAgentLimitIndex(userID, codeID int64) (js string, found boo
 // when codeID has no agent row of userID (nothing is written).
 func (s *Service) SaveBotAgentLimitIndex(userID, codeID int64, js string) (found bool, err error) {
 	res, err := s.db.Exec(`UPDATE bot_agents SET limit_index_json = ? WHERE code_id = ? AND user_id = ?`, js, codeID, userID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// BotAgentRoutine returns codeID's routine (a JSON object, "" when none was saved) and its human-mode
+// switch; found false when codeID has no agent row of userID.
+func (s *Service) BotAgentRoutine(userID, codeID int64) (routineJSON string, humanMode, found bool, err error) {
+	err = s.db.QueryRow(`SELECT routine_json, human_mode FROM bot_agents WHERE code_id = ? AND user_id = ?`, codeID, userID).
+		Scan(&routineJSON, &humanMode)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, false, nil
+	}
+	return routineJSON, humanMode, err == nil, err
+}
+
+// SaveBotAgentRoutine replaces codeID's routine (a validated JSON object, "" = none) and human-mode
+// switch; found false when codeID has no agent row of userID (nothing is written).
+func (s *Service) SaveBotAgentRoutine(userID, codeID int64, routineJSON string, humanMode bool) (found bool, err error) {
+	res, err := s.db.Exec(`UPDATE bot_agents SET routine_json = ?, human_mode = ? WHERE code_id = ? AND user_id = ?`,
+		routineJSON, humanMode, codeID, userID)
 	if err != nil {
 		return false, err
 	}

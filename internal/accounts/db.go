@@ -213,6 +213,11 @@ var migrations = []string{
 	// 8: bots controller Phase 3b (rule 3): each agent's limit index, a JSON array of
 	// {"bookmaker","sport","marketTypes":[…],"level":0|1|2} set by hand in the Fleet; '[]' = every cell Normal.
 	`ALTER TABLE bot_agents ADD COLUMN limit_index_json TEXT NOT NULL DEFAULT '[]';`,
+	// 9: bot human mode Phase A: each agent's routine (a JSON object, '' = none) and human-mode switch
+	// (off by default), and when the user marked an ended order as checked (0 = not checked).
+	`ALTER TABLE bot_agents ADD COLUMN routine_json TEXT NOT NULL DEFAULT '';
+	ALTER TABLE bot_agents ADD COLUMN human_mode INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE bot_orders ADD COLUMN checked_at INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

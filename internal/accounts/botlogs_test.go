@@ -149,3 +149,25 @@ func TestBotLogs_PruneInBatches(t *testing.T) {
 		t.Fatalf("after prune: %v", logIDs(got))
 	}
 }
+
+func TestBotLogs_StepFilter(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	home, _ := s.CreateCode(user.UserID, "Home PC", KindBot)
+	if err := s.AddBotLogs(user.UserID, home.ID, []BotLogLine{
+		{TS: 1000, Level: "info", WindowID: "fortuna-1", Step: "human", Msg: "Fortuna 1 · check my bets"},     // id 1
+		{TS: 2000, Level: "info", WindowID: "fortuna-1", Step: "humane", Msg: "not an exact match"},           // id 2
+		{TS: 3000, Level: "info", WindowID: "tipsport-1", Step: "human", Msg: "Tipsport 1 · page open"},       // id 3
+		{TS: 4000, Level: "warn", WindowID: "fortuna-1", Step: "placeBet", Msg: "a human-mode word in a msg"}, // id 4
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.QueryBotLogs(user.UserID, BotLogFilter{Step: "human"})
+	if err != nil || !slices.Equal(logIDs(got), []int64{3, 1}) {
+		t.Fatalf("step human: %v %v", logIDs(got), err)
+	}
+	got, _ = s.QueryBotLogs(user.UserID, BotLogFilter{Step: "human", WindowID: "fortuna-1"})
+	if !slices.Equal(logIDs(got), []int64{1}) {
+		t.Fatalf("step human + window: %v", logIDs(got))
+	}
+}

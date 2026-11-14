@@ -99,3 +99,43 @@ func TestBotAgents_LimitIndex(t *testing.T) {
 		t.Fatalf("index changed by another user: %q", js)
 	}
 }
+
+func TestBotAgents_Routine(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	other, _ := mustUser(t, s, "other@example.com", RoleUser)
+	home, _ := s.CreateCode(user.UserID, "Home PC", KindBot)
+	never, _ := s.CreateCode(user.UserID, "Never connected", KindBot)
+	if err := s.TouchBotAgent(user.UserID, home.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// A new agent: no routine, human mode off.
+	if js, on, found, err := s.BotAgentRoutine(user.UserID, home.ID); err != nil || !found || js != "" || on {
+		t.Fatalf("new agent: %q %v %v %v", js, on, found, err)
+	}
+	if list, _ := s.ListBotAgents(user.UserID); len(list) != 1 || list[0].HumanMode {
+		t.Fatalf("list: %+v", list)
+	}
+	if found, err := s.SaveBotAgentRoutine(user.UserID, home.ID, `{"version":1}`, true); err != nil || !found {
+		t.Fatalf("save: %v %v", found, err)
+	}
+	if js, on, found, err := s.BotAgentRoutine(user.UserID, home.ID); err != nil || !found || js != `{"version":1}` || !on {
+		t.Fatalf("after save: %q %v %v %v", js, on, found, err)
+	}
+	if list, _ := s.ListBotAgents(user.UserID); len(list) != 1 || !list[0].HumanMode {
+		t.Fatalf("list after save: %+v", list)
+	}
+	// Another user's agent, or a code without an agent row: not found, nothing written.
+	for _, c := range []struct{ user, code int64 }{{other.UserID, home.ID}, {user.UserID, never.ID}} {
+		if found, err := s.SaveBotAgentRoutine(c.user, c.code, "", false); err != nil || found {
+			t.Fatalf("save %+v: %v %v", c, found, err)
+		}
+		if _, _, found, err := s.BotAgentRoutine(c.user, c.code); err != nil || found {
+			t.Fatalf("read %+v: %v %v", c, found, err)
+		}
+	}
+	if js, on, _, _ := s.BotAgentRoutine(user.UserID, home.ID); js != `{"version":1}` || !on {
+		t.Fatalf("changed by another user: %q %v", js, on)
+	}
+}

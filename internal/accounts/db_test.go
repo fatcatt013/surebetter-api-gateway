@@ -336,3 +336,45 @@ func TestMigrate_AgentLimitIndex(t *testing.T) {
 		t.Fatalf("agent after the migration: %q (err %v)", row, err)
 	}
 }
+
+func TestMigrate_HumanMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The schema as shipped with Phase 3b (version 8), one agent with a limit index and one ended order.
+	steps := append(append([]string{}, migrations[:8]...), `PRAGMA user_version = 8`,
+		`INSERT INTO users (id, email, password_hash, role, created_at) VALUES (1, 'u@example.com', 'x', 'user', 0)`,
+		`INSERT INTO extension_codes (id, user_id, name, kind, code_hash, hint, created_at) VALUES (5, 1, 'Home PC', 'bot', 'h', 'ABCD', 0)`,
+		`INSERT INTO bot_agents (code_id, user_id, version, host_name, windows_json, first_seen_at, last_seen_at, limit_index_json)
+			VALUES (5, 1, '1.2.3', 'home-pc', '[]', 10, 20, '[{"bookmaker":"betano"}]')`,
+		`INSERT INTO bot_orders (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json, created_at, sent_at, ended_at)
+			VALUES ('00000000000000aa', 1, 'k', 5, 'outcome_unknown', '', 0, 10, '{}', '[]', 1, 2, 3)`)
+	for _, q := range steps {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%.60s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 9 || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want 9", version, err)
+	}
+	var agent string
+	if err := db.QueryRow(`SELECT code_id || '/' || limit_index_json || '/' || routine_json || '/' || human_mode FROM bot_agents`).Scan(&agent); err != nil ||
+		agent != `5/[{"bookmaker":"betano"}]//0` {
+		t.Fatalf("agent after the migration: %q (err %v)", agent, err)
+	}
+	var order string
+	if err := db.QueryRow(`SELECT id || '/' || state || '/' || ended_at || '/' || checked_at FROM bot_orders`).Scan(&order); err != nil ||
+		order != `00000000000000aa/outcome_unknown/3/0` {
+		t.Fatalf("order after the migration: %q (err %v)", order, err)
+	}
+}
