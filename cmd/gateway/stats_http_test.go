@@ -34,23 +34,27 @@ func seedSent(t *testing.T, svc *accounts.Service, msg int64, at time.Time, live
 	}
 }
 
-func TestStatsHTTP_AdminOnly(t *testing.T) {
+// Every signed-in user reads the statistics (the admins' Telegram group); the bot setup stays admin only.
+func TestStatsHTTP_EverySession(t *testing.T) {
 	srv, svc := newAuthServer(t, true)
 	admin := newUser(t, svc, "admin@example.com", accounts.RoleAdmin)
 	user := newUser(t, svc, "user@example.com", accounts.RoleUser)
-	for _, path := range []string{"/api/admin/stats/arbs", "/api/admin/stats/arbs.csv"} {
+	for _, path := range []string{"/api/stats/arbs", "/api/stats/arbs.csv"} {
 		if s, b := request(t, srv, "GET", path, "", "", nil); s != 401 || !strings.Contains(b, `"unauthorized"`) {
 			t.Errorf("%s without a session: %d %s", path, s, b)
 		}
-		if s, b := request(t, srv, "GET", path, user, "", nil); s != 403 || !strings.Contains(b, `"forbidden"`) {
+		if s, b := request(t, srv, "GET", path, user, "", nil); s != 200 {
 			t.Errorf("%s as a user: %d %s", path, s, b)
 		}
 		if s, b := request(t, srv, "GET", path, admin, "", nil); s != 200 {
 			t.Errorf("%s as the admin: %d %s", path, s, b)
 		}
-		if s, _ := request(t, srv, "POST", path, admin, "{}", nil); s != 405 {
+		if s, _ := request(t, srv, "POST", path, user, "{}", nil); s != 405 {
 			t.Errorf("POST %s: %d", path, s)
 		}
+	}
+	if s, b := request(t, srv, "GET", "/api/telegram/config", user, "", nil); s != 403 {
+		t.Errorf("the Telegram bot setup is still admin only: %d %s", s, b)
 	}
 	if s, _ := request(t, srv, "GET", "/api/admin/users", admin, "", nil); s != 200 {
 		t.Fatalf("the accounts' admin API still answers: %d", s)
@@ -61,7 +65,7 @@ func TestStatsHTTP_BadQuery(t *testing.T) {
 	srv, svc := newAuthServer(t, true)
 	admin := newUser(t, svc, "admin@example.com", accounts.RoleAdmin)
 	for _, q := range []string{"?from=x", "?include=A", "?live=1", "?bucket=hour&from=0&to=" + itoa(2001*3600_000)} {
-		for _, path := range []string{"/api/admin/stats/arbs", "/api/admin/stats/arbs.csv"} {
+		for _, path := range []string{"/api/stats/arbs", "/api/stats/arbs.csv"} {
 			if s, b := request(t, srv, "GET", path+q, admin, "", nil); s != 400 || !strings.Contains(b, `"bad_query"`) {
 				t.Errorf("%s%s: %d %s", path, q, s, b)
 			}
@@ -79,7 +83,7 @@ func TestStatsHTTP_ArbsFromTheDatabase(t *testing.T) {
 	seedSent(t, svc, 4, day.Add(12*time.Hour), true, 6, "", "chance", "tipsport")
 	seedSent(t, svc, 5, day.Add(24*time.Hour), true, 1, "removed", "fortuna", "tipsport") // at to: out
 	q := "?from=" + itoa(ms(day)) + "&to=" + itoa(ms(day.Add(24*time.Hour))) + "&exclude=chance"
-	s, b := request(t, srv, "GET", "/api/admin/stats/arbs"+q, admin, "", nil)
+	s, b := request(t, srv, "GET", "/api/stats/arbs"+q, admin, "", nil)
 	if s != 200 {
 		t.Fatalf("%d %s", s, b)
 	}
@@ -114,12 +118,12 @@ func TestStatsHTTP_CursorPages(t *testing.T) {
 		seedSent(t, svc, int64(i+1), now.Add(-time.Hour).Add(time.Duration(i)*time.Second), true, 2, "removed", "fortuna", "tipsport")
 	}
 	var a statsAnswer
-	_, b := request(t, srv, "GET", "/api/admin/stats/arbs", admin, "", nil) // default range: the last 14 days
+	_, b := request(t, srv, "GET", "/api/stats/arbs", admin, "", nil) // default range: the last 14 days
 	if err := json.Unmarshal([]byte(b), &a); err != nil || len(a.Rows) != 50 || a.NextCursor == nil || a.KPIs.Arbs != 55 {
 		t.Fatalf("page 1: %v %s", err, b)
 	}
 	newest := a.Rows[0].ID
-	_, b = request(t, srv, "GET", "/api/admin/stats/arbs?cursor="+*a.NextCursor, admin, "", nil)
+	_, b = request(t, srv, "GET", "/api/stats/arbs?cursor="+*a.NextCursor, admin, "", nil)
 	a = statsAnswer{}
 	if err := json.Unmarshal([]byte(b), &a); err != nil || len(a.Rows) != 5 || a.NextCursor != nil || a.Rows[0].ID != newest-50 {
 		t.Fatalf("page 2: %v %s", err, b)
@@ -134,7 +138,7 @@ func TestStatsHTTP_CSV(t *testing.T) {
 	seedSent(t, svc, 2, day.Add(11*time.Hour), false, 4, "", "betano", "tipsport")
 	seedSent(t, svc, 3, day.Add(12*time.Hour), true, 7, "unknown", "betano", "tipsport")
 	q := "?from=" + itoa(ms(day)) + "&to=" + itoa(ms(day.Add(24*time.Hour))) + "&maxProfit=5"
-	req, _ := http.NewRequest("GET", srv.URL+"/api/admin/stats/arbs.csv"+q, nil)
+	req, _ := http.NewRequest("GET", srv.URL+"/api/stats/arbs.csv"+q, nil)
 	req.Header.Set("Cookie", accounts.CookieName+"="+admin)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -163,10 +167,10 @@ func TestStatsHTTP_TooManyRows(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		seedSent(t, svc, int64(i+1), now.Add(-time.Duration(i+1)*time.Minute), true, 2, "removed", "fortuna", "tipsport")
 	}
-	if s, b := request(t, srv, "GET", "/api/admin/stats/arbs", admin, "", nil); s != 413 || !strings.Contains(b, `"too_many_rows"`) {
+	if s, b := request(t, srv, "GET", "/api/stats/arbs", admin, "", nil); s != 413 || !strings.Contains(b, `"too_many_rows"`) {
 		t.Fatalf("%d %s", s, b)
 	}
-	if s, _ := request(t, srv, "GET", "/api/admin/stats/arbs?live=prematch", admin, "", nil); s != 200 { // the cap counts kept rows
+	if s, _ := request(t, srv, "GET", "/api/stats/arbs?live=prematch", admin, "", nil); s != 200 { // the cap counts kept rows
 		t.Fatalf("filtered: %d", s)
 	}
 }

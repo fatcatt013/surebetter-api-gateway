@@ -18,8 +18,10 @@ import (
 	"time"
 )
 
-// The Statistics page (admin only): GET /api/admin/stats/arbs and /arbs.csv over the Telegram
-// bot's sent-arb rows (telegram_sent_arbs / telegram_sent_legs). Contract:
+// The Statistics page (every signed-in user): GET /api/stats/arbs and /arbs.csv over the Telegram
+// bot's sent-arb rows (telegram_sent_arbs / telegram_sent_legs). There is one bot, set up by the
+// admins (/api/telegram/, admin only), so every user sees the same rows: the arbs posted to the
+// admins' Telegram group, with the stakes of that bot config. Contract:
 // ../surebetter-common/docs/superpowers/plans/2026-11-13-statistics-page-contract.md.
 
 const (
@@ -653,14 +655,14 @@ var statsMaxRows = 300_000
 
 var errStatsTooManyRows = errors.New("too many rows")
 
-// newStatsAPI serves GET /api/admin/stats/arbs and /arbs.csv (admin session only; CSRF like the
-// accounts API, for the same cookie).
+// newStatsAPI serves GET /api/stats/arbs and /arbs.csv (any signed-in browser session; CSRF like
+// the accounts API, for the same cookie).
 func newStatsAPI(acc *accounts.Service) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("GET /api/admin/stats/arbs", acc.RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /api/stats/arbs", acc.RequireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleStats(acc, w, r, false)
 	})))
-	mux.Handle("GET /api/admin/stats/arbs.csv", acc.RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /api/stats/arbs.csv", acc.RequireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleStats(acc, w, r, true)
 	})))
 	return accounts.CSRF(mux)
