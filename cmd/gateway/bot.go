@@ -292,6 +292,11 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("GET /api/me/bot/agents/{agentId}/recordings", acc.RequireSession(http.HandlerFunc(b.handleAgentRecordings)))
 	mux.Handle("GET /api/me/bot/recordings", acc.RequireBotCode(http.HandlerFunc(b.handleOwnRecordings)))
 	mux.Handle("GET /api/me/bot/recordings/{kind}", acc.RequireBotCode(http.HandlerFunc(b.handleOwnRecording)))
+	mux.Handle("GET /api/me/bot/alerts", acc.RequireSession(http.HandlerFunc(b.handleGetAlerts)))
+	mux.Handle("POST /api/me/bot/alerts/dismiss-all", acc.RequireSession(http.HandlerFunc(b.handleDismissAllAlerts)))
+	mux.Handle("POST /api/me/bot/alerts/{id}/dismiss", acc.RequireSession(http.HandlerFunc(b.handleDismissAlert)))
+	mux.Handle("GET /api/me/bot/alert-settings", acc.RequireSession(http.HandlerFunc(b.handleGetAlertSettings)))
+	mux.Handle("PUT /api/me/bot/alert-settings", acc.RequireSession(http.HandlerFunc(b.handlePutAlertSettings)))
 	return accounts.CSRF(mux)
 }
 
