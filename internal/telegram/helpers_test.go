@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -81,6 +82,17 @@ func (s *scriptedClient) Delete(_ context.Context, id int64) error {
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, "delete")
 	return s.pop()
+}
+
+func (s *scriptedClient) SendTo(_ context.Context, chatID int64, text string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, fmt.Sprintf("sendTo:%d:%s", chatID, text))
+	if err := s.pop(); err != nil {
+		return 0, err
+	}
+	s.next++
+	return s.next, nil
 }
 
 type memStore struct {
