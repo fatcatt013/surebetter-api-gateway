@@ -186,7 +186,9 @@ type botOrder struct {
 	deadline time.Time
 	flow     string // the agent's last flow object, compact JSON; "" = none yet
 	// dayChecked: the POST that created it just checked the day limit (cleared when that POST ends).
-	dayChecked bool
+	dayChecked   bool
+	accepted     bool // the agent posted "accepted" (a later stop is an order result alert)
+	stuckAlerted bool // its stuck alert was raised (once per order)
 }
 
 func (o *botOrder) legsJSON() string {
@@ -824,7 +826,10 @@ func (b *botHub) endLocked(o *botOrder, state, reason string, relay bool, fx *ef
 	}
 	fx.notify(o.userID)
 	log.Info().Int64("user", o.userID).Str("order_id", o.id).Str("state", state).Str("reason", reason).Msg("bot order ended")
-	if st := b.settingsLocked(o.userID); state == "outcome_unknown" && st.PauseOnUnknown && !st.Paused {
+	st := b.settingsLocked(o.userID)
+	pausing := state == "outcome_unknown" && st.PauseOnUnknown && !st.Paused
+	b.alertOrderEndLocked(o, state, reason, pausing, fx)
+	if pausing {
 		b.pauseLocked(o.userID, "Outcome unknown · order "+shortID(o.id), fx)
 	}
 }
@@ -1129,8 +1134,14 @@ func (b *botHub) event(userID, codeID int64, in botEventIn, flow string) error {
 				}
 			}
 		}
+	case "accepted":
+		o.accepted = true
 	case "flow":
 		o.flow, ev.Flow = flow, json.RawMessage(flow)
+		if !o.dryRun && !o.stuckAlerted && flowIsStuck(flow) {
+			o.stuckAlerted = true
+			b.alertStuckLocked(o, fx)
+		}
 		if d := b.now().Add(orderMemory); d.After(o.deadline) {
 			o.deadline = d // the agent still works on it (a stuck mode may last minutes)
 		}
@@ -1199,7 +1210,10 @@ func (b *botHub) recoverOrders() {
 		b.loadSettings(o.UserID)
 		b.mu.Lock()
 		fx := &effects{}
-		if st := b.settingsLocked(o.UserID); st.PauseOnUnknown && !st.Paused {
+		st := b.settingsLocked(o.UserID)
+		pausing := st.PauseOnUnknown && !st.Paused
+		b.alertRecoveredLocked(o, pausing, fx)
+		if pausing {
 			b.pauseLocked(o.UserID, "Outcome unknown · order "+shortID(o.ID), fx)
 		}
 		b.release(fx)

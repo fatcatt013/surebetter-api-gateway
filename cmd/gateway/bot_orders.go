@@ -249,5 +249,6 @@ func (b *botHub) handleOrderChecked(w http.ResponseWriter, r *http.Request) {
 	b.sendRoutineLocked(userID, row.CodeID)
 	b.mu.Unlock()
 	b.changed(userID)
+	b.resolveOrderAlerts(userID, row.ID)
 	accounts.WriteJSON(w, http.StatusOK, map[string]int64{"checkedAt": row.CheckedAt})
 }
