@@ -48,16 +48,21 @@ type alertEngine struct {
 	pauseTil map[alertScope]time.Time // window scope → no new alert before then
 	names    map[int64]string         // code id → agent name (from its bot socket)
 	revoked  map[int64]bool           // code ids revoked since the start: never alerted about again
+	disabled map[int64]bool           // users disabled since the start: none of their agents alerts until one connects again
 	// settingsErr: the user's switches could not be read (and are not cached): alerts go to the app only.
 	settingsErr map[int64]bool
 	// startChecked: the start check (agents seen in the last 24 h and not back) ran (checkAgentsAfterStart).
 	startChecked bool
+	// startRetryAt: after a failed read the start check waits until then (startCheckRetry); startFailing: the last
+	// read failed (one error log per failure streak).
+	startRetryAt time.Time
+	startFailing bool
 }
 
 func newAlertEngine(started time.Time) *alertEngine {
 	return &alertEngine{started: started, settings: map[int64]alertSettings{}, pending: map[alertScope]*pendingAlert{},
 		open: map[alertScope]*openAlert{}, pauseTil: map[alertScope]time.Time{}, names: map[int64]string{},
-		revoked: map[int64]bool{}, settingsErr: map[int64]bool{}}
+		revoked: map[int64]bool{}, disabled: map[int64]bool{}, settingsErr: map[int64]bool{}}
 }
 
 // loadAlertSettings caches userID's alert switches (call without b.mu; loadSettings calls it). A read error leaves
@@ -118,14 +123,55 @@ func (b *botHub) alertsCodeRevoked(codeID int64) {
 	}
 	fx := &effects{}
 	b.alerts.revoked[codeID] = true
+	b.forgetAgentsLocked(func(sc alertScope) bool { return sc.codeID == codeID }, fx)
+	delete(b.alerts.names, codeID)
+	b.release(fx)
+}
+
+// alertsUserClosed hears of connRegistry.CloseUser (a user disabled, or signed out everywhere by a password reset).
+// For a disabled user it forgets their agents like alertsCodeRevoked, until one of them connects again (re-enabled).
+// Call it without b.mu.
+func (b *botHub) alertsUserClosed(userID int64) {
+	b.mu.Lock()
+	off := b.alerts == nil || b.acc == nil
+	b.mu.Unlock()
+	if off {
+		return
+	}
+	disabled, err := b.acc.UserDisabled(userID)
+	if err != nil {
+		log.Error().Err(err).Int64("user", userID).Msg("bot alerts: could not read whether the user is disabled")
+		return
+	}
+	if !disabled {
+		return
+	}
+	b.mu.Lock()
+	fx := &effects{}
+	b.alerts.disabled[userID] = true
+	for codeID := range b.agents[userID] {
+		delete(b.alerts.names, codeID)
+	}
+	for sc := range b.alerts.open {
+		if sc.userID == userID {
+			delete(b.alerts.names, sc.codeID)
+		}
+	}
+	b.forgetAgentsLocked(func(sc alertScope) bool { return sc.userID == userID }, fx)
+	b.release(fx)
+}
+
+// forgetAgentsLocked drops the graces, resolves the open window and agent alerts, and drops the pauses of the scopes
+// that match. b.mu must be held; b.alerts not nil.
+func (b *botHub) forgetAgentsLocked(match func(alertScope) bool, fx *effects) {
 	for sc := range b.alerts.pending {
-		if sc.codeID == codeID {
+		if match(sc) {
 			delete(b.alerts.pending, sc)
 		}
 	}
 	var open []alertScope
 	for sc := range b.alerts.open {
-		if sc.codeID == codeID {
+		if match(sc) {
 			open = append(open, sc)
 		}
 	}
@@ -134,12 +180,10 @@ func (b *botHub) alertsCodeRevoked(codeID int64) {
 		b.resolveLocked(sc, fx)
 	}
 	for sc := range b.alerts.pauseTil {
-		if sc.codeID == codeID {
+		if match(sc) {
 			delete(b.alerts.pauseTil, sc)
 		}
 	}
-	delete(b.alerts.names, codeID)
-	b.release(fx)
 }
 
 // agentNameLocked is the agent's name as its bot socket gave it, else "Agent <code id>". b.mu must be held.

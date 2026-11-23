@@ -16,6 +16,9 @@ type connRegistry struct {
 	// codeRevoked, when set, hears of every revoked extension code before its sockets close (the bot alerts forget
 	// that agent). Set once at start.
 	codeRevoked func(codeID int64)
+	// userClosed, when set, hears of every CloseUser (a user disabled, or a password reset) before the sockets close
+	// (the bot alerts forget a disabled user's agents). Set once at start.
+	userClosed func(userID int64)
 }
 
 func newConnRegistry() *connRegistry { return &connRegistry{clients: map[*Client]struct{}{}} }
@@ -49,6 +52,9 @@ func (r *connRegistry) closeWhere(match func(*Client) bool) {
 }
 
 func (r *connRegistry) CloseUser(id int64) {
+	if r.userClosed != nil && id != 0 {
+		r.userClosed(id)
+	}
 	r.closeWhere(func(c *Client) bool { return id != 0 && c.principal.UserID == id })
 }
 

@@ -35,3 +35,26 @@ func TestRecentBotAgents(t *testing.T) {
 		t.Fatalf("recent = %+v, want %+v (not the one seen 25 h ago, not the revoked one)", got, want)
 	}
 }
+
+// A disabled user's agents are not in the start check; UserDisabled says so.
+func TestRecentBotAgents_SkipsDisabledUsers(t *testing.T) {
+	s, _, _ := newTestService(t)
+	admin, _ := mustUser(t, s, "admin@example.com", RoleAdmin)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	code, _ := s.CreateCode(user.UserID, "Home PC", KindBot)
+	if err := s.TouchBotAgent(user.UserID, code.ID); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := s.UserDisabled(user.UserID); err != nil || d {
+		t.Fatalf("enabled: %v %v", d, err)
+	}
+	if err := s.SetDisabled(admin.UserID, user.UserID, true); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := s.UserDisabled(user.UserID); err != nil || !d {
+		t.Fatalf("disabled: %v %v", d, err)
+	}
+	if got, err := s.RecentBotAgents(0); err != nil || len(got) != 0 {
+		t.Fatalf("recent = %+v (err %v), want none", got, err)
+	}
+}

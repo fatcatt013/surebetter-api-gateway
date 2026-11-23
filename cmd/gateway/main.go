@@ -782,6 +782,7 @@ func main() {
 	bots.alerts = newAlertEngine(bots.now())
 	bots.tg = tgAlerts
 	reg.codeRevoked = bots.alertsCodeRevoked // a revoked agent is forgotten by the alerts
+	reg.userClosed = bots.alertsUserClosed   // and a disabled user's agents
 	// The window and agent alerts the previous process left open can no longer be resolved by it.
 	if n, err := acc.ResolveOpenBotAlerts([]string{alertWindow, alertAgent}, bots.now().UnixMilli()); err != nil {
 		log.Error().Err(err).Msg("bot alerts: resolving the previous process's open alerts failed")

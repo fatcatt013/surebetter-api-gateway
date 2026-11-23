@@ -38,6 +38,7 @@ func newAlertRig(t *testing.T) *alertRig {
 	out := &fakeOutbox{}
 	b.tg = &telegramAlerts{acc: svc, out: out, loc: prague, appURL: "https://sb.example"}
 	reg.codeRevoked = b.alertsCodeRevoked // as main wires it
+	reg.userClosed = b.alertsUserClosed
 	code, err := svc.CreateCode(uid, "Home PC", accounts.KindBot)
 	if err != nil {
 		t.Fatal(err)

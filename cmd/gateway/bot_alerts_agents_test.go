@@ -178,3 +178,92 @@ func TestBotAlerts_RevokedAgentIsForgotten(t *testing.T) {
 		t.Fatalf("engine state kept: open %v pending %v pause %v names %v", r.b.alerts.open, r.b.alerts.pending, r.b.alerts.pauseTil, r.b.alerts.names)
 	}
 }
+
+// After a failed read the start check waits 30 s before it tries again.
+func TestBotAlerts_StartCheckBacksOff(t *testing.T) {
+	r := newAlertRig(t)
+	r.b.alerts.started, r.b.alerts.startChecked = r.clk.now(), false
+	r.db.Close()
+	r.clk.advance(alertStartQuiet)
+	r.b.tick()
+	retryAt := func() time.Time {
+		r.b.mu.Lock()
+		defer r.b.mu.Unlock()
+		return r.b.alerts.startRetryAt
+	}
+	first := retryAt()
+	if !first.Equal(r.clk.now().Add(startCheckRetry)) {
+		t.Fatalf("retry at %v, want %v", first, r.clk.now().Add(startCheckRetry))
+	}
+	r.clk.advance(startCheckRetry - time.Second)
+	r.b.tick()
+	if !retryAt().Equal(first) {
+		t.Fatal("tried again before 30 s")
+	}
+	r.clk.advance(time.Second)
+	r.b.tick()
+	if !retryAt().Equal(r.clk.now().Add(startCheckRetry)) {
+		t.Fatal("did not try again after 30 s")
+	}
+}
+
+// Disabling a user (connRegistry.CloseUser) drops their agents' graces and open alerts; their sockets closing starts no
+// offline grace. Signing everyone out (a password reset: same CloseUser, user still enabled) changes nothing; an agent
+// of a re-enabled user alerts again.
+func TestBotAlerts_DisabledUserIsForgotten(t *testing.T) {
+	r := newAlertRig(t)
+	c := r.attach()
+	r.status(alertWin("tipsport", 1, "down", "bot", ""))
+	r.clk.advance(windowAlertGrace)
+	r.b.tick()
+	r.status(alertWin("tipsport", 1, "down", "bot", ""), alertWin("betano", 1, "down", "bot", "")) // betano-1: a grace
+	r.alerts()
+	r.b.alertsUserClosed(r.uid) // a password reset
+	r.b.mu.Lock()
+	open, pending := len(r.b.alerts.open), len(r.b.alerts.pending)
+	r.b.mu.Unlock()
+	if open != 1 || pending != 1 {
+		t.Fatalf("enabled user: open %d pending %d, want 1 and 1", open, pending)
+	}
+	if _, err := r.db.Exec(`UPDATE users SET disabled_at = 1 WHERE id = ?`, r.uid); err != nil {
+		t.Fatal(err)
+	}
+	r.b.alertsUserClosed(r.uid)
+	if got := r.alerts(); len(got) != 1 || got[0].WindowID != "tipsport-1" || got[0].ResolvedAt == 0 {
+		t.Fatalf("resolved: %+v", got)
+	}
+	r.b.detach(c)
+	r.clk.advance(time.Hour)
+	r.b.tick()
+	if got := r.alerts(); len(got) != 0 {
+		t.Fatalf("a disabled user's agent alerted: %+v", got)
+	}
+	r.b.mu.Lock()
+	if len(r.b.alerts.open) != 0 || len(r.b.alerts.pending) != 0 || r.b.alerts.names[r.code.ID] != "" {
+		t.Fatalf("engine state kept: open %v pending %v names %v", r.b.alerts.open, r.b.alerts.pending, r.b.alerts.names)
+	}
+	r.b.mu.Unlock()
+	if _, err := r.db.Exec(`UPDATE users SET disabled_at = NULL WHERE id = ?`, r.uid); err != nil {
+		t.Fatal(err)
+	}
+	c = r.attach() // re-enabled: its agent connects again
+	r.b.detach(c)
+	r.clk.advance(agentAlertGrace)
+	r.b.tick()
+	if got := r.alerts(); len(got) != 1 || got[0].Title != titleAgentOffline {
+		t.Fatalf("re-enabled: %+v", got)
+	}
+}
+
+func TestConnRegistry_CloseUserAndCodeTellTheHooks(t *testing.T) {
+	reg := newConnRegistry()
+	var users, codes []int64
+	reg.userClosed = func(id int64) { users = append(users, id) }
+	reg.codeRevoked = func(id int64) { codes = append(codes, id) }
+	reg.CloseUser(5)
+	reg.CloseCode(7)
+	reg.CloseUser(0)
+	if len(users) != 1 || users[0] != 5 || len(codes) != 1 || codes[0] != 7 {
+		t.Fatalf("users %v codes %v", users, codes)
+	}
+}

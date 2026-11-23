@@ -2,6 +2,7 @@ package accounts
 
 import (
 	"database/sql"
+	"errors"
 	"strings"
 )
 
@@ -146,4 +147,14 @@ func (s *Service) SetDisabled(adminID, userID int64, disabled bool) error {
 		s.conns.CloseUser(userID)
 	}
 	return nil
+}
+
+// UserDisabled reports whether userID is disabled (an unknown user is not).
+func (s *Service) UserDisabled(userID int64) (bool, error) {
+	var disabled sql.NullInt64
+	err := s.db.QueryRow(`SELECT disabled_at FROM users WHERE id = ?`, userID).Scan(&disabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return disabled.Valid, err
 }

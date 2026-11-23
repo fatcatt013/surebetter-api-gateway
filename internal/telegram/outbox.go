@@ -10,7 +10,8 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// JobKind is also the priority order: lower runs first.
+// JobKind is a job's kind. The numbers say nothing about priority: next() sets the order, gone queue (JobGone,
+// JobDelete, JobOrphan in arrival order) > JobTest > JobAlert > JobSend > JobEdit > JobReply.
 type JobKind int
 
 const (

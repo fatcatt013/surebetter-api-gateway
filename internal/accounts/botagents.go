@@ -148,11 +148,12 @@ type RecentBotAgent struct {
 	Name   string // the code's name
 }
 
-// RecentBotAgents returns every user's agents (non-revoked bot codes with an agent row) last seen at or after sinceMs,
-// by user then code id.
+// RecentBotAgents returns the agents (non-revoked bot codes with an agent row) of every user not disabled, last seen at
+// or after sinceMs, by user then code id.
 func (s *Service) RecentBotAgents(sinceMs int64) ([]RecentBotAgent, error) {
 	rows, err := s.db.Query(`SELECT a.user_id, a.code_id, c.name FROM bot_agents a JOIN extension_codes c ON c.id = a.code_id
-		WHERE c.user_id = a.user_id AND c.kind = 'bot' AND c.revoked_at IS NULL AND a.last_seen_at >= ?
+		JOIN users u ON u.id = a.user_id
+		WHERE c.user_id = a.user_id AND c.kind = 'bot' AND c.revoked_at IS NULL AND u.disabled_at IS NULL AND a.last_seen_at >= ?
 		ORDER BY a.user_id, a.code_id`, sinceMs)
 	if err != nil {
 		return nil, err
