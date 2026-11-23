@@ -53,6 +53,8 @@ type Config struct {
 	TelegramGoneDeleteS   int
 	TelegramRatePerMin    int
 	TelegramTZ            string
+	TelegramPoll          bool   // TELEGRAM_POLL=1: Telegram bot alerts on (the getUpdates linker and the sends); one reader per token
+	AppPublicURL          string // APP_PUBLIC_URL: the app's address (https://host, no trailing slash) for links in alerts; "" = none
 }
 
 // authRequired fails closed: only the exact value "false" disables authentication.
@@ -84,6 +86,8 @@ func configFromEnv() Config {
 		TelegramGoneDeleteS:   getenvInt("TELEGRAM_GONE_DELETE_AFTER_S", 0),
 		TelegramRatePerMin:    getenvInt("TELEGRAM_RATE_PER_MIN", 18),
 		TelegramTZ:            getenv("TELEGRAM_TZ", "Europe/Prague"),
+		TelegramPoll:          strings.TrimSpace(getenv("TELEGRAM_POLL", "")) == "1",
+		AppPublicURL:          strings.TrimRight(strings.TrimSpace(getenv("APP_PUBLIC_URL", "")), "/"),
 	}
 }
 
@@ -744,6 +748,8 @@ func main() {
 	log.Info().Str("version", version).Msg("surebetter-api-gateway starting")
 
 	cfg := configFromEnv()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Accounts: users, sessions, extension codes and per-user state.
 	accountsDB, err := accounts.OpenDB(cfg.AccountsDB)
@@ -768,8 +774,19 @@ func main() {
 	if !cfg.AuthRequired {
 		log.Warn().Msg("AUTH_REQUIRED=false: the feed, the snapshots and the Telegram settings are open to anyone")
 	}
+	// Telegram alerts (private chats) need the token and TELEGRAM_POLL=1; the arb notifier shares their outbox
+	// (setupTelegram below; tgOut nil = it makes its own).
+	tgAlerts, tgOut := setupTelegramAlerts(ctx, cfg, acc)
 	bots := newBotHub(reg, acc)
 	bots.shotsDir = filepath.Join(filepath.Dir(cfg.AccountsDB), "bot-screenshots") // same volume as the DB
+	bots.alerts = newAlertEngine(bots.now())
+	bots.tg = tgAlerts
+	// The window and agent alerts the previous process left open can no longer be resolved by it.
+	if n, err := acc.ResolveOpenBotAlerts([]string{alertWindow, alertAgent}, bots.now().UnixMilli()); err != nil {
+		log.Error().Err(err).Msg("bot alerts: resolving the previous process's open alerts failed")
+	} else if n > 0 {
+		log.Info().Int64("resolved", n).Msg("bot alerts left open by the previous process resolved")
+	}
 	// Orders the previous process left waiting or running end now (it lost them from memory).
 	bots.recoverOrders()
 	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired, bots: bots}
@@ -792,8 +809,6 @@ func main() {
 	// Connect Redis (for snapshot)
 	redisOpts, _ := redis.ParseURL(cfg.RedisURL)
 	rdb := redis.NewClient(redisOpts)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to connect to Redis")
 	}
@@ -803,7 +818,7 @@ func main() {
 	go bots.runPrune(ctx)
 
 	// Telegram bot: hook the arb hub before the bridge starts feeding it
-	tg := setupTelegram(ctx, cfg, hub, rdb, acc)
+	tg := setupTelegram(ctx, cfg, hub, rdb, acc, tgOut)
 
 	// Start NATS→hub bridge
 	go runNATSBridge(ctx, nc, hub)

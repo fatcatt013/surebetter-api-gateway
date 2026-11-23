@@ -22,7 +22,7 @@ var orderSweepEvery = time.Second
 // shotTmpMaxAge is how old a screenshot's temporary file must be for prune to treat it as left over.
 const shotTmpMaxAge = 10 * time.Minute
 
-// prune deletes log lines (by their ts) and screenshot files (by modification time) older than
+// prune deletes log lines (by their ts), alerts (by created_at) and screenshot files (by modification time) older than
 // botRetention, and forgets ended rate windows.
 func (b *botHub) prune() {
 	now := b.now()
@@ -34,6 +34,11 @@ func (b *botHub) prune() {
 			log.Error().Err(err).Msg("bot logs prune failed")
 		} else if n > 0 {
 			log.Info().Int64("deleted", n).Msg("old bot log lines pruned")
+		}
+		if n, err := b.acc.PruneBotAlerts(cutoff.UnixMilli()); err != nil {
+			log.Error().Err(err).Msg("bot alerts prune failed")
+		} else if n > 0 {
+			log.Info().Int64("deleted", n).Msg("old bot alerts pruned")
 		}
 	}
 	if b.shotsDir != "" {

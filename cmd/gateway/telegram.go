@@ -15,7 +15,7 @@ import (
 // setupTelegram starts the Telegram notifier and hooks it to the arb hub. It returns nil (feature
 // off) when TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is unset or the notifier cannot start. Call it
 // before the NATS bridge starts so no transition is missed.
-func setupTelegram(ctx context.Context, cfg Config, hub *Hub, rdb *redis.Client, acc *accounts.Service) *telegram.Notifier {
+func setupTelegram(ctx context.Context, cfg Config, hub *Hub, rdb *redis.Client, acc *accounts.Service, out *telegram.Outbox) *telegram.Notifier {
 	if cfg.TelegramToken == "" || cfg.TelegramChatID == "" {
 		log.Info().Msg("Telegram notifier off (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set)")
 		return nil
@@ -34,6 +34,7 @@ func setupTelegram(ctx context.Context, cfg Config, hub *Hub, rdb *redis.Client,
 		GoneDelete:   time.Duration(cfg.TelegramGoneDeleteS) * time.Second,
 		Present:      hub.Has,
 		Stats:        telegramStatsSink{acc},
+		Outbox:       out, // shared with the bot alerts (setupTelegramAlerts)
 	}, rdb)
 	if err != nil {
 		log.Error().Err(err).Msg("Telegram notifier failed to start; feature off")
@@ -93,4 +94,32 @@ func (s telegramStatsSink) EndSent(e telegram.SentEnd) error {
 func (s telegramStatsSink) SweepSent(keep []int64) error {
 	_, err := s.acc.SweepTelegramSent(keep)
 	return err
+}
+
+// setupTelegramAlerts starts the bot's shared outbox and the alert linker (getUpdates) when TELEGRAM_TOKEN is set and
+// TELEGRAM_POLL=1 (one getUpdates reader per token: only the VPS sets it); TELEGRAM_CHAT_ID is not needed for alerts.
+// nil, nil: off (alerts stay in the app, GET /api/me/telegram says available false, the arb notifier keeps its own
+// outbox).
+func setupTelegramAlerts(ctx context.Context, cfg Config, acc *accounts.Service) (*telegramAlerts, *telegram.Outbox) {
+	if cfg.TelegramToken == "" || !cfg.TelegramPoll {
+		log.Info().Bool("token", cfg.TelegramToken != "").Bool("poll", cfg.TelegramPoll).
+			Msg("Telegram alerts off (they need TELEGRAM_TOKEN and TELEGRAM_POLL=1)")
+		return nil, nil
+	}
+	if cfg.AppPublicURL == "" {
+		log.Warn().Msg("APP_PUBLIC_URL not set: Telegram alerts go out without a link into the app")
+	}
+	loc, err := time.LoadLocation(cfg.TelegramTZ)
+	if err != nil {
+		log.Warn().Err(err).Str("tz", cfg.TelegramTZ).Msg("TELEGRAM_TZ unknown; alert times use Europe/Prague")
+		loc = prague
+	}
+	client := telegram.NewHTTPClient(cfg.TelegramToken, cfg.TelegramChatID)
+	out := telegram.NewOutbox(client, cfg.TelegramRatePerMin, nil)
+	go out.Run(ctx)
+	var store telegram.LinkStore = acc
+	linker := telegram.NewLinker(client, out, store)
+	go linker.Run(ctx)
+	log.Info().Msg("Telegram alerts on: private chats linked from the app")
+	return &telegramAlerts{acc: acc, out: out, linker: linker, loc: loc, appURL: cfg.AppPublicURL}, out
 }
