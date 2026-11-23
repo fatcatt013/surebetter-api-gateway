@@ -6,6 +6,8 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 // JobKind is also the priority order: lower runs first.
@@ -25,7 +27,19 @@ const (
 	// NotSent) is tried again by Run after alertRetryDelays (a 429 after its retry_after), then given up; a timeout or
 	// a 5xx is never retried (it may have been posted). Its final result goes to Job.Done only, never to the arb notifier.
 	JobAlert
+	// JobReply sends the linker's one-line answer to a stranger's private message (Job.ChatID): plain text, tried once,
+	// result dropped. It runs last, after every arb job (gone > delete > test > alert > send > edit > reply), and at most
+	// maxQueuedReplies wait: anyone can message the bot, so its answers must never delay arb posts or alerts.
+	JobReply
 )
+
+const (
+	maxQueuedReplies = 20  // more JobReply jobs than this waiting: the new one is dropped
+	maxQueuedAlerts  = 200 // more JobAlert jobs than this waiting: the oldest is dropped (its Done gets ErrQueueFull)
+)
+
+// ErrQueueFull is the result of an alert dropped from a full queue.
+var ErrQueueFull = errors.New("telegram: alert queue full")
 
 // alertRetryDelays: the waits before an alert's 2nd, 3rd and 4th try.
 var alertRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second}
@@ -71,6 +85,7 @@ type Outbox struct {
 	gone      []Job
 	tests     []Job
 	alerts    []Job
+	replies   []Job
 	sends     []Job
 	edits     map[string]Job
 	editOrder []string
@@ -95,6 +110,7 @@ func (o *Outbox) SetDeliver(f func(Result)) {
 
 // Enqueue never blocks. A newer edit for a key replaces the queued one; a gone job drops it.
 func (o *Outbox) Enqueue(j Job) {
+	var dropped *Job
 	o.mu.Lock()
 	switch j.Kind {
 	case JobGone, JobDelete, JobOrphan:
@@ -103,7 +119,19 @@ func (o *Outbox) Enqueue(j Job) {
 	case JobTest:
 		o.tests = append(o.tests, j)
 	case JobAlert:
+		if len(o.alerts) >= maxQueuedAlerts {
+			d := o.alerts[0]
+			o.alerts = o.alerts[1:]
+			dropped = &d
+		}
 		o.alerts = append(o.alerts, j)
+	case JobReply:
+		if len(o.replies) >= maxQueuedReplies {
+			o.mu.Unlock()
+			log.Debug().Int64("chat", j.ChatID).Msg("telegram: reply queue full, answer dropped")
+			return
+		}
+		o.replies = append(o.replies, j)
 	case JobSend:
 		o.sends = append(o.sends, j)
 	case JobEdit:
@@ -113,6 +141,12 @@ func (o *Outbox) Enqueue(j Job) {
 		o.edits[j.Key] = j
 	}
 	o.mu.Unlock()
+	if dropped != nil {
+		log.Warn().Int64("chat", dropped.ChatID).Msg("telegram: alert queue full, the oldest alert dropped")
+		if dropped.Done != nil {
+			dropped.Done(Result{Job: *dropped, Err: ErrQueueFull})
+		}
+	}
 	select {
 	case o.wake <- struct{}{}:
 	default:
@@ -151,6 +185,8 @@ func (o *Outbox) next() (Job, bool) {
 		j := o.edits[k]
 		delete(o.edits, k)
 		return j, true
+	case len(o.replies) > 0:
+		return pop(&o.replies), true
 	}
 	return Job{}, false
 }
@@ -174,6 +210,10 @@ func (o *Outbox) Run(ctx context.Context) {
 		switch {
 		case j.Kind == JobAlert:
 			o.finishAlert(r)
+		case j.Kind == JobReply:
+			if r.Err != nil {
+				log.Debug().Err(r.Err).Int64("chat", j.ChatID).Msg("telegram: reply not sent")
+			}
 		case j.Reply != nil:
 			j.Reply <- r
 		default:
@@ -197,8 +237,9 @@ func (o *Outbox) do(ctx context.Context, j Job) Result {
 		if err == nil {
 			return Result{Job: j, MessageID: id}
 		}
-		if j.Kind == JobAlert {
-			return Result{Job: j, Err: err} // Run schedules its next try (finishAlert): the worker never sleeps on it
+		if j.Kind == JobAlert || j.Kind == JobReply {
+			// An alert's next try is scheduled by Run (finishAlert), a reply has none: the worker never sleeps on them.
+			return Result{Job: j, Err: err}
 		}
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Code == 429 && waits429 < max429Waits {
@@ -234,7 +275,7 @@ func (o *Outbox) call(ctx context.Context, j Job) (int64, error) {
 		return o.client.Send(ctx, j.Text)
 	case JobDelete:
 		return j.MessageID, o.client.Delete(ctx, j.MessageID)
-	case JobAlert:
+	case JobAlert, JobReply:
 		return o.client.SendTo(ctx, j.ChatID, j.Text)
 	default:
 		return j.MessageID, o.client.Edit(ctx, j.MessageID, j.Text)

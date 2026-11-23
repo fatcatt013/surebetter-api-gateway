@@ -120,3 +120,82 @@ func TestOutbox_AlertMaybeSentOrForbiddenIsFinal(t *testing.T) {
 		t.Fatalf("AlertNoRetry = %d, want %d", AlertNoRetry, len(alertRetryDelays))
 	}
 }
+
+// The linker's answers to strangers run last, after every arb job, and at most maxQueuedReplies wait.
+func TestOutbox_RepliesRunLastAndAreCapped(t *testing.T) {
+	o := newTestOutbox(&scriptedClient{}, newFakeClock())
+	for i := 0; i < 3*maxQueuedReplies; i++ {
+		o.Enqueue(Job{Kind: JobReply, ChatID: int64(i), Text: "r"})
+	}
+	o.Enqueue(Job{Kind: JobEdit, Key: "a", Text: "e"})
+	o.Enqueue(Job{Kind: JobSend, Key: "b", Text: "s"})
+	o.Enqueue(Job{Kind: JobAlert, ChatID: 5, Text: "al"})
+	var order []JobKind
+	for {
+		j, ok := o.next()
+		if !ok {
+			break
+		}
+		order = append(order, j.Kind)
+	}
+	if len(order) != 3+maxQueuedReplies || order[0] != JobAlert || order[1] != JobSend || order[2] != JobEdit {
+		t.Fatalf("order = %v, want alert, send, edit, then %d replies", order, maxQueuedReplies)
+	}
+	for _, k := range order[3:] {
+		if k != JobReply {
+			t.Fatalf("order = %v", order)
+		}
+	}
+}
+
+// A reply is tried once (a 429 is not waited for); its result never reaches the arb notifier.
+func TestOutbox_ReplyTriedOnceNeverDelivered(t *testing.T) {
+	clk := newFakeClock()
+	c := &scriptedClient{errs: []error{&APIError{Code: 429, RetryAfter: 7}}}
+	if r := newTestOutbox(c, clk).do(context.Background(), Job{Kind: JobReply, ChatID: 1, Text: "x"}); r.Err == nil ||
+		len(c.calls) != 1 || len(clk.slept) != 0 {
+		t.Fatalf("calls=%v slept=%v err=%v", c.calls, clk.slept, r.Err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c2 := &scriptedClient{}
+	o := newTestOutbox(c2, newFakeClock())
+	delivered := make(chan Result, 1)
+	o.SetDeliver(func(r Result) { delivered <- r })
+	go o.Run(ctx)
+	o.Enqueue(Job{Kind: JobReply, ChatID: 42, Text: "hi"})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c2.mu.Lock()
+		n := len(c2.calls)
+		c2.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the reply was never sent")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case r := <-delivered:
+		t.Fatalf("a reply result reached the arb notifier: %+v", r)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// Beyond maxQueuedAlerts the oldest queued alert is dropped and its Done gets ErrQueueFull.
+func TestOutbox_AlertQueueDropsTheOldest(t *testing.T) {
+	o := newTestOutbox(&scriptedClient{}, newFakeClock())
+	var dropped []Result
+	for i := 0; i < maxQueuedAlerts+2; i++ {
+		o.Enqueue(Job{Kind: JobAlert, ChatID: int64(i), Text: "a", Done: func(r Result) { dropped = append(dropped, r) }})
+	}
+	if len(dropped) != 2 || dropped[0].Job.ChatID != 0 || dropped[1].Job.ChatID != 1 || !errors.Is(dropped[0].Err, ErrQueueFull) {
+		t.Fatalf("dropped %+v", dropped)
+	}
+	j, _ := o.next()
+	if j.ChatID != 2 {
+		t.Fatalf("first queued alert: %+v", j)
+	}
+}

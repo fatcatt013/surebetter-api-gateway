@@ -28,8 +28,14 @@ const LinkCodeTTL = 10 * time.Minute
 
 const (
 	linkPollTimeoutS = 10               // getUpdates long poll (below the client's 15 s HTTP timeout)
-	linkRetryWait    = 5 * time.Second  // after a failed getUpdates
+	linkRetryWait    = 5 * time.Second  // after a failed getUpdates; doubled after each further failure
+	linkRetryMax     = 60 * time.Second // the longest wait after failures
 	linkConflictWait = 30 * time.Second // after a 409: another getUpdates reader, or a webhook, holds this bot
+	// linkReplyEvery: one chat gets at most one answer this often (anyone can message the bot); the answer to a valid
+	// /start <code> is always sent.
+	linkReplyEvery = 30 * time.Minute
+	// linkRepliedMax: above this many remembered chats, the ones answered more than linkReplyEvery ago are forgotten.
+	linkRepliedMax = 1000
 )
 
 // The linker's one-line answers in a private chat.
@@ -58,12 +64,14 @@ type Linker struct {
 
 	mu       sync.Mutex
 	codes    map[string]linkCode
+	replied  map[int64]time.Time // chat → its last throttled answer
 	username string
 	offset   int64 // next update id (Run's goroutine only)
 }
 
 func NewLinker(c UpdatesClient, out enqueuer, store LinkStore) *Linker {
-	return &Linker{client: c, out: out, store: store, now: time.Now, sleep: sleepCtx, codes: map[string]linkCode{}}
+	return &Linker{client: c, out: out, store: store, now: time.Now, sleep: sleepCtx, codes: map[string]linkCode{},
+		replied: map[int64]time.Time{}}
 }
 
 // NewCode makes a one-time code (32 hex) for userID, valid LinkCodeTTL; the user's older code and expired codes stop
@@ -122,12 +130,18 @@ func (l *Linker) BotUsername(ctx context.Context) (string, error) {
 
 // Run reads the bot's updates until ctx ends.
 func (l *Linker) Run(ctx context.Context) {
+	backoff := linkRetryWait
 	for ctx.Err() == nil {
 		err := l.pollOnce(ctx)
-		if err == nil || ctx.Err() != nil {
+		if err == nil {
+			backoff = linkRetryWait
 			continue
 		}
-		wait := linkRetryWait
+		if ctx.Err() != nil {
+			return
+		}
+		wait := backoff
+		backoff = min(2*backoff, linkRetryMax)
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Code == 409 {
 			wait = linkConflictWait
@@ -157,7 +171,8 @@ func (l *Linker) pollOnce(ctx context.Context) error {
 }
 
 // handle answers one update: a private "/start <code>" links (or says the link expired), any other private message
-// gets onlyAlertsText, and everything else is ignored.
+// (a bare /start included) gets onlyAlertsText, and everything else is ignored. Only the answers to a valid code go
+// as alerts; the others are low-priority replies, at most one per chat per linkReplyEvery.
 func (l *Linker) handle(u Update) {
 	m := u.Message
 	if m == nil || m.Chat.Type != "private" {
@@ -165,13 +180,14 @@ func (l *Linker) handle(u Update) {
 	}
 	text := strings.TrimSpace(m.Text)
 	rest, isStart := strings.CutPrefix(text, "/start")
-	if !isStart || (rest != "" && rest[0] != ' ') {
-		l.reply(m.Chat.ID, onlyAlertsText)
+	code := strings.TrimSpace(rest)
+	if !isStart || (rest != "" && rest[0] != ' ') || code == "" {
+		l.replyLimited(m.Chat.ID, onlyAlertsText)
 		return
 	}
-	lc, ok := l.take(strings.TrimSpace(rest))
+	lc, ok := l.take(code)
 	if !ok {
-		l.reply(m.Chat.ID, badCodeText)
+		l.replyLimited(m.Chat.ID, badCodeText)
 		return
 	}
 	if err := l.store.SetTelegramLink(lc.userID, m.Chat.ID); err != nil {
@@ -183,6 +199,27 @@ func (l *Linker) handle(u Update) {
 	l.reply(m.Chat.ID, linkedText)
 }
 
+// reply answers a valid /start <code> (linked, or the save failed): always sent, as an alert.
 func (l *Linker) reply(chatID int64, text string) {
 	l.out.Enqueue(Job{Kind: JobAlert, ChatID: chatID, Text: text})
+}
+
+// replyLimited answers anything else: a low-priority JobReply, unless chatID got one in the last linkReplyEvery.
+func (l *Linker) replyLimited(chatID int64, text string) {
+	now := l.now()
+	l.mu.Lock()
+	if last, ok := l.replied[chatID]; ok && now.Sub(last) < linkReplyEvery {
+		l.mu.Unlock()
+		return
+	}
+	if len(l.replied) >= linkRepliedMax {
+		for c, at := range l.replied {
+			if now.Sub(at) >= linkReplyEvery {
+				delete(l.replied, c)
+			}
+		}
+	}
+	l.replied[chatID] = now
+	l.mu.Unlock()
+	l.out.Enqueue(Job{Kind: JobReply, ChatID: chatID, Text: text})
 }

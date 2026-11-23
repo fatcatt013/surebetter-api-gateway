@@ -10,6 +10,7 @@ import (
 
 type fakeUpdates struct {
 	mu      sync.Mutex
+	errs    []error // popped first, one per call; nil = answer from batches
 	batches [][]Update
 	offsets []int64
 	me      string
@@ -21,6 +22,13 @@ func (f *fakeUpdates) GetUpdates(_ context.Context, offset int64, _ int) ([]Upda
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.offsets = append(f.offsets, offset)
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(f.batches) == 0 {
 		return nil, nil
 	}
@@ -64,7 +72,7 @@ func private(id int64, chat int64, text string) Update {
 func replies(out *fakeOut) []string {
 	var texts []string
 	for _, j := range out.take() {
-		if j.Kind != JobAlert {
+		if j.Kind != JobAlert && j.Kind != JobReply {
 			continue
 		}
 		texts = append(texts, j.Text)
@@ -100,9 +108,9 @@ func TestLinker_WrongExpiredAndReplacedCodes(t *testing.T) {
 	l.handle(private(1, 555, "/start nope"))
 	old, _ := l.NewCode(7)
 	code, _ := l.NewCode(7) // a newer code replaces the user's older one
-	l.handle(private(2, 555, "/start "+old))
+	l.handle(private(2, 556, "/start "+old))
 	clk.sleep(context.Background(), LinkCodeTTL)
-	l.handle(private(3, 555, "/start "+code))
+	l.handle(private(3, 557, "/start "+code))
 	if len(store.links) != 0 {
 		t.Fatalf("linked: %+v", store.links)
 	}
@@ -131,7 +139,7 @@ func TestLinker_GroupsIgnoredOtherMessagesAnswered(t *testing.T) {
 
 func TestLinker_PollOnceMovesTheOffset(t *testing.T) {
 	l, up, out, _, _ := newTestLinker()
-	up.batches = [][]Update{{private(10, 555, "hi"), private(11, 555, "hi")}, {}}
+	up.batches = [][]Update{{private(10, 555, "hi"), private(11, 556, "hi")}, {}}
 	if err := l.pollOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -173,5 +181,69 @@ func TestLinker_RunStopsWithItsContext(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not stop")
+	}
+}
+
+// Anyone can message the bot: one chat gets at most one answer per linkReplyEvery (as a low-priority JobReply); the
+// answer to a valid /start <code> always goes, as a JobAlert.
+func TestLinker_StrangersGetOneAnswerPerChatPer30Min(t *testing.T) {
+	l, _, out, store, clk := newTestLinker()
+	for i := 0; i < 100; i++ {
+		l.handle(private(int64(i), 555, "spam"))
+	}
+	l.handle(private(200, 555, "/start nope"))
+	l.handle(private(201, 555, "/start"))
+	jobs := out.take()
+	if len(jobs) != 1 || jobs[0].Kind != JobReply || jobs[0].ChatID != 555 || jobs[0].Text != onlyAlertsText {
+		t.Fatalf("jobs: %+v", jobs)
+	}
+	code, _ := l.NewCode(7)
+	l.handle(private(202, 555, "/start "+code))
+	jobs = out.take()
+	if len(jobs) != 1 || jobs[0].Kind != JobAlert || jobs[0].Text != linkedText || store.links[7].chatID != 555 {
+		t.Fatalf("link answer: %+v", jobs)
+	}
+	clk.sleep(context.Background(), linkReplyEvery)
+	l.handle(private(203, 555, "spam"))
+	if got := out.take(); len(got) != 1 || got[0].Kind != JobReply {
+		t.Fatalf("after 30 min: %+v", got)
+	}
+}
+
+// A bare /start (someone opened the bot without a link) is not an expired link.
+func TestLinker_BareStartIsNotAnExpiredLink(t *testing.T) {
+	l, _, out, _, _ := newTestLinker()
+	l.handle(private(1, 555, "/start"))
+	l.handle(private(2, 556, "/start   "))
+	if got := replies(out); len(got) != 2 || got[0] != onlyAlertsText || got[1] != onlyAlertsText {
+		t.Fatalf("replies: %v", got)
+	}
+}
+
+// A failing getUpdates waits 5 s, then twice as long each time up to 60 s; a success starts over.
+func TestLinker_BackoffAfterFailures(t *testing.T) {
+	l, up, _, _, _ := newTestLinker()
+	boom := errors.New("down")
+	up.errs = []error{boom, boom, boom, boom, boom, boom, nil, boom} // nil: one success
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var waits []time.Duration
+	l.sleep = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		if len(waits) == 7 {
+			cancel()
+			return context.Canceled
+		}
+		return nil
+	}
+	l.Run(ctx)
+	want := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, 60 * time.Second, 60 * time.Second, 5 * time.Second}
+	if len(waits) != len(want) {
+		t.Fatalf("waits %v, want %v", waits, want)
+	}
+	for i := range want {
+		if waits[i] != want[i] {
+			t.Fatalf("waits %v, want %v", waits, want)
+		}
 	}
 }
