@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -20,11 +21,12 @@ type alertRig struct {
 	code accounts.NewExtCode
 	app  *Client
 	out  *fakeOutbox
+	db   *sql.DB
 }
 
 func newAlertRig(t *testing.T) *alertRig {
 	t.Helper()
-	svc, uid := newAlertsAccounts(t)
+	svc, uid, db := newAlertsAccountsDB(t)
 	reg := newConnRegistry()
 	svc.SetConnections(reg)
 	b := newBotHub(reg, svc)
@@ -35,13 +37,14 @@ func newAlertRig(t *testing.T) *alertRig {
 	b.alerts.startChecked = true                         // the start check has its own test
 	out := &fakeOutbox{}
 	b.tg = &telegramAlerts{acc: svc, out: out, loc: prague, appURL: "https://sb.example"}
+	reg.codeRevoked = b.alertsCodeRevoked // as main wires it
 	code, err := svc.CreateCode(uid, "Home PC", accounts.KindBot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	app := &Client{principal: accounts.Principal{UserID: uid}, send: make(chan []byte, 256), notify: true}
 	reg.add(app)
-	return &alertRig{t: t, b: b, svc: svc, clk: clk, uid: uid, code: code, app: app, out: out}
+	return &alertRig{t: t, b: b, svc: svc, clk: clk, uid: uid, code: code, app: app, out: out, db: db}
 }
 
 // link links the user's Telegram to chat 555 (the rig's APP_PUBLIC_URL is https://sb.example).
@@ -191,5 +194,20 @@ func TestBotAlerts_SettingsReadFromTheDB(t *testing.T) {
 	}
 	if got := r.b.agentNameLocked(42); got != "Agent 42" {
 		t.Fatalf("unknown agent name: %q", got)
+	}
+}
+
+// Alert switches that cannot be read: the alert goes to the app only (never to Telegram on a guess).
+func TestBotAlerts_UnreadableSettingsAppOnly(t *testing.T) {
+	r := newAlertRig(t)
+	r.link()
+	r.db.Close()
+	r.b.loadAlertSettings(r.uid)
+	r.raise(botAlert{Kind: alertWindow, Severity: severityProblem, Title: "Logged out"}, nil)
+	if got := r.alerts(); len(got) != 1 {
+		t.Fatalf("app: %+v", got)
+	}
+	if jobs := r.out.take(); len(jobs) != 0 {
+		t.Fatalf("telegram: %+v", jobs)
 	}
 }

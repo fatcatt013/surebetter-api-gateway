@@ -131,3 +131,50 @@ func TestBotAlerts_AgentOfflineCancelsItsWindowGraces(t *testing.T) {
 		t.Fatalf("a window of an offline agent alerted: %+v", got)
 	}
 }
+
+// The start check runs again on the next tick when the agents could not be read.
+func TestBotAlerts_StartCheckRetriesAfterAReadError(t *testing.T) {
+	r := newAlertRig(t)
+	r.b.alerts.started, r.b.alerts.startChecked = r.clk.now(), false
+	r.db.Close()
+	r.clk.advance(alertStartQuiet)
+	r.b.tick()
+	r.b.mu.Lock()
+	checked := r.b.alerts.startChecked
+	r.b.mu.Unlock()
+	if checked {
+		t.Fatal("the failed start check counted as done")
+	}
+}
+
+// A revoked agent is forgotten: its open alerts resolve, its graces end, and its socket closing starts no offline
+// grace.
+func TestBotAlerts_RevokedAgentIsForgotten(t *testing.T) {
+	r := newAlertRig(t)
+	c := r.attach()
+	r.status(alertWin("tipsport", 1, "down", "bot", ""), alertWin("betano", 1, "blocked", "bot", ""))
+	r.clk.advance(windowAlertGrace)
+	r.b.tick()
+	if got := r.alerts(); len(got) != 2 {
+		t.Fatalf("window alerts: %+v", got)
+	}
+	r.status(alertWin("tipsport", 1, "down", "bot", ""), alertWin("betano", 1, "idle", "bot", ""))
+	r.alerts()
+	if err := r.svc.RevokeExtensionCode(r.uid, r.code.ID); err != nil {
+		t.Fatal(err)
+	}
+	r.b.detach(c)
+	if got := r.alerts(); len(got) != 1 || got[0].WindowID != "tipsport-1" || got[0].ResolvedAt == 0 {
+		t.Fatalf("resolved at revoke: %+v", got)
+	}
+	r.clk.advance(time.Hour)
+	r.b.tick()
+	if got := r.alerts(); len(got) != 0 {
+		t.Fatalf("a revoked agent alerted: %+v", got)
+	}
+	r.b.mu.Lock()
+	defer r.b.mu.Unlock()
+	if len(r.b.alerts.open) != 0 || len(r.b.alerts.pending) != 0 || len(r.b.alerts.pauseTil) != 0 || r.b.alerts.names[r.code.ID] != "" {
+		t.Fatalf("engine state kept: open %v pending %v pause %v names %v", r.b.alerts.open, r.b.alerts.pending, r.b.alerts.pauseTil, r.b.alerts.names)
+	}
+}

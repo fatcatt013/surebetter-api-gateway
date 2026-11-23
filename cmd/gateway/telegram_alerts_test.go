@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -37,6 +38,12 @@ func (f *fakeOutbox) take() []telegram.Job {
 
 // newAlertsAccounts opens a fresh accounts DB with one user.
 func newAlertsAccounts(t *testing.T) (*accounts.Service, int64) {
+	svc, uid, _ := newAlertsAccountsDB(t)
+	return svc, uid
+}
+
+// newAlertsAccountsDB is newAlertsAccounts with the database handle (a test closes it to make reads fail).
+func newAlertsAccountsDB(t *testing.T) (*accounts.Service, int64, *sql.DB) {
 	t.Helper()
 	db, err := accounts.OpenDB(filepath.Join(t.TempDir(), "accounts.db"))
 	if err != nil {
@@ -44,7 +51,7 @@ func newAlertsAccounts(t *testing.T) (*accounts.Service, int64) {
 	}
 	t.Cleanup(func() { db.Close() })
 	svc := accounts.NewService(db, nil)
-	return svc, userIDOf(t, svc, newUser(t, svc, "u@example.com", accounts.RoleUser))
+	return svc, userIDOf(t, svc, newUser(t, svc, "u@example.com", accounts.RoleUser)), db
 }
 
 func TestAlertText(t *testing.T) {

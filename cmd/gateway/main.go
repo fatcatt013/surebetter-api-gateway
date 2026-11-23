@@ -781,6 +781,7 @@ func main() {
 	bots.shotsDir = filepath.Join(filepath.Dir(cfg.AccountsDB), "bot-screenshots") // same volume as the DB
 	bots.alerts = newAlertEngine(bots.now())
 	bots.tg = tgAlerts
+	reg.codeRevoked = bots.alertsCodeRevoked // a revoked agent is forgotten by the alerts
 	// The window and agent alerts the previous process left open can no longer be resolved by it.
 	if n, err := acc.ResolveOpenBotAlerts([]string{alertWindow, alertAgent}, bots.now().UnixMilli()); err != nil {
 		log.Error().Err(err).Msg("bot alerts: resolving the previous process's open alerts failed")

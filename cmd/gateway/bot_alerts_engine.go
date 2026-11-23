@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"strconv"
 	"time"
 
@@ -46,17 +47,21 @@ type alertEngine struct {
 	open     map[alertScope]*openAlert
 	pauseTil map[alertScope]time.Time // window scope → no new alert before then
 	names    map[int64]string         // code id → agent name (from its bot socket)
+	revoked  map[int64]bool           // code ids revoked since the start: never alerted about again
+	// settingsErr: the user's switches could not be read (and are not cached): alerts go to the app only.
+	settingsErr map[int64]bool
 	// startChecked: the start check (agents seen in the last 24 h and not back) ran (checkAgentsAfterStart).
 	startChecked bool
 }
 
 func newAlertEngine(started time.Time) *alertEngine {
 	return &alertEngine{started: started, settings: map[int64]alertSettings{}, pending: map[alertScope]*pendingAlert{},
-		open: map[alertScope]*openAlert{}, pauseTil: map[alertScope]time.Time{}, names: map[int64]string{}}
+		open: map[alertScope]*openAlert{}, pauseTil: map[alertScope]time.Time{}, names: map[int64]string{},
+		revoked: map[int64]bool{}, settingsErr: map[int64]bool{}}
 }
 
 // loadAlertSettings caches userID's alert switches (call without b.mu; loadSettings calls it). A read error leaves
-// them uncached: the defaults apply until a later read works.
+// them uncached: until a later read works, alerts go to the app only (alertSettingsLocked).
 func (b *botHub) loadAlertSettings(userID int64) {
 	b.mu.Lock()
 	if b.alerts == nil {
@@ -72,7 +77,10 @@ func (b *botHub) loadAlertSettings(userID int64) {
 	if b.acc != nil {
 		js, found, err := b.acc.BotAlertSettings(userID)
 		if err != nil {
-			log.Error().Err(err).Int64("user", userID).Msg("bot alert settings read failed")
+			log.Error().Err(err).Int64("user", userID).Msg("bot alert settings read failed; alerts go to the app only")
+			b.mu.Lock()
+			b.alerts.settingsErr[userID] = true
+			b.mu.Unlock()
 			return
 		}
 		if found {
@@ -83,15 +91,55 @@ func (b *botHub) loadAlertSettings(userID int64) {
 	if _, ok := b.alerts.settings[userID]; !ok {
 		b.alerts.settings[userID] = st
 	}
+	delete(b.alerts.settingsErr, userID)
 	b.mu.Unlock()
 }
 
-// alertSettingsLocked is userID's switches (the defaults when not loaded). b.mu must be held; b.alerts not nil.
+// alertSettingsLocked is userID's switches: the defaults when not loaded, every kind to the app only (never Telegram
+// on a guess) when the last read failed. b.mu must be held; b.alerts not nil.
 func (b *botHub) alertSettingsLocked(userID int64) alertSettings {
 	if st, ok := b.alerts.settings[userID]; ok {
 		return st
 	}
+	if b.alerts.settingsErr[userID] {
+		app := alertChannels{App: true}
+		return alertSettings{Attention: app, Window: app, Agent: app, Order: app}
+	}
 	return defaultAlertSettings()
+}
+
+// alertsCodeRevoked forgets a revoked agent (connRegistry.CloseCode, before its socket closes): its graces end, its
+// open window and agent alerts resolve, its pauses and name go, and it never alerts again. Call it without b.mu.
+func (b *botHub) alertsCodeRevoked(codeID int64) {
+	b.mu.Lock()
+	if b.alerts == nil {
+		b.mu.Unlock()
+		return
+	}
+	fx := &effects{}
+	b.alerts.revoked[codeID] = true
+	for sc := range b.alerts.pending {
+		if sc.codeID == codeID {
+			delete(b.alerts.pending, sc)
+		}
+	}
+	var open []alertScope
+	for sc := range b.alerts.open {
+		if sc.codeID == codeID {
+			open = append(open, sc)
+		}
+	}
+	slices.SortFunc(open, compareScopes)
+	for _, sc := range open {
+		b.resolveLocked(sc, fx)
+	}
+	for sc := range b.alerts.pauseTil {
+		if sc.codeID == codeID {
+			delete(b.alerts.pauseTil, sc)
+		}
+	}
+	delete(b.alerts.names, codeID)
+	b.release(fx)
 }
 
 // agentNameLocked is the agent's name as its bot socket gave it, else "Agent <code id>". b.mu must be held.

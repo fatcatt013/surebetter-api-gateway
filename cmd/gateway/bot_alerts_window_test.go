@@ -159,3 +159,35 @@ func TestBotAlerts_DismissedWindowAlertResolvesQuietly(t *testing.T) {
 		t.Fatalf("re-alerted within the pause: %+v", got)
 	}
 }
+
+// A window removed from the agent's status resolves its open alert; ended pauses are forgotten.
+func TestBotAlerts_VanishedWindowResolvesAndPausesExpire(t *testing.T) {
+	r := newAlertRig(t)
+	r.attach()
+	r.status(alertWin("tipsport", 1, "down", "bot", ""), alertWin("betano", 1, "blocked", "bot", ""))
+	r.clk.advance(windowAlertGrace)
+	r.b.tick()
+	raised := r.alerts()
+	if len(raised) != 2 {
+		t.Fatalf("alerts: %+v", raised)
+	}
+	r.status(alertWin("tipsport", 1, "idle", "bot", "")) // betano-1 removed
+	got := r.alerts()
+	if len(got) != 2 || got[0].ResolvedAt == 0 || got[1].ResolvedAt == 0 {
+		t.Fatalf("resolutions: %+v", got)
+	}
+	r.b.mu.Lock()
+	open, paused := len(r.b.alerts.open), len(r.b.alerts.pauseTil)
+	r.b.mu.Unlock()
+	if open != 0 || paused != 1 {
+		t.Fatalf("open %d paused %d, want 0 and 1 (tipsport-1)", open, paused)
+	}
+	r.clk.advance(windowRealertPause)
+	r.b.tick()
+	r.b.mu.Lock()
+	paused = len(r.b.alerts.pauseTil)
+	r.b.mu.Unlock()
+	if paused != 0 {
+		t.Fatalf("an ended pause is kept: %d", paused)
+	}
+}

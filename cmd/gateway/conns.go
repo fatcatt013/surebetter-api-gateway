@@ -13,6 +13,9 @@ import (
 type connRegistry struct {
 	mu      sync.Mutex
 	clients map[*Client]struct{}
+	// codeRevoked, when set, hears of every revoked extension code before its sockets close (the bot alerts forget
+	// that agent). Set once at start.
+	codeRevoked func(codeID int64)
 }
 
 func newConnRegistry() *connRegistry { return &connRegistry{clients: map[*Client]struct{}{}} }
@@ -54,6 +57,9 @@ func (r *connRegistry) CloseSession(id int64) {
 }
 
 func (r *connRegistry) CloseCode(id int64) {
+	if r.codeRevoked != nil && id != 0 {
+		r.codeRevoked(id)
+	}
 	r.closeWhere(func(c *Client) bool { return id != 0 && c.principal.CodeID == id })
 }
 

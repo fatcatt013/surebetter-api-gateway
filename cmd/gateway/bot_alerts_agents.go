@@ -12,7 +12,7 @@ const agentsSeenWithin = 24 * time.Hour
 // alertAttachLocked: codeID's bot socket opened (name = its code's name). It cancels the agent's offline grace; when
 // its offline alert had fired, that alert resolves and an info "Agent back" alert is raised. b.mu must be held.
 func (b *botHub) alertAttachLocked(userID, codeID int64, name string, fx *effects) {
-	if b.alerts == nil {
+	if b.alerts == nil || b.alerts.revoked[codeID] {
 		return
 	}
 	if name != "" {
@@ -31,7 +31,7 @@ func (b *botHub) alertAttachLocked(userID, codeID int64, name string, fx *effect
 // alertDetachLocked: codeID's bot socket closed. Its windows' graces end (the agent alert covers them) and, unless its
 // offline alert is already open, a 2 min grace starts. b.mu must be held.
 func (b *botHub) alertDetachLocked(userID, codeID int64) {
-	if b.alerts == nil {
+	if b.alerts == nil || b.alerts.revoked[codeID] {
 		return
 	}
 	for sc := range b.alerts.pending {
@@ -45,7 +45,8 @@ func (b *botHub) alertDetachLocked(userID, codeID int64) {
 	}
 }
 
-// checkAgentsAfterStart is the start check, run once by the first tick alertStartQuiet after the gateway start: every
+// checkAgentsAfterStart is the start check, run by the first tick alertStartQuiet after the gateway start (again on
+// the next tick when the agents could not be read): every
 // agent seen in the last 24 h that is not connected (and has no offline grace of its own running) gets one "Agent
 // offline" alert, which resolves with "Agent back" when it reconnects. A restart sees no detach, so without it an agent
 // that never came back would never alert. Call it without b.mu (it reads the registry).
@@ -63,7 +64,10 @@ func (b *botHub) checkAgentsAfterStart() {
 	}
 	recent, err := b.acc.RecentBotAgents(since)
 	if err != nil {
-		log.Error().Err(err).Msg("bot alerts: the start check could not read the agents")
+		log.Error().Err(err).Msg("bot alerts: the start check could not read the agents; trying again")
+		b.mu.Lock()
+		b.alerts.startChecked = false
+		b.mu.Unlock()
 		return
 	}
 	for _, a := range recent {
@@ -73,7 +77,8 @@ func (b *botHub) checkAgentsAfterStart() {
 	fx := &effects{}
 	for _, a := range recent {
 		sc := alertScope{kind: alertAgent, userID: a.UserID, codeID: a.CodeID}
-		if b.presenceLocked(a.UserID, a.CodeID) != nil || b.alerts.pending[sc] != nil || b.alerts.open[sc] != nil {
+		if b.presenceLocked(a.UserID, a.CodeID) != nil || b.alerts.pending[sc] != nil || b.alerts.open[sc] != nil ||
+			b.alerts.revoked[a.CodeID] {
 			continue
 		}
 		if b.alerts.names[a.CodeID] == "" {

@@ -29,7 +29,7 @@ func windowText(w botWindow) string {
 // alertWindowsLocked follows the windows of codeID's last status (p.windows): a problem starts a 60 s grace (unless
 // the window has an open alert or is in its 10 min pause after one); a window no longer a problem cancels its grace,
 // and back to idle or busy resolves its open alert and starts the pause. A window gone from the status cancels its
-// grace. b.mu must be held.
+// grace, resolves its open alert and forgets its pause. b.mu must be held.
 func (b *botHub) alertWindowsLocked(userID, codeID int64, p *botPresence, fx *effects) {
 	if b.alerts == nil {
 		return
@@ -56,9 +56,27 @@ func (b *botHub) alertWindowsLocked(userID, codeID int64, p *botPresence, fx *ef
 			b.alerts.pauseTil[sc] = now.Add(windowRealertPause)
 		}
 	}
+	gone := func(sc alertScope) bool {
+		return sc.kind == alertWindow && sc.userID == userID && sc.codeID == codeID && !seen[sc.windowID]
+	}
 	for sc := range b.alerts.pending {
-		if sc.kind == alertWindow && sc.userID == userID && sc.codeID == codeID && !seen[sc.windowID] {
+		if gone(sc) {
 			delete(b.alerts.pending, sc)
+		}
+	}
+	var vanished []alertScope
+	for sc := range b.alerts.open {
+		if gone(sc) {
+			vanished = append(vanished, sc)
+		}
+	}
+	slices.SortFunc(vanished, compareScopes)
+	for _, sc := range vanished {
+		b.resolveLocked(sc, fx)
+	}
+	for sc := range b.alerts.pauseTil {
+		if gone(sc) {
+			delete(b.alerts.pauseTil, sc)
 		}
 	}
 }
@@ -73,6 +91,11 @@ func (b *botHub) fireAlertsLocked(fx *effects) {
 		return
 	}
 	now := b.now()
+	for sc, til := range b.alerts.pauseTil {
+		if !now.Before(til) {
+			delete(b.alerts.pauseTil, sc)
+		}
+	}
 	var due []alertScope
 	for sc, pa := range b.alerts.pending {
 		if !now.Before(pa.due) {
