@@ -24,6 +24,10 @@ func TestHTTPClient_NetErrorSaysWhetherItWasSent(t *testing.T) {
 		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
 	}))
 	defer slow.Close()
+	// The name does not resolve (no real lookup: the dialer answers as DNS would).
+	noSuchHost := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "bot.example", IsNotFound: true}
+	}}
 	// The TCP connect never completes: the client's timeout fires while dialing.
 	hangingDial := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		<-ctx.Done()
@@ -36,7 +40,7 @@ func TestHTTPClient_NetErrorSaysWhetherItWasSent(t *testing.T) {
 		notSent    bool
 	}{
 		{"refused", closed.URL, 2 * time.Second, nil, true},
-		{"dns", "http://surebetter-alerts.invalid", 5 * time.Second, nil, true},
+		{"dns", "http://bot.example", 5 * time.Second, noSuchHost, true},
 		{"dial timeout", slow.URL, 50 * time.Millisecond, hangingDial, true},
 		{"timeout", slow.URL, 50 * time.Millisecond, nil, false},
 	} {

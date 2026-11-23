@@ -28,6 +28,8 @@ func TestSetupTelegramAlerts_TokenAndPoll(t *testing.T) {
 }
 
 func TestConfig_TelegramPollAndAppPublicURL(t *testing.T) {
+	t.Setenv("TELEGRAM_POLL", "") // whatever the shell running the tests has
+	t.Setenv("APP_PUBLIC_URL", "")
 	if c := configFromEnv(); c.TelegramPoll || c.AppPublicURL != "" {
 		t.Fatalf("defaults: poll %v url %q", c.TelegramPoll, c.AppPublicURL)
 	}
