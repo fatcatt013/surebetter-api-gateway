@@ -143,6 +143,8 @@ func TestTelegramMe_LinkWhileGetMeFails(t *testing.T) {
 }
 
 func TestTelegramMe_SendTest(t *testing.T) {
+	defer func(d time.Duration) { telegramTestEvery = d }(telegramTestEvery)
+	telegramTestEvery = 0 // this test sends several in a row
 	r := newTelegramServer(t, true)
 	token := newUser(t, r.svc, "u@example.com", accounts.RoleUser)
 	uid := userIDOf(t, r.svc, token)
@@ -184,5 +186,36 @@ func TestTelegramMe_SendTest(t *testing.T) {
 	telegramTestWait = 50 * time.Millisecond
 	if s, b := request(t, r.srv, "POST", "/api/me/telegram/test", token, `{}`, nil); s != 504 || !strings.Contains(b, `"telegram_timeout"`) {
 		t.Fatalf("timeout: %d %s", s, b)
+	}
+}
+
+// One Send test per user per telegramTestEvery: the next one is 429 too_many (another user is not held up).
+func TestTelegramMe_SendTestRateLimited(t *testing.T) {
+	defer func(d time.Duration) { telegramTestEvery = d }(telegramTestEvery)
+	telegramTestEvery = 200 * time.Millisecond
+	r := newTelegramServer(t, true)
+	r.out.answer = func(j telegram.Job) telegram.Result { return telegram.Result{Job: j, MessageID: 9} }
+	token := newUser(t, r.svc, "u@example.com", accounts.RoleUser)
+	other := newUser(t, r.svc, "o@example.com", accounts.RoleUser)
+	for _, tk := range []string{token, other} {
+		if err := r.svc.SetTelegramLink(userIDOf(t, r.svc, tk), 555); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s, b := request(t, r.srv, "POST", "/api/me/telegram/test", token, `{}`, nil); s != 200 {
+		t.Fatalf("first: %d %s", s, b)
+	}
+	if s, b := request(t, r.srv, "POST", "/api/me/telegram/test", token, `{}`, nil); s != 429 || !strings.Contains(b, `"too_many"`) {
+		t.Fatalf("second: %d %s", s, b)
+	}
+	if s, b := request(t, r.srv, "POST", "/api/me/telegram/test", other, `{}`, nil); s != 200 {
+		t.Fatalf("another user: %d %s", s, b)
+	}
+	if n := len(r.out.take()); n != 2 {
+		t.Fatalf("sent %d, want 2", n)
+	}
+	time.Sleep(telegramTestEvery)
+	if s, b := request(t, r.srv, "POST", "/api/me/telegram/test", token, `{}`, nil); s != 200 {
+		t.Fatalf("after the wait: %d %s", s, b)
 	}
 }
