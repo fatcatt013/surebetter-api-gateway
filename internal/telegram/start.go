@@ -19,6 +19,7 @@ type Settings struct {
 	GoneDelete   time.Duration // TELEGRAM_GONE_DELETE_AFTER_S; 0 = delete at once, no GONE edit
 	Present      func(key string) bool
 	Stats        StatsSink // where the sent-arb statistics go (nil: none)
+	Outbox       *Outbox   // shared with the bot alerts (cmd/gateway); nil = Start makes and runs its own
 }
 
 // statsBuffer bounds the stats records waiting for the database; beyond it they are dropped.
@@ -31,19 +32,25 @@ func Start(ctx context.Context, s Settings, rdb *redis.Client) (*Notifier, error
 	if err != nil {
 		return nil, err
 	}
-	var n *Notifier
-	out := NewOutbox(NewHTTPClient(s.Token, s.ChatID), s.RatePerMin, func(r Result) { n.Deliver(r) })
+	out := s.Outbox
+	own := out == nil
+	if own {
+		out = NewOutbox(NewHTTPClient(s.Token, s.ChatID), s.RatePerMin, nil)
+	}
 	opts := Options{EditInterval: s.EditInterval, StartupGrace: s.StartupGrace, GoneDeleteAfter: s.GoneDelete, Present: s.Present}
 	if s.Stats != nil {
 		w := NewStatsWriter(s.Stats, statsBuffer)
 		go w.Run(ctx)
 		opts.Stats = w
 	}
-	n = NewNotifier(NewRedisStore(rdb), out, render, opts)
+	n := NewNotifier(NewRedisStore(rdb), out, render, opts)
+	out.SetDeliver(n.Deliver)
 	if err := n.Load(ctx); err != nil {
 		log.Error().Err(err).Msg("telegram: loading state from Redis failed; the bot stays disabled until a config is saved")
 	}
-	go out.Run(ctx)
+	if own {
+		go out.Run(ctx)
+	}
 	go n.Run(ctx)
 	log.Info().Str("chat_id", s.ChatID).Bool("enabled", n.Config().Enabled).Msg("Telegram notifier started")
 	return n, nil

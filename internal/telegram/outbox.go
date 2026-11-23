@@ -20,7 +20,18 @@ const (
 	// JobOrphan edits a message id that an ambiguous send may have posted to GONE. Telegram lets a
 	// bot edit only its own messages, so the edit doubles as an ownership probe. Runs in the gone queue.
 	JobOrphan
+	// JobAlert sends plain text to one private chat (Job.ChatID): a bot alert or the linker's answer. It runs after
+	// the test jobs and before the arb sends, sharing the rate limit. One surely not sent (a 429, or a NetError with
+	// NotSent) is tried again by Run after alertRetryDelays (a 429 after its retry_after), then given up; a timeout or
+	// a 5xx is never retried (it may have been posted). Its final result goes to Job.Done only, never to the arb notifier.
+	JobAlert
 )
+
+// alertRetryDelays: the waits before an alert's 2nd, 3rd and 4th try.
+var alertRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second}
+
+// AlertNoRetry as a JobAlert's Attempt makes its first try the last (the app's Send test waits for the answer).
+const AlertNoRetry = 3
 
 // Job is one Bot API call. Reply, when set, receives the Result instead of the outbox callback.
 type Job struct {
@@ -29,6 +40,9 @@ type Job struct {
 	MessageID int64
 	Text      string
 	Reply     chan<- Result
+	ChatID    int64        // JobAlert: the private chat
+	Done      func(Result) // JobAlert: receives the final result (nil: nobody)
+	Attempt   int          // JobAlert: retries already made (0 to AlertNoRetry)
 }
 
 // Result is the outcome of a Job. MessageID is the new id for sends.
@@ -50,21 +64,33 @@ type Outbox struct {
 	now     func() time.Time
 	sleep   func(context.Context, time.Duration) error
 
+	after func(time.Duration, func()) // runs f after d (time.AfterFunc; a test runs it at once)
+
 	mu        sync.Mutex
 	bucket    *bucket
 	gone      []Job
 	tests     []Job
+	alerts    []Job
 	sends     []Job
 	edits     map[string]Job
 	editOrder []string
 	wake      chan struct{}
 }
 
-// NewOutbox: ratePerMin is TELEGRAM_RATE_PER_MIN; deliver receives every non-Reply result.
+// NewOutbox: ratePerMin is TELEGRAM_RATE_PER_MIN; deliver receives every non-Reply result except alerts' (nil: none
+// yet, see SetDeliver).
 func NewOutbox(c Client, ratePerMin int, deliver func(Result)) *Outbox {
-	o := &Outbox{client: c, deliver: deliver, now: time.Now, sleep: sleepCtx, edits: map[string]Job{}, wake: make(chan struct{}, 1)}
+	o := &Outbox{client: c, deliver: deliver, now: time.Now, sleep: sleepCtx, edits: map[string]Job{}, wake: make(chan struct{}, 1),
+		after: func(d time.Duration, f func()) { time.AfterFunc(d, f) }}
 	o.bucket = newBucket(ratePerMin, 3, o.now())
 	return o
+}
+
+// SetDeliver sets where the results of jobs without Reply go (alerts excepted): the arb notifier of a shared outbox.
+func (o *Outbox) SetDeliver(f func(Result)) {
+	o.mu.Lock()
+	o.deliver = f
+	o.mu.Unlock()
 }
 
 // Enqueue never blocks. A newer edit for a key replaces the queued one; a gone job drops it.
@@ -76,6 +102,8 @@ func (o *Outbox) Enqueue(j Job) {
 		o.gone = append(o.gone, j)
 	case JobTest:
 		o.tests = append(o.tests, j)
+	case JobAlert:
+		o.alerts = append(o.alerts, j)
 	case JobSend:
 		o.sends = append(o.sends, j)
 	case JobEdit:
@@ -113,6 +141,8 @@ func (o *Outbox) next() (Job, bool) {
 		return pop(&o.gone), true
 	case len(o.tests) > 0:
 		return pop(&o.tests), true
+	case len(o.alerts) > 0:
+		return pop(&o.alerts), true
 	case len(o.sends) > 0:
 		return pop(&o.sends), true
 	case len(o.editOrder) > 0:
@@ -141,10 +171,18 @@ func (o *Outbox) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if j.Reply != nil {
+		switch {
+		case j.Kind == JobAlert:
+			o.finishAlert(r)
+		case j.Reply != nil:
 			j.Reply <- r
-		} else if o.deliver != nil {
-			o.deliver(r)
+		default:
+			o.mu.Lock()
+			deliver := o.deliver
+			o.mu.Unlock()
+			if deliver != nil {
+				deliver(r)
+			}
 		}
 	}
 }
@@ -158,6 +196,9 @@ func (o *Outbox) do(ctx context.Context, j Job) Result {
 		id, err := o.call(ctx, j)
 		if err == nil {
 			return Result{Job: j, MessageID: id}
+		}
+		if j.Kind == JobAlert {
+			return Result{Job: j, Err: err} // Run schedules its next try (finishAlert): the worker never sleeps on it
 		}
 		var ae *APIError
 		if errors.As(err, &ae) && ae.Code == 429 && waits429 < max429Waits {
@@ -193,6 +234,8 @@ func (o *Outbox) call(ctx context.Context, j Job) (int64, error) {
 		return o.client.Send(ctx, j.Text)
 	case JobDelete:
 		return j.MessageID, o.client.Delete(ctx, j.MessageID)
+	case JobAlert:
+		return o.client.SendTo(ctx, j.ChatID, j.Text)
 	default:
 		return j.MessageID, o.client.Edit(ctx, j.MessageID, j.Text)
 	}
@@ -245,4 +288,37 @@ func (b *bucket) take(now time.Time) time.Duration {
 		return 0
 	}
 	return time.Duration((1 - b.tokens) / b.perSec * float64(time.Second))
+}
+
+// finishAlert hands an alert's result to its Done, or queues another try when the alert was surely not sent (a 429, a
+// NetError with NotSent), after alertRetryDelays (a 429 after its retry_after), until AlertNoRetry retries were made.
+func (o *Outbox) finishAlert(r Result) {
+	j := r.Job
+	if r.Err != nil && j.Attempt < AlertNoRetry {
+		if wait, ok := alertRetryWait(r.Err, j.Attempt); ok {
+			j.Attempt++
+			o.after(wait, func() { o.Enqueue(j) })
+			return
+		}
+	}
+	if j.Done != nil {
+		j.Done(r)
+	}
+}
+
+// alertRetryWait is how long before an alert refused with err is tried again; false: never — it may have been posted
+// (a timeout, a 5xx, a connection broken after the request went out) or was refused for good (another 4xx).
+func alertRetryWait(err error, attempt int) (time.Duration, bool) {
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Code == 429 {
+		if ae.RetryAfter > 0 {
+			return time.Duration(ae.RetryAfter) * time.Second, true
+		}
+		return alertRetryDelays[attempt], true
+	}
+	var ne *NetError
+	if errors.As(err, &ne) && ne.NotSent {
+		return alertRetryDelays[attempt], true
+	}
+	return 0, false
 }
