@@ -715,6 +715,9 @@ func newMux(hub *Hub, valueHub *ValueHub, tg *telegram.Notifier, gate *wsGate) *
 		botAPI := newBotAPI(gate.acc, gate.bots)
 		mux.Handle("/api/me/bot", botAPI)
 		mux.Handle("/api/me/bot/", botAPI)
+		tgMe := newTelegramMeAPI(gate.acc, gate.bots.tg)
+		mux.Handle("/api/me/telegram", tgMe)
+		mux.Handle("/api/me/telegram/", tgMe)
 	}
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/metrics", metricsHandler(hub, valueHub, tg))
