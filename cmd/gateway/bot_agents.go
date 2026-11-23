@@ -201,6 +201,7 @@ func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 	p.books, p.dryRun, p.version, p.hostName, p.windowsJSON = st.books, st.dryRun, st.version, st.hostName, st.windowsJSON
 	p.windows, p.proto, p.cpu, p.mem, p.boot = st.windows, st.proto, st.cpu, st.mem, st.boot
 	p.windowsKey, p.humanActs, p.humanJSON = st.windowsKey, st.humanActs, st.humanJSON
+	b.alertWindowsLocked(userID, codeID, p, fx)
 	if st.boot != "" {
 		for _, o := range b.ordersLocked(userID, orderRunning) {
 			if o.codeID == codeID && o.boot != st.boot {

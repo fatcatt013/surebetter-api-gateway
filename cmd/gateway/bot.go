@@ -208,6 +208,7 @@ func (b *botHub) attach(c *Client) {
 	old := b.agents[userID][codeID]
 	b.agents[userID][codeID] = &botPresence{client: c, books: []botBook{}, dryRun: true, windowsJSON: "[]", windowsKey: "[]", humanJSON: "{}",
 		idleSince: map[string]time.Time{}, reservedAt: b.now()}
+	b.alertAttachLocked(userID, codeID, c.principal.CodeName, fx)
 	b.dispatchLocked(userID, fx)
 	b.release(fx)
 	if old != nil {

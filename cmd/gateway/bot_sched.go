@@ -890,6 +890,7 @@ func (b *botHub) tick() {
 	b.mu.Lock()
 	fx := &effects{}
 	b.expireLocked(fx)
+	b.fireAlertsLocked(fx)
 	var users []int64
 	for _, o := range b.orders {
 		if o.state == orderWaiting && !slices.Contains(users, o.userID) {
