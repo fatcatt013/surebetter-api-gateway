@@ -224,6 +224,34 @@ var migrations = []string{
 	`ALTER TABLE bot_settings ADD COLUMN odds_drop TEXT NOT NULL DEFAULT 'strict';
 	ALTER TABLE bot_orders ADD COLUMN odds_drop TEXT NOT NULL DEFAULT 'strict';
 	ALTER TABLE bot_orders ADD COLUMN min_profit_pct REAL NOT NULL DEFAULT 0;`,
+	// 11: bot alerts (bots controller Phase 4b): each user's alert switches (a JSON object of the four kinds ×
+	// app/telegram; no row = the defaults), the alerts (kept 7 days; id = 16 hex made by the gateway; resolved_at and
+	// dismissed_at 0 = not), and each user's private Telegram chat for alerts.
+	`CREATE TABLE bot_alert_settings (
+		user_id    INTEGER PRIMARY KEY REFERENCES users (id),
+		json       TEXT    NOT NULL,
+		updated_at INTEGER NOT NULL
+	);
+	CREATE TABLE bot_alerts (
+		id            TEXT    PRIMARY KEY,
+		user_id       INTEGER NOT NULL REFERENCES users (id),
+		kind          TEXT    NOT NULL CHECK (kind IN ('attention', 'window', 'agent', 'order')),
+		severity      TEXT    NOT NULL CHECK (severity IN ('attention', 'problem', 'info')),
+		agent_code_id INTEGER NOT NULL DEFAULT 0,
+		window_id     TEXT    NOT NULL DEFAULT '',
+		order_id      TEXT    NOT NULL DEFAULT '',
+		title         TEXT    NOT NULL,
+		detail        TEXT    NOT NULL DEFAULT '',
+		created_at    INTEGER NOT NULL,
+		resolved_at   INTEGER NOT NULL DEFAULT 0,
+		dismissed_at  INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX bot_alerts_user_created ON bot_alerts (user_id, created_at);
+	CREATE TABLE telegram_links (
+		user_id   INTEGER PRIMARY KEY REFERENCES users (id),
+		chat_id   INTEGER NOT NULL,
+		linked_at INTEGER NOT NULL
+	);`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

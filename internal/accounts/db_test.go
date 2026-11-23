@@ -404,8 +404,8 @@ func TestMigrate_OddsDrop(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 10 || version != len(migrations) {
-		t.Fatalf("user_version = %d (err %v), want 10", version, err)
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want %d", version, err, len(migrations))
 	}
 	var settings string
 	if err := db.QueryRow(`SELECT dry_run || '/' || max_leg || '/' || odds_drop FROM bot_settings`).Scan(&settings); err != nil ||
@@ -416,5 +416,58 @@ func TestMigrate_OddsDrop(t *testing.T) {
 	if err := db.QueryRow(`SELECT id || '/' || state || '/' || odds_drop || '/' || min_profit_pct FROM bot_orders`).Scan(&order); err != nil ||
 		order != `00000000000000aa/placed/strict/0.0` {
 		t.Fatalf("order after the migration: %q (err %v)", order, err)
+	}
+}
+
+func TestMigrate_BotAlerts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The schema as shipped with odds drop (version 10) and one user.
+	steps := append(append([]string{}, migrations[:10]...), `PRAGMA user_version = 10`,
+		`INSERT INTO users (id, email, password_hash, role, created_at) VALUES (1, 'u@example.com', 'x', 'user', 0)`)
+	for _, q := range steps {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%.60s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 11 || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want 11", version, err)
+	}
+	for _, q := range []string{
+		`INSERT INTO bot_alert_settings (user_id, json, updated_at) VALUES (1, '{}', 5)`,
+		`INSERT INTO bot_alerts (id, user_id, kind, severity, title, created_at) VALUES ('a', 1, 'window', 'problem', 'Logged out', 5)`,
+		`INSERT INTO telegram_links (user_id, chat_id, linked_at) VALUES (1, 555, 5)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%.60s: %v", q, err)
+		}
+	}
+	for _, q := range []string{
+		`INSERT INTO bot_alerts (id, user_id, kind, severity, title, created_at) VALUES ('b', 1, 'weather', 'problem', 'x', 5)`,
+		`INSERT INTO bot_alerts (id, user_id, kind, severity, title, created_at) VALUES ('c', 1, 'window', 'loud', 'x', 5)`,
+	} {
+		if _, err := db.Exec(q); err == nil {
+			t.Fatalf("accepted: %s", q)
+		}
+	}
+	var defaults string
+	if err := db.QueryRow(`SELECT agent_code_id || '/' || window_id || '/' || order_id || '/' || detail || '/' || resolved_at || '/' || dismissed_at
+		FROM bot_alerts`).Scan(&defaults); err != nil || defaults != "0////0/0" {
+		t.Fatalf("alert defaults: %q (err %v)", defaults, err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'bot_alerts_user_created'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("index bot_alerts_user_created: %d (err %v)", n, err)
 	}
 }
