@@ -61,6 +61,7 @@ func (b *botHub) handleDismissAlert(w http.ResponseWriter, r *http.Request) {
 		accounts.WriteError(w, http.StatusNotFound, "unknown_alert")
 		return
 	}
+	b.alertsDismissed(userID, []accounts.BotAlertRow{row})
 	a := alertOfRow(row)
 	b.reg.sendUser(userID, alertMessage(a))
 	accounts.WriteJSON(w, http.StatusOK, a)
@@ -75,6 +76,7 @@ func (b *botHub) handleDismissAllAlerts(w http.ResponseWriter, r *http.Request) 
 		accounts.WriteError(w, http.StatusInternalServerError, "internal")
 		return
 	}
+	b.alertsDismissed(userID, rows)
 	for _, row := range rows {
 		b.reg.sendUser(userID, alertMessage(alertOfRow(row)))
 	}

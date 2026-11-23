@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/surebetter/api-gateway/internal/accounts"
 )
 
 func TestBotAlerts_WindowProblemAfter60s(t *testing.T) {
@@ -121,5 +123,39 @@ func TestBotAlerts_WindowGoneFromTheStatusCancels(t *testing.T) {
 	r.b.tick()
 	if got := r.alerts(); len(got) != 0 {
 		t.Fatalf("a removed window alerted: %+v", got)
+	}
+}
+
+// A window alert dismissed in the app does not come back when it resolves: the row gets resolved_at, the app no
+// message, and the 10 min pause still holds.
+func TestBotAlerts_DismissedWindowAlertResolvesQuietly(t *testing.T) {
+	r := newAlertRig(t)
+	r.attach()
+	r.status(alertWin("tipsport", 1, "down", "bot", ""))
+	r.clk.advance(windowAlertGrace)
+	r.b.tick()
+	raised := r.alerts()
+	if len(raised) != 1 {
+		t.Fatalf("alert: %+v", raised)
+	}
+	row, found, err := r.svc.DismissBotAlert(r.uid, raised[0].ID, r.clk.now().UnixMilli())
+	if err != nil || !found {
+		t.Fatalf("dismiss: %v %v", found, err)
+	}
+	r.b.alertsDismissed(r.uid, []accounts.BotAlertRow{row})
+	r.clk.advance(time.Minute)
+	r.status(alertWin("tipsport", 1, "idle", "bot", ""))
+	if got := r.alerts(); len(got) != 0 {
+		t.Fatalf("a dismissed alert came back: %+v", got)
+	}
+	again, _, _ := r.svc.DismissBotAlert(r.uid, raised[0].ID, 0)
+	if again.ResolvedAt != r.clk.now().UnixMilli() || again.DismissedAt != row.DismissedAt {
+		t.Fatalf("row: %+v", again)
+	}
+	r.status(alertWin("tipsport", 1, "down", "bot", ""))
+	r.clk.advance(windowAlertGrace)
+	r.b.tick()
+	if got := r.alerts(); len(got) != 0 {
+		t.Fatalf("re-alerted within the pause: %+v", got)
 	}
 }

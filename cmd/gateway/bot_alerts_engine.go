@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+
+	"github.com/surebetter/api-gateway/internal/accounts"
 )
 
 const (
@@ -127,7 +129,7 @@ func (b *botHub) raiseLocked(userID int64, a botAlert, scope *alertScope, fx *ef
 }
 
 // resolveLocked resolves scope's open alert, if any: its row and the app get resolvedAt (an alert that was never in
-// the app: nothing to tell). No Telegram message. b.mu must be held; b.alerts not nil.
+// the app, or that the user dismissed: the row only). No Telegram message. b.mu must be held; b.alerts not nil.
 func (b *botHub) resolveLocked(scope alertScope, fx *effects) {
 	oa := b.alerts.open[scope]
 	if oa == nil {
@@ -143,5 +145,28 @@ func (b *botHub) resolveLocked(scope alertScope, fx *effects) {
 		id, at := a.ID, a.ResolvedAt
 		fx.write(func() error { return b.acc.ResolveBotAlert(id, at) })
 	}
+	if a.DismissedAt != 0 {
+		return // dismissed in the app: it must not come back there
+	}
 	fx.events = append(fx.events, userMsg{userID: scope.userID, payload: alertMessage(a)})
+}
+
+// alertsDismissed copies the dismissal of rows (just dismissed in the database) onto the engine's open window and
+// agent alerts, so their later resolution does not bring them back to the app. They stay open in the engine (one per
+// scope, and the re-alert pause after it resolves). Call it without b.mu, before telling the app.
+func (b *botHub) alertsDismissed(userID int64, rows []accounts.BotAlertRow) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.alerts == nil {
+		return
+	}
+	at := map[string]int64{}
+	for _, r := range rows {
+		at[r.ID] = r.DismissedAt
+	}
+	for sc, oa := range b.alerts.open {
+		if t, ok := at[oa.alert.ID]; ok && sc.userID == userID && oa.alert.DismissedAt == 0 {
+			oa.alert.DismissedAt = t
+		}
+	}
 }
