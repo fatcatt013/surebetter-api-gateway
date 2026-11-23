@@ -99,6 +99,10 @@ type botHub struct {
 	// shotsDir holds screenshots as <user id>/<id>.jpg (<data dir>/bot-screenshots); "" = none.
 	shotsDir string
 	shotsMu  sync.Mutex // held from a user directory's size check to the write, so uploads cannot overrun the cap
+	// alerts derives the bot alerts (bot_alerts_*.go); nil = off (newBotHub leaves it off; main turns it on). Guarded by mu.
+	alerts *alertEngine
+	// tg sends alerts to the users' linked Telegram chats; nil = no TELEGRAM_TOKEN.
+	tg *telegramAlerts
 }
 
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {

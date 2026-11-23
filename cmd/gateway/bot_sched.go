@@ -217,6 +217,7 @@ type effects struct {
 	writes []func() error
 	events []userMsg
 	users  []int64
+	later  []func() // after the messages, outside both locks: the Telegram alerts (they read the link and queue a job)
 }
 
 type userMsg struct {
@@ -250,6 +251,9 @@ func (b *botHub) release(fx *effects) {
 	for _, id := range fx.users {
 		b.changed(id)
 	}
+	for _, f := range fx.later {
+		f()
+	}
 }
 
 // loadSettings caches userID's settings (call without b.mu). A database error is returned and
@@ -257,6 +261,7 @@ func (b *botHub) release(fx *effects) {
 // order is refused). A pause decided while they were unreadable (memPause) is applied to the
 // settings read here and stored.
 func (b *botHub) loadSettings(userID int64) error {
+	b.loadAlertSettings(userID)
 	b.mu.Lock()
 	_, ok := b.settings[userID]
 	b.mu.Unlock()
