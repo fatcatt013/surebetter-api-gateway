@@ -140,3 +140,31 @@ func (s *Service) SaveBotAgentRoutine(userID, codeID int64, routineJSON string, 
 	n, err := res.RowsAffected()
 	return n > 0, err
 }
+
+// RecentBotAgent is an agent seen recently (the gateway's start check).
+type RecentBotAgent struct {
+	UserID int64
+	CodeID int64
+	Name   string // the code's name
+}
+
+// RecentBotAgents returns every user's agents (non-revoked bot codes with an agent row) last seen at or after sinceMs,
+// by user then code id.
+func (s *Service) RecentBotAgents(sinceMs int64) ([]RecentBotAgent, error) {
+	rows, err := s.db.Query(`SELECT a.user_id, a.code_id, c.name FROM bot_agents a JOIN extension_codes c ON c.id = a.code_id
+		WHERE c.user_id = a.user_id AND c.kind = 'bot' AND c.revoked_at IS NULL AND a.last_seen_at >= ?
+		ORDER BY a.user_id, a.code_id`, sinceMs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RecentBotAgent
+	for rows.Next() {
+		var a RecentBotAgent
+		if err := rows.Scan(&a.UserID, &a.CodeID, &a.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}

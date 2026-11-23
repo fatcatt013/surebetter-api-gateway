@@ -167,22 +167,24 @@ func (s *Service) BotOrderDay(userID, from, to int64) (BotOrderDayStats, error) 
 // CloseOpenBotOrders ends every order the last gateway process left open: waiting → stopped
 // (a live one placed nothing: its stake becomes 0), running → outcome_unknown (its ordered stake
 // stays), both with reason and ended_at. It returns the closed orders (with
-// their new state), running ones first, each group by id.
+// their new state), running ones first, each group by id. Each also carries DryRun, CodeID and
+// Agent (the code's name, "" without one): the gateway's alerts read them.
 func (s *Service) CloseOpenBotOrders(reason string, endedAt int64) ([]BotOrderRow, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT id, user_id, arb_key, state FROM bot_orders WHERE state IN ('waiting', 'running')
-		ORDER BY state = 'waiting', id`)
+	rows, err := tx.Query(`SELECT o.id, o.user_id, o.arb_key, o.state, o.dry_run, o.code_id, COALESCE(c.name, '')
+		FROM bot_orders o LEFT JOIN extension_codes c ON c.id = o.code_id
+		WHERE o.state IN ('waiting', 'running') ORDER BY o.state = 'waiting', o.id`)
 	if err != nil {
 		return nil, err
 	}
 	var closed []BotOrderRow
 	for rows.Next() {
 		var r BotOrderRow
-		if err := rows.Scan(&r.ID, &r.UserID, &r.ArbKey, &r.State); err != nil {
+		if err := rows.Scan(&r.ID, &r.UserID, &r.ArbKey, &r.State, &r.DryRun, &r.CodeID, &r.Agent); err != nil {
 			rows.Close()
 			return nil, err
 		}

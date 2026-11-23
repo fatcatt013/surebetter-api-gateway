@@ -289,3 +289,39 @@ func TestBotOrders_Checked(t *testing.T) {
 		t.Fatalf("ended rows checked_at: %v", at)
 	}
 }
+
+// The closed orders say whether they were dry runs and which agent had them (the gateway's alerts read them).
+func TestBotOrders_CloseOpenReportsDryRunAndAgent(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	code, err := s.CreateCode(user.UserID, "Home PC", KindBot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []BotOrderRow{
+		{ID: "r1", UserID: user.UserID, ArbKey: "r1", CodeID: code.ID, State: "running", DryRun: false, Stake: 200, InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 1000},
+		{ID: "r2", UserID: user.UserID, ArbKey: "r2", CodeID: code.ID, State: "running", DryRun: true, Stake: 200, InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 1000},
+		{ID: "w1", UserID: user.UserID, ArbKey: "w1", State: "waiting", DryRun: false, Stake: 200, InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 1000},
+	} {
+		if err := s.InsertBotOrder(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	closed, err := s.CloseOpenBotOrders("Gateway restarted", 5000)
+	if err != nil || len(closed) != 3 {
+		t.Fatalf("closed: %+v %v", closed, err)
+	}
+	by := map[string]BotOrderRow{}
+	for _, r := range closed {
+		by[r.ID] = r
+	}
+	if r := by["r1"]; r.DryRun || r.CodeID != code.ID || r.Agent != "Home PC" || r.State != "outcome_unknown" || r.Reason != "Gateway restarted" {
+		t.Fatalf("r1: %+v", r)
+	}
+	if r := by["r2"]; !r.DryRun || r.Agent != "Home PC" {
+		t.Fatalf("r2: %+v", r)
+	}
+	if r := by["w1"]; r.DryRun || r.CodeID != 0 || r.Agent != "" || r.State != "stopped" {
+		t.Fatalf("w1: %+v", r)
+	}
+}
