@@ -80,9 +80,18 @@ func (b *botHub) fireAlertsLocked(fx *effects) {
 		}
 	}
 	slices.SortFunc(due, compareScopes)
+	quietEnd := b.alerts.started.Add(alertStartQuiet)
 	for _, sc := range due {
 		pa := b.alerts.pending[sc]
 		switch sc.kind {
+		case alertAgent:
+			if now.Before(quietEnd) { // every agent reconnects after a start: wait for the end of the quiet period
+				pa.due = quietEnd
+				continue
+			}
+			delete(b.alerts.pending, sc)
+			b.raiseLocked(sc.userID, botAlert{Kind: alertAgent, Severity: severityProblem, AgentID: sc.codeID, Title: titleAgentOffline,
+				Detail: b.agentNameLocked(sc.codeID)}, &sc, fx)
 		case alertWindow:
 			delete(b.alerts.pending, sc)
 			b.raiseLocked(sc.userID, botAlert{Kind: alertWindow, Severity: severityProblem, AgentID: sc.codeID, WindowID: sc.windowID,

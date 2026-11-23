@@ -232,6 +232,7 @@ func (b *botHub) detach(c *Client) {
 	if len(b.agents[userID]) == 0 {
 		delete(b.agents, userID)
 	}
+	b.alertDetachLocked(userID, codeID)
 	b.mu.Unlock()
 	b.touch(userID, codeID)
 	b.changed(userID)

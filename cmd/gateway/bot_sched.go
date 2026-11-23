@@ -887,6 +887,7 @@ func (b *botHub) expireLocked(fx *effects) {
 
 // tick expires orders and retries every user's waiting orders (the scheduler's 1 s beat).
 func (b *botHub) tick() {
+	b.checkAgentsAfterStart()
 	b.mu.Lock()
 	fx := &effects{}
 	b.expireLocked(fx)
