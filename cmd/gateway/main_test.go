@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -92,6 +93,51 @@ func TestStakeAllocation_FairOddsRelayed(t *testing.T) {
 		if !present || got != want {
 			t.Errorf("%s → fair_odds = %v (present %v), want %v (re-marshalled: %s)", in, got, present, want, out)
 		}
+	}
+}
+
+// alternatives (the other books' prices for the leg's outcome) survive the gateway's
+// unmarshal → re-marshal field for field, stay absent when the engine left them out, and
+// reach the Telegram notifier for its re-pick.
+func TestStakeAllocation_AlternativesRelayed(t *testing.T) {
+	alt := `{"bookmaker":"betano","decimal_odds":4,"label":"Away","market_name":"Zápas","match_url":"https://b/m","odds_updated_at":1775037276100,"source_id":"77","source_market_ref":"ufo:1","fair_odds":3.9}`
+	alt2 := `{"bookmaker":"tipsport","decimal_odds":3.2,"label":"Away","market_name":"Vítěz","match_url":"","odds_updated_at":5,"fair_odds":null}`
+	in := `{"bookmaker":"kingsbet","outcome_id":"AWAY","decimal_odds":4.1,"stake_pct":24.8,"fair_odds":null,"alternatives":[` + alt + `,` + alt2 + `]}`
+	var s StakeAllocation
+	if err := json.Unmarshal([]byte(in), &s); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := json.Marshal(s)
+	var back struct {
+		Alternatives []json.RawMessage `json:"alternatives"`
+	}
+	_ = json.Unmarshal(out, &back)
+	if len(back.Alternatives) != 2 {
+		t.Fatalf("alternatives lost: %s", out)
+	}
+	for i, want := range []string{alt, alt2} {
+		var w, g map[string]any
+		_ = json.Unmarshal([]byte(want), &w)
+		_ = json.Unmarshal(back.Alternatives[i], &g)
+		if len(w) != len(g) {
+			t.Fatalf("alternative %d = %s, want %s", i, back.Alternatives[i], want)
+		}
+		for k, v := range w {
+			if g[k] != v {
+				t.Errorf("alternative %d %s = %v, want %v", i, k, g[k], v)
+			}
+		}
+	}
+
+	var bare StakeAllocation
+	_ = json.Unmarshal([]byte(`{"bookmaker":"kingsbet","outcome_id":"AWAY","decimal_odds":4.1,"stake_pct":24.8}`), &bare)
+	if out, _ := json.Marshal(bare); strings.Contains(string(out), "alternatives") {
+		t.Errorf("absent alternatives must stay absent: %s", out)
+	}
+
+	ta := toTelegramArb(ArbOpportunity{Stakes: []StakeAllocation{s}})
+	if q := ta.Stakes[0].Alternatives; len(q) != 2 || q[0].Bookmaker != "betano" || q[0].DecimalOdds != 4 || q[0].MatchURL != "https://b/m" {
+		t.Errorf("telegram alternatives = %+v", q)
 	}
 }
 

@@ -55,6 +55,9 @@ func toTelegramArb(o ArbOpportunity) telegram.Arb {
 	stakes := make([]telegram.Stake, len(o.Stakes))
 	for i, s := range o.Stakes {
 		stakes[i] = telegram.Stake{Bookmaker: s.Bookmaker, OutcomeID: s.OutcomeID, Label: s.Label, DecimalOdds: s.DecimalOdds, StakePct: s.StakePct, MatchURL: s.MatchURL, MarketName: s.MarketName}
+		for _, q := range s.Alternatives {
+			stakes[i].Alternatives = append(stakes[i].Alternatives, telegram.Quote{Bookmaker: q.Bookmaker, Label: q.Label, DecimalOdds: q.DecimalOdds, MatchURL: q.MatchURL, MarketName: q.MarketName})
+		}
 	}
 	return telegram.Arb{
 		EventID: o.EventID, Sport: o.Sport, MarketType: o.MarketType, Line: o.Line, ProfitPct: o.ProfitPct, Stakes: stakes,

@@ -172,6 +172,25 @@ type StakeAllocation struct {
 	// (the value-bet consensus, leave-one-out); nil = no consensus. Relayed verbatim —
 	// always present, null when unknown — for bots rule 2 ("outlier first").
 	FairOdds *float64 `json:"fair_odds"`
+	// Alternatives are the other bookmakers' current prices for this outcome, best first
+	// (never this leg's bookmaker, never ARB_EXCLUDED_BOOKS). Relayed verbatim — omitted when
+	// empty, as the engine sends it — so the app can re-pick each outcome among the books its
+	// filter shows; the Telegram bot re-picks among its preset's books (telegram.Repick).
+	Alternatives []AltQuote `json:"alternatives,omitempty"`
+}
+
+// AltQuote mirrors the arb-engine's AltQuote: another bookmaker's price for a stake's outcome.
+// Every field means what the StakeAllocation field of the same name means, for that bookmaker.
+type AltQuote struct {
+	Bookmaker       string   `json:"bookmaker"`
+	DecimalOdds     float64  `json:"decimal_odds"`
+	Label           string   `json:"label"`
+	MarketName      string   `json:"market_name"`
+	MatchURL        string   `json:"match_url"`
+	OddsUpdatedAt   int64    `json:"odds_updated_at"`
+	SourceID        string   `json:"source_id,omitempty"`
+	SourceMarketRef string   `json:"source_market_ref,omitempty"`
+	FairOdds        *float64 `json:"fair_odds"`
 }
 
 // ── ValueBet (mirrors the arb-engine's value.rs ValueBet) ──────────────────

@@ -54,17 +54,41 @@ func ageSec(a Arb, nowMs int64) float64 {
 
 // Matches reports whether the arb passes the bot's filter at nowMs.
 func Matches(a Arb, f Filter, b Bankroll, nowMs int64) bool {
-	// bookmakers: every leg must be at a selected book; a leg-less arb never qualifies
-	if f.Bookmakers != nil {
-		if len(a.Stakes) == 0 {
-			return false
-		}
-		for _, s := range a.Stakes {
-			if !slices.Contains(f.Bookmakers, s.Bookmaker) {
-				return false
-			}
-		}
+	_, ok := Select(a, f, b, nowMs)
+	return ok
+}
+
+// ForBooks is the arb as the filter's bookmakers can play it (Repick), or false when it is not an
+// arb for them: an outcome has no price at a selected book, the re-picked profit is ≤ 0, or the arb
+// has no legs. nil bookmakers = every book: the arb unchanged.
+func ForBooks(a Arb, f Filter) (Arb, bool) {
+	if f.Bookmakers == nil {
+		return a, true
 	}
+	if len(a.Stakes) == 0 {
+		return Arb{}, false
+	}
+	r, ok := Repick(a, f.Bookmakers)
+	if !ok || r.ProfitPct <= 0 {
+		return Arb{}, false
+	}
+	return r, true
+}
+
+// Select is Matches returning the arb the bot posts: re-picked among the filter's bookmakers
+// (ForBooks), every later step judging the re-picked prices.
+func Select(a Arb, f Filter, b Bankroll, nowMs int64) (Arb, bool) {
+	a, ok := ForBooks(a, f)
+	if !ok {
+		return Arb{}, false
+	}
+	if !matchesRest(a, f, b, nowMs) {
+		return Arb{}, false
+	}
+	return a, true
+}
+
+func matchesRest(a Arb, f Filter, b Bankroll, nowMs int64) bool {
 	if f.ThreeLeg == "exclude" && len(a.Stakes) >= 3 {
 		return false
 	}

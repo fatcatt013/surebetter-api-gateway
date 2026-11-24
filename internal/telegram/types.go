@@ -32,6 +32,18 @@ type Stake struct {
 	StakePct    float64 `json:"stake_pct"` // percent, e.g. 49.03
 	MatchURL    string  `json:"match_url"`
 	MarketName  string  `json:"market_name"` // the bookmaker's own market label for this leg
+	// Alternatives: the other bookmakers' prices for this outcome, best first (the engine's
+	// stakes[].alternatives). Read only by Repick; a re-picked arb carries none.
+	Alternatives []Quote `json:"alternatives,omitempty"`
+}
+
+// Quote is another bookmaker's price for a stake's outcome; the fields mean what Stake's do.
+type Quote struct {
+	Bookmaker   string  `json:"bookmaker"`
+	Label       string  `json:"label"`
+	DecimalOdds float64 `json:"decimal_odds"`
+	MatchURL    string  `json:"match_url"`
+	MarketName  string  `json:"market_name"`
 }
 
 // firstSeen is the ms epoch the arb was first detected (first_detected_at, else detected_at, else 0).

@@ -249,10 +249,18 @@ func (n *Notifier) handle(_ context.Context, ev Event, now time.Time) {
 		n.goGone(ev.Key, e, now, EndRedetected)
 		return
 	}
+	// A posted arb shows the prices the preset's bookmakers can play. When they no longer make
+	// it an arb (an outcome lost its last price at those books, or the re-picked profit is ≤ 0),
+	// it ended for this preset, like an engine removal.
+	a, ok := ForBooks(ev.Arb, n.Config().Filter)
+	if !ok {
+		n.goGone(ev.Key, e, now, EndRemoved)
+		return
+	}
 	e.restored = false
-	e.Arb = ev.Arb
-	if ev.Arb.ProfitPct > e.PeakProfit {
-		e.PeakProfit = ev.Arb.ProfitPct
+	e.Arb = a
+	if a.ProfitPct > e.PeakProfit {
+		e.PeakProfit = a.ProfitPct
 	}
 	if e.state == stateLive {
 		n.maybeEdit(ev.Key, e, now)
@@ -268,7 +276,11 @@ func (n *Notifier) maybeSend(key string, a Arb, now time.Time) {
 		return
 	}
 	cfg := n.Config()
-	if !cfg.Enabled || cfg.Preset == nil || !Matches(a, cfg.Filter, cfg.Bankroll, now.UnixMilli()) {
+	if !cfg.Enabled || cfg.Preset == nil {
+		return
+	}
+	a, ok := Select(a, cfg.Filter, cfg.Bankroll, now.UnixMilli())
+	if !ok {
 		return
 	}
 	e := &entry{
