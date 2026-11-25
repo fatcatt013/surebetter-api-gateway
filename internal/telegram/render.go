@@ -44,8 +44,8 @@ func (r *Renderer) Render(v View) string {
 	var head string
 	if v.Gone {
 		head = "❌ <b>GONE</b>"
-		if a.firstSeen() > 0 {
-			head += " after " + formatDuration(v.GoneAt.Sub(time.UnixMilli(a.firstSeen())))
+		if a.FirstSeen() > 0 {
+			head += " after " + formatDuration(v.GoneAt.Sub(time.UnixMilli(a.FirstSeen())))
 		}
 		head += " · <s>" + pct(plan.ROI) + "</s>"
 		if v.PeakProfit > a.ProfitPct+0.005 {
@@ -128,8 +128,8 @@ func (r *Renderer) Render(v View) string {
 	}
 
 	var foot []string
-	if a.firstSeen() > 0 {
-		f := "⏱ found " + r.clock(time.UnixMilli(a.firstSeen()), v.Now, true)
+	if a.FirstSeen() > 0 {
+		f := "⏱ found " + r.clock(time.UnixMilli(a.FirstSeen()), v.Now, true)
 		if a.FirstDetectedAt > 0 && a.LastChangedAt > a.FirstDetectedAt {
 			f += " · changed " + r.clock(time.UnixMilli(a.LastChangedAt), v.Now, true)
 		}

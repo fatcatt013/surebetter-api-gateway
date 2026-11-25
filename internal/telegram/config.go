@@ -3,6 +3,8 @@ package telegram
 import (
 	"errors"
 	"fmt"
+
+	"github.com/surebetter/api-gateway/internal/arbfilter"
 )
 
 // PresetRef names the frontend filter preset the bot follows.
@@ -11,29 +13,11 @@ type PresetRef struct {
 	Name string `json:"name"`
 }
 
-// Filter is the frontend FilterState as the bot applies it. `markets` is pre-resolved by the
-// frontend into BlockedMarkets (base sport → canonical market types it blocks); `sort` is dropped.
-// A nil slice means "don't constrain"; an empty, non-nil Bookmakers slice keeps nothing (as in the UI).
-type Filter struct {
-	Bookmakers     []string            `json:"bookmakers"`
-	Sports         []string            `json:"sports"`
-	LiveState      string              `json:"live_state"` // all | live | prematch
-	ProfitMin      *float64            `json:"profit_min"`
-	ProfitMax      *float64            `json:"profit_max"`
-	MinAgeSec      int                 `json:"min_age_sec"`
-	ThreeLeg       string              `json:"three_leg"` // include | exclude: arbs with 3+ legs
-	BlockedMarkets map[string][]string `json:"blocked_markets"`
-}
+// Filter is the frontend FilterState as the bot applies it (arbfilter.Filter).
+type Filter = arbfilter.Filter
 
-// Bankroll mirrors the frontend BankrollSettings (snake_case).
-type Bankroll struct {
-	Mode       string  `json:"mode"` // split | maxleg
-	Total      float64 `json:"total"`
-	MaxLeg     float64 `json:"max_leg"`
-	Currency   string  `json:"currency"` // CZK | EUR
-	AnchorBook *string `json:"anchor_book"`
-	Rounding   int     `json:"rounding"` // 1 | 10 | 100
-}
+// Bankroll mirrors the frontend BankrollSettings (arbfilter.Bankroll).
+type Bankroll = arbfilter.Bankroll
 
 // DefaultBankroll matches the frontend DEFAULT_BANKROLL; used for the test message when no config is stored.
 var DefaultBankroll = Bankroll{Mode: "split", Total: 10000, MaxLeg: 3000, Currency: "CZK", Rounding: 1}

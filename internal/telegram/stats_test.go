@@ -210,7 +210,7 @@ func TestStats_LoadSweepsAllButTrackedMessages(t *testing.T) {
 	a := SampleArb(now)
 	st := newMemStore()
 	st.cfg = validConfig()
-	st.msgs["k"] = Tracked{MessageID: 77, SentAt: now.UnixMilli(), FirstDetectedAt: a.firstSeen(), Arb: a, Bankroll: DefaultBankroll}
+	st.msgs["k"] = Tracked{MessageID: 77, SentAt: now.UnixMilli(), FirstDetectedAt: a.FirstSeen(), Arb: a, Bankroll: DefaultBankroll}
 	st.msgs["gone:70"] = Tracked{MessageID: 70, SentAt: now.UnixMilli(), GoneAt: now.UnixMilli()}
 	_, _, rec := newStatsNotifier(t, st, nil)
 	if !reflect.DeepEqual(rec.sweeps, [][]int64{{77}}) {
@@ -223,7 +223,7 @@ func TestStats_RestoredMessageEndsUnknownWhenFoundAbsent(t *testing.T) {
 	a := SampleArb(now)
 	st := newMemStore()
 	st.cfg = validConfig()
-	st.msgs["k"] = Tracked{MessageID: 77, SentAt: now.UnixMilli(), FirstDetectedAt: a.firstSeen(), Arb: a, Bankroll: DefaultBankroll}
+	st.msgs["k"] = Tracked{MessageID: 77, SentAt: now.UnixMilli(), FirstDetectedAt: a.FirstSeen(), Arb: a, Bankroll: DefaultBankroll}
 	present := map[string]bool{}
 	n, _, rec := newStatsNotifier(t, st, present)
 	// After a restart, absence says only that the arb ended at some point during the downtime.
@@ -238,7 +238,7 @@ func TestStats_RestoredMessageRemovedHasAKnownEnd(t *testing.T) {
 	a := SampleArb(now)
 	st := newMemStore()
 	st.cfg = validConfig()
-	st.msgs["k"] = Tracked{MessageID: 77, SentAt: now.UnixMilli(), FirstDetectedAt: a.firstSeen(), Arb: a, Bankroll: DefaultBankroll}
+	st.msgs["k"] = Tracked{MessageID: 77, SentAt: now.UnixMilli(), FirstDetectedAt: a.FirstSeen(), Arb: a, Bankroll: DefaultBankroll}
 	n, _, rec := newStatsNotifier(t, st, nil)
 	at := now.Add(time.Minute)
 	n.handle(bg, upsert("k", a), now.Add(time.Second)) // the arb is still alive after the restart
@@ -347,7 +347,7 @@ func TestStats_RestoredMessageRedetectedEndsUnknown(t *testing.T) {
 	a := SampleArb(now)
 	st := newMemStore()
 	st.cfg = validConfig()
-	st.msgs["k"] = Tracked{MessageID: 77, SentAt: now.UnixMilli(), FirstDetectedAt: a.firstSeen(), Arb: a, Bankroll: DefaultBankroll}
+	st.msgs["k"] = Tracked{MessageID: 77, SentAt: now.UnixMilli(), FirstDetectedAt: a.FirstSeen(), Arb: a, Bankroll: DefaultBankroll}
 	n, _, rec := newStatsNotifier(t, st, nil)
 	b := a
 	b.FirstDetectedAt += 90_000 // the old one ended during the downtime, when exactly is unknown

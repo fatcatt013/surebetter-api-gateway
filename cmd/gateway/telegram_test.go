@@ -58,6 +58,27 @@ func TestToTelegramArb_CopiesFields(t *testing.T) {
 	}
 }
 
+// The Telegram path converts as before the shared arbfilter types: an arb whose legs carry selection ids and fair
+// odds (an alternative's too) is persisted (telegram:messages) as the same JSON as before — no source ids, no fair odds.
+func TestToTelegramArb_PersistedJSONUnchanged(t *testing.T) {
+	fair := 1.97
+	o := ArbOpportunity{EventID: "e", Sport: "tennis", MarketType: "T", Line: 2, ProfitPct: 1,
+		Stakes: []StakeAllocation{{Bookmaker: "betano", OutcomeID: "o", Label: "l", DecimalOdds: 2.1, StakePct: 49, MatchURL: "u", MarketName: "m",
+			SourceID: "s1", SourceMarketRef: "r1", FairOdds: &fair,
+			Alternatives: []AltQuote{{Bookmaker: "fortuna", DecimalOdds: 2, Label: "lf", MarketName: "mf", MatchURL: "uf", SourceID: "s2", SourceMarketRef: "r2", FairOdds: &fair}}}}}
+	js, err := json.Marshal(toTelegramArb(o))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"event_id":"e","sport":"tennis","market_type":"T","line":2,"profit_pct":1,"stakes":[{"bookmaker":"betano","outcome_id":"o","label":"l",` +
+		`"decimal_odds":2.1,"stake_pct":49,"match_url":"u","market_name":"m","alternatives":[{"bookmaker":"fortuna","label":"lf","decimal_odds":2,` +
+		`"match_url":"uf","market_name":"mf"}]}],"detected_at":0,"first_detected_at":0,"last_changed_at":0,"name_home":"","name_away":"","league":"",` +
+		`"market_name":"","start_time":0}`
+	if string(js) != want {
+		t.Fatalf("persisted arb:\n%s\nwant\n%s", js, want)
+	}
+}
+
 func TestTelegramStatsSink_WritesTheAccountsDB(t *testing.T) {
 	db, err := accounts.OpenDB(filepath.Join(t.TempDir(), "accounts.db"))
 	if err != nil {

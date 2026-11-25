@@ -1,4 +1,4 @@
-package telegram
+package arbfilter
 
 import "math"
 
@@ -14,11 +14,11 @@ type StakePlan struct {
 	FavIdx int     // capped leg in maxleg mode, -1 in split
 }
 
-// jsRound is JavaScript's Math.round (halves toward +∞), unlike Go's math.Round.
-func jsRound(x float64) float64 { return math.Floor(x + 0.5) }
+// JSRound is JavaScript's Math.round (halves toward +∞), unlike Go's math.Round.
+func JSRound(x float64) float64 { return math.Floor(x + 0.5) }
 
-// roundingStep: 10 or 100 pass, anything else is 1.
-func roundingStep(r int) float64 {
+// RoundingStep: 10 or 100 pass, anything else is 1.
+func RoundingStep(r int) float64 {
 	if r == 10 || r == 100 {
 		return float64(r)
 	}
@@ -75,8 +75,8 @@ func ComputeStakes(a Arb, b Bankroll) StakePlan {
 		}
 	}
 
-	step := roundingStep(b.Rounding)
-	roundStake := func(x float64) float64 { return jsRound(x/step) * step }
+	step := RoundingStep(b.Rounding)
+	roundStake := func(x float64) float64 { return JSRound(x/step) * step }
 	stakes := make([]float64, n)
 	total := 0.0
 
@@ -108,7 +108,7 @@ func ComputeStakes(a Arb, b Bankroll) StakePlan {
 		if step > 1 {
 			capStake = math.Floor(b.MaxLeg/step) * step // the max is a ceiling
 		} else {
-			capStake = jsRound(b.MaxLeg)
+			capStake = JSRound(b.MaxLeg)
 		}
 		if capStake <= 0 {
 			return zeros
@@ -135,12 +135,12 @@ func ComputeStakes(a Arb, b Bankroll) StakePlan {
 		for i, s := range a.Stakes {
 			worst = math.Min(worst, stakes[i]*s.DecimalOdds)
 		}
-		return StakePlan{Stakes: stakes, Total: total, Profit: jsRound(worst - total), ROI: (worst - total) / total * 100, FavIdx: fav}
+		return StakePlan{Stakes: stakes, Total: total, Profit: JSRound(worst - total), ROI: (worst - total) / total * 100, FavIdx: fav}
 	}
-	return StakePlan{Stakes: stakes, Total: total, Profit: jsRound(total * arbROI / 100), ROI: arbROI, FavIdx: fav}
+	return StakePlan{Stakes: stakes, Total: total, Profit: JSRound(total * arbROI / 100), ROI: arbROI, FavIdx: fav}
 }
 
 // LosesAfterRounding: stake rounding (10/100) leaves the arb losing money. Always false with rounding off.
 func LosesAfterRounding(a Arb, b Bankroll) bool {
-	return roundingStep(b.Rounding) > 1 && ComputeStakes(a, b).Profit < 0
+	return RoundingStep(b.Rounding) > 1 && ComputeStakes(a, b).Profit < 0
 }

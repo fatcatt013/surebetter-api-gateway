@@ -244,7 +244,7 @@ func (n *Notifier) handle(_ context.Context, ev Event, now time.Time) {
 	if e.state == stateGone {
 		return
 	}
-	if e.FirstDetectedAt != 0 && ev.Arb.firstSeen() != 0 && ev.Arb.firstSeen() != e.FirstDetectedAt {
+	if e.FirstDetectedAt != 0 && ev.Arb.FirstSeen() != 0 && ev.Arb.FirstSeen() != e.FirstDetectedAt {
 		// The engine re-detected it: the old opportunity ended without a removal reaching us.
 		n.goGone(ev.Key, e, now, EndRedetected)
 		return
@@ -284,7 +284,7 @@ func (n *Notifier) maybeSend(key string, a Arb, now time.Time) {
 		return
 	}
 	e := &entry{
-		Tracked: Tracked{FirstDetectedAt: a.firstSeen(), PeakProfit: a.ProfitPct, Arb: a, Bankroll: cfg.Bankroll, PresetName: cfg.Preset.Name},
+		Tracked: Tracked{FirstDetectedAt: a.FirstSeen(), PeakProfit: a.ProfitPct, Arb: a, Bankroll: cfg.Bankroll, PresetName: cfg.Preset.Name},
 		state:   stateSending,
 		sent:    a,
 		userID:  cfg.UpdatedBy,

@@ -1,4 +1,4 @@
-package telegram
+package arbfilter
 
 import "slices"
 
@@ -8,7 +8,8 @@ import "slices"
 // profit = (1 − index) × 100, stake_i = (1/odds_i) / index × 100). false when some outcome has no
 // price at any of the books. nil books = every book: the arb is returned unchanged. The result may
 // have profit ≤ 0 (no longer an arb for these books); the caller decides. A re-picked arb's stakes
-// carry no Alternatives. The frontend's repickArb (util/repick.ts) is the same rule.
+// carry no Alternatives; a stake taken from an alternative keeps that quote's every field (source ids,
+// fair odds). The frontend's repickArb (util/repick.ts) is the same rule.
 func Repick(a Arb, books []string) (Arb, bool) {
 	if books == nil {
 		return a, true
@@ -25,7 +26,7 @@ func Repick(a Arb, books []string) (Arb, bool) {
 				continue
 			}
 			best = Stake{Bookmaker: q.Bookmaker, OutcomeID: s.OutcomeID, Label: q.Label, DecimalOdds: q.DecimalOdds,
-				MatchURL: q.MatchURL, MarketName: q.MarketName}
+				MatchURL: q.MatchURL, MarketName: q.MarketName, SourceID: q.SourceID, SourceMarketRef: q.SourceMarketRef, FairOdds: q.FairOdds}
 			found = true
 		}
 		if !found {

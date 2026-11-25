@@ -147,7 +147,7 @@ func sentArb(key string, a Arb, b Bankroll, userID, messageID, sentAt int64) Sen
 		legs[i] = SentLeg{Bookmaker: s.Bookmaker, OutcomeID: s.OutcomeID, Odds: s.DecimalOdds, Stake: whole(plan.Stakes[i])}
 	}
 	return SentArb{
-		MessageID: messageID, SentAt: sentAt, UserID: userID, ArbKey: key, FirstDetectedAt: a.firstSeen(),
+		MessageID: messageID, SentAt: sentAt, UserID: userID, ArbKey: key, FirstDetectedAt: a.FirstSeen(),
 		Sport: strings.TrimSuffix(a.Sport, liveSuffix), IsLive: IsLive(a.Sport), MarketType: a.MarketType, Line: a.Line,
 		ProfitPct: a.ProfitPct, ShownProfitPct: plan.ROI, Currency: b.Currency,
 		TotalStake: whole(plan.Total), Payout: whole(plan.Total + plan.Profit), Profit: whole(plan.Profit), Legs: legs,

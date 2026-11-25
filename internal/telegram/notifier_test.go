@@ -229,7 +229,7 @@ func TestNotifier_RestartResumesStoredMessage(t *testing.T) {
 	a := SampleArb(now)
 	st := newMemStore()
 	st.cfg = validConfig()
-	st.msgs["k"] = Tracked{MessageID: 77, SentAt: now.UnixMilli(), LastEditAt: now.UnixMilli(), FirstDetectedAt: a.firstSeen(), Arb: a, Bankroll: DefaultBankroll, PresetName: "p"}
+	st.msgs["k"] = Tracked{MessageID: 77, SentAt: now.UnixMilli(), LastEditAt: now.UnixMilli(), FirstDetectedAt: a.FirstSeen(), Arb: a, Bankroll: DefaultBankroll, PresetName: "p"}
 	n, out := newTestNotifier(t, st, nil)
 	n.handle(bg, upsert("k", a), now.Add(time.Second))
 	noJobs(t, out) // same opportunity: no new message (text hash unknown → treated as changed but throttled)
