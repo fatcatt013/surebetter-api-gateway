@@ -495,8 +495,8 @@ func TestMigrate_BotLogins(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 12 || version != len(migrations) {
-		t.Fatalf("user_version = %d (err %v), want 12", version, err)
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want %d", version, err, len(migrations))
 	}
 	var alerts int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM bot_alerts`).Scan(&alerts); err != nil || alerts != 1 {
@@ -524,5 +524,48 @@ func TestMigrate_BotLogins(t *testing.T) {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'bot_logins_user'`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("index bot_logins_user: %d (err %v)", n, err)
+	}
+}
+
+func TestMigrate_BotAutoMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The schema as shipped with bot auto-login (version 12), one user, their settings and one order.
+	steps := append(append([]string{}, migrations[:12]...), `PRAGMA user_version = 12`,
+		`INSERT INTO users (id, email, password_hash, role, created_at) VALUES (1, 'u@example.com', 'x', 'user', 0)`,
+		`INSERT INTO bot_settings (user_id, dry_run, paused, paused_reason, max_order, max_leg, per_day, orders_at_once, pause_on_unknown, updated_at)
+			VALUES (1, 0, 0, '', 1000, 500, 5000, 1, 1, 5)`,
+		`INSERT INTO bot_orders (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json, created_at)
+			VALUES ('o1', 1, 'k', 0, 'placed', '', 0, 200, '{}', '[]', 7)`)
+	for _, q := range steps {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%.60s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 13 || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want 13", version, err)
+	}
+	var settings, order string
+	if err := db.QueryRow(`SELECT max_leg || '/' || auto_json || '/' || auto_paused_reason || '/' || auto_paused_orders FROM bot_settings`).
+		Scan(&settings); err != nil || settings != "500///[]" {
+		t.Fatalf("settings after the migration: %q (err %v)", settings, err)
+	}
+	if err := db.QueryRow(`SELECT stake || '/' || source || '/' || event_id FROM bot_orders`).Scan(&order); err != nil || order != "200/app/" {
+		t.Fatalf("order after the migration: %q (err %v)", order, err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'bot_orders_user_event'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("index bot_orders_user_event: %d (err %v)", n, err)
 	}
 }

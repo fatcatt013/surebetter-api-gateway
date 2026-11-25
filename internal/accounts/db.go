@@ -272,6 +272,15 @@ var migrations = []string{
 		PRIMARY KEY (code_id, window_id)
 	);
 	CREATE INDEX bot_logins_user ON bot_logins (user_id);`,
+	// 13: bot automatic mode: each user's auto settings (a JSON object, '' = never set: mode
+	// off), the auto pause (reason, '' = not paused, and the ids of the orders that paused it), and each order's source
+	// ('app' or 'auto') and match (event_id, '' for orders older than this). Times are Unix ms.
+	`ALTER TABLE bot_settings ADD COLUMN auto_json TEXT NOT NULL DEFAULT '';
+	ALTER TABLE bot_settings ADD COLUMN auto_paused_reason TEXT NOT NULL DEFAULT '';
+	ALTER TABLE bot_settings ADD COLUMN auto_paused_orders TEXT NOT NULL DEFAULT '[]';
+	ALTER TABLE bot_orders ADD COLUMN source TEXT NOT NULL DEFAULT 'app';
+	ALTER TABLE bot_orders ADD COLUMN event_id TEXT NOT NULL DEFAULT '';
+	CREATE INDEX bot_orders_user_event ON bot_orders (user_id, event_id, created_at);`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

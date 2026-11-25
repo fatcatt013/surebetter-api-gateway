@@ -20,7 +20,8 @@ func TestBotSettings_DefaultsSaveAndLoad(t *testing.T) {
 	}
 
 	want := BotSettings{DryRun: false, Paused: true, PausedReason: "Outcome unknown · order 0123abcd", MaxOrder: 5000, MaxLeg: 3000,
-		PerDay: 20000, OrdersAtOnce: 3, PauseOnUnknown: false}
+		PerDay: 20000, OrdersAtOnce: 3, PauseOnUnknown: false, AutoJSON: `{"mode":"log"}`, AutoPausedReason: "Stuck order · order 0123abcd",
+		AutoPausedOrders: `["0123abcd00000000"]`}
 	if err := s.SaveBotSettings(user.UserID, want); err != nil {
 		t.Fatal(err)
 	}
@@ -29,6 +30,7 @@ func TestBotSettings_DefaultsSaveAndLoad(t *testing.T) {
 	}
 	clk.advance(time.Minute)
 	want.Paused, want.PausedReason = false, ""
+	want.AutoPausedReason, want.AutoPausedOrders = "", "[]"
 	if err := s.SaveBotSettings(user.UserID, want); err != nil {
 		t.Fatal(err)
 	}
@@ -80,5 +82,22 @@ func TestBotSettings_OddsDrop(t *testing.T) {
 	}
 	if got, err := s.BotSettings(user.UserID); err != nil || got != st {
 		t.Fatalf("after save: %+v %v", got, err)
+	}
+}
+
+func TestBotSettings_AutoUsers(t *testing.T) {
+	s, _, _ := newTestService(t)
+	a, _ := mustUser(t, s, "a@example.com", RoleUser)
+	b, _ := mustUser(t, s, "b@example.com", RoleUser)
+	st := DefaultBotSettings()
+	if err := s.SaveBotSettings(a.UserID, st); err != nil {
+		t.Fatal(err)
+	}
+	st.AutoJSON = `{"mode":"off"}`
+	if err := s.SaveBotSettings(b.UserID, st); err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := s.BotAutoUserIDs(); err != nil || len(ids) != 1 || ids[0] != b.UserID {
+		t.Fatalf("auto users: %v %v", ids, err)
 	}
 }

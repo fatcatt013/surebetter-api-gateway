@@ -61,8 +61,15 @@ func (s *Service) PutState(p Principal, key string, value json.RawMessage, clien
 		return err
 	}
 	s.conns.NotifyState(p.UserID, key, clientID)
+	if s.stateHook != nil {
+		s.stateHook(p.UserID, key)
+	}
 	return nil
 }
+
+// SetStateHook sets a function told of every saved state key (after the write; the bots' auto mode re-reads
+// "hidden"). Call it once at startup, before serving. It must not block.
+func (s *Service) SetStateHook(f func(userID int64, key string)) { s.stateHook = f }
 
 // SetOnboarded marks onboarding finished (idempotent: the first time is kept).
 func (s *Service) SetOnboarded(userID int64) error {

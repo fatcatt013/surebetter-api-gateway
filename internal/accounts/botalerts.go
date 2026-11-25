@@ -135,6 +135,12 @@ func (s *Service) ResolveBotOrderAlerts(userID int64, orderID string, at int64) 
 		`user_id = ? AND order_id = ? AND kind = 'attention' AND resolved_at = 0 AND dismissed_at = 0`, at, userID, orderID)
 }
 
+// ResolveBotAlertsTitled resolves userID's open (not resolved, not dismissed) alerts titled title (Resume of the auto
+// pause: "Auto paused") and returns them.
+func (s *Service) ResolveBotAlertsTitled(userID int64, title string, at int64) ([]BotAlertRow, error) {
+	return s.changeBotAlerts("resolved_at", `user_id = ? AND title = ? AND resolved_at = 0 AND dismissed_at = 0`, at, userID, title)
+}
+
 // ResolveOpenBotAlerts resolves every open alert of kinds (at gateway start: the window and agent alerts the previous
 // process can no longer resolve) and returns how many.
 func (s *Service) ResolveOpenBotAlerts(kinds []string, at int64) (int64, error) {

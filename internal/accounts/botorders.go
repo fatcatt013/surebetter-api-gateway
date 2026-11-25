@@ -27,6 +27,10 @@ type BotOrderRow struct {
 	// would have had when posted); MinProfitPct its minimum profit % (0 = none).
 	OddsDrop     string
 	MinProfitPct float64
+	// Source is who created it: "app" (POST /api/me/bot/orders) or "auto" (the automatic mode); EventID its match
+	// (the arb's event_id; "" for orders older than migration 13).
+	Source  string
+	EventID string
 }
 
 // BotOrderDayStats sums a user's orders created in one day: all orders, the placed ones, and the
@@ -41,10 +45,19 @@ type BotOrderDayStats struct {
 // InsertBotOrder stores a new order (Agent is ignored).
 func (s *Service) InsertBotOrder(r BotOrderRow) error {
 	_, err := s.db.Exec(`INSERT INTO bot_orders (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json,
-			flow_json, created_at, sent_at, ended_at, odds_drop, min_profit_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			flow_json, created_at, sent_at, ended_at, odds_drop, min_profit_pct, source, event_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.UserID, r.ArbKey, r.CodeID, r.State, r.Reason, r.DryRun, r.Stake, r.InfoJSON, r.LegsJSON, r.FlowJSON, r.CreatedAt, r.SentAt, r.EndedAt,
-		r.OddsDrop, r.MinProfitPct)
+		r.OddsDrop, r.MinProfitPct, orderSource(r.Source), r.EventID)
 	return err
+}
+
+// orderSource is the stored source: "auto", anything else "app".
+func orderSource(s string) string {
+	if s == "auto" {
+		return "auto"
+	}
+	return "app"
 }
 
 // MarkBotOrderSent moves a waiting order to running: the agent, the mode (dry run) and odds-drop
@@ -78,13 +91,14 @@ func (s *Service) SetBotOrderFlow(id, flowJSON string) error {
 }
 
 const botOrderColumns = `o.id, o.user_id, o.arb_key, o.code_id, COALESCE(c.name, ''), o.state, o.reason, o.dry_run, o.stake,
-	o.info_json, o.legs_json, o.flow_json, o.created_at, o.sent_at, o.ended_at, o.checked_at, o.odds_drop, o.min_profit_pct`
+	o.info_json, o.legs_json, o.flow_json, o.created_at, o.sent_at, o.ended_at, o.checked_at, o.odds_drop, o.min_profit_pct, o.source, o.event_id`
 
 // scanBotOrder reads one row of botOrderColumns.
 func scanBotOrder(row interface{ Scan(...any) error }) (BotOrderRow, error) {
 	var r BotOrderRow
 	err := row.Scan(&r.ID, &r.UserID, &r.ArbKey, &r.CodeID, &r.Agent, &r.State, &r.Reason, &r.DryRun, &r.Stake,
-		&r.InfoJSON, &r.LegsJSON, &r.FlowJSON, &r.CreatedAt, &r.SentAt, &r.EndedAt, &r.CheckedAt, &r.OddsDrop, &r.MinProfitPct)
+		&r.InfoJSON, &r.LegsJSON, &r.FlowJSON, &r.CreatedAt, &r.SentAt, &r.EndedAt, &r.CheckedAt, &r.OddsDrop, &r.MinProfitPct,
+		&r.Source, &r.EventID)
 	return r, err
 }
 
@@ -153,6 +167,26 @@ func (s *Service) EndedBotOrders(userID, from, to int64, limit int) ([]BotOrderR
 	return out, rows.Err()
 }
 
+// BotOrdersOfDay returns every order of userID created in [from, to) (any state), oldest first (auto mode rebuilds
+// its day from them).
+func (s *Service) BotOrdersOfDay(userID, from, to int64) ([]BotOrderRow, error) {
+	rows, err := s.db.Query(`SELECT `+botOrderColumns+` FROM bot_orders o LEFT JOIN extension_codes c ON c.id = o.code_id
+		WHERE o.user_id = ? AND o.created_at >= ? AND o.created_at < ? ORDER BY o.created_at, o.id`, userID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []BotOrderRow{}
+	for rows.Next() {
+		r, err := scanBotOrder(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // BotOrderDay counts userID's orders created in [from, to) and sums their live stake.
 func (s *Service) BotOrderDay(userID, from, to int64) (BotOrderDayStats, error) {
 	var st BotOrderDayStats
@@ -175,7 +209,7 @@ func (s *Service) CloseOpenBotOrders(reason string, endedAt int64) ([]BotOrderRo
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT o.id, o.user_id, o.arb_key, o.state, o.dry_run, o.code_id, COALESCE(c.name, '')
+	rows, err := tx.Query(`SELECT o.id, o.user_id, o.arb_key, o.state, o.dry_run, o.code_id, COALESCE(c.name, ''), o.source, o.event_id
 		FROM bot_orders o LEFT JOIN extension_codes c ON c.id = o.code_id
 		WHERE o.state IN ('waiting', 'running') ORDER BY o.state = 'waiting', o.id`)
 	if err != nil {
@@ -184,7 +218,7 @@ func (s *Service) CloseOpenBotOrders(reason string, endedAt int64) ([]BotOrderRo
 	var closed []BotOrderRow
 	for rows.Next() {
 		var r BotOrderRow
-		if err := rows.Scan(&r.ID, &r.UserID, &r.ArbKey, &r.State, &r.DryRun, &r.CodeID, &r.Agent); err != nil {
+		if err := rows.Scan(&r.ID, &r.UserID, &r.ArbKey, &r.State, &r.DryRun, &r.CodeID, &r.Agent, &r.Source, &r.EventID); err != nil {
 			rows.Close()
 			return nil, err
 		}

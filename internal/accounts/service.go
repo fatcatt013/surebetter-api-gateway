@@ -80,6 +80,7 @@ type Service struct {
 	emailLimit *limiter // failed logins per email
 	ipLimit    *limiter // failed logins, unknown invite and reset codes per client IP
 	tickets    *tickets
+	stateHook  func(userID int64, key string) // SetStateHook; nil = none
 }
 
 // NewService wraps an opened database (OpenDB). now may be nil (time.Now).

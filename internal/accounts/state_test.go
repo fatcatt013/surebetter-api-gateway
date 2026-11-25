@@ -65,3 +65,18 @@ func TestState_Onboarded(t *testing.T) {
 }
 
 func itoa(n int64) string { b, _ := json.Marshal(n); return string(b) }
+
+// The state hook hears each saved key (the bots' auto mode re-reads "hidden"), not a refused write.
+func TestState_Hook(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	var got []string
+	s.SetStateHook(func(userID int64, key string) { got = append(got, key) })
+	if err := s.PutState(user, "hidden", json.RawMessage(`[]`), ""); err != nil {
+		t.Fatal(err)
+	}
+	s.PutState(user, "hidden", json.RawMessage(`{broken`), "")
+	if len(got) != 1 || got[0] != "hidden" {
+		t.Fatalf("hook got %v", got)
+	}
+}

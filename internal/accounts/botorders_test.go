@@ -38,7 +38,7 @@ func TestBotOrders_Lifecycle(t *testing.T) {
 	}
 	want := BotOrderRow{ID: w.ID, UserID: user.UserID, ArbKey: "k1", CodeID: code.ID, Agent: "Home PC", State: "placed", DryRun: false, Stake: 202,
 		InfoJSON: `{"match":"A – B"}`, LegsJSON: `[{"bookmaker":"tipsport","windowId":"tipsport-2","step":"placeBet"}]`,
-		CreatedAt: 1000, SentAt: 1500, EndedAt: 9000, OddsDrop: "rearb", MinProfitPct: 4}
+		CreatedAt: 1000, SentAt: 1500, EndedAt: 9000, OddsDrop: "rearb", MinProfitPct: 4, Source: "app"}
 	if rows[0] != want {
 		t.Fatalf("row:\n got %+v\nwant %+v", rows[0], want)
 	}
@@ -323,5 +323,44 @@ func TestBotOrders_CloseOpenReportsDryRunAndAgent(t *testing.T) {
 	}
 	if r := by["w1"]; r.DryRun || r.CodeID != 0 || r.Agent != "" || r.State != "stopped" {
 		t.Fatalf("w1: %+v", r)
+	}
+}
+
+// Migration 13: an order keeps its source and match; the day's orders come back oldest first, any state.
+func TestBotOrders_SourceEventAndDay(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	other, _ := mustUser(t, s, "other@example.com", RoleUser)
+	for _, r := range []BotOrderRow{
+		{ID: "b", UserID: user.UserID, ArbKey: "tennis-live:h:T:2.5", State: "waiting", InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 2000, Source: "auto", EventID: "tennis-live:h"},
+		{ID: "a", UserID: user.UserID, ArbKey: "k", State: "waiting", InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 1000, Source: "bogus"},
+		{ID: "c", UserID: user.UserID, ArbKey: "k", State: "waiting", InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 5000},
+		{ID: "d", UserID: other.UserID, ArbKey: "k", State: "waiting", InfoJSON: "{}", LegsJSON: "[]", CreatedAt: 1500},
+	} {
+		if err := s.InsertBotOrder(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.EndBotOrder("b", "placed", "", "[]", 0, 3000); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.BotOrdersOfDay(user.UserID, 1000, 5000)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("day: %+v %v", rows, err)
+	}
+	if r := rows[0]; r.ID != "a" || r.Source != "app" || r.EventID != "" {
+		t.Fatalf("first: %+v", r)
+	}
+	if r := rows[1]; r.ID != "b" || r.Source != "auto" || r.EventID != "tennis-live:h" || r.State != "placed" {
+		t.Fatalf("second: %+v", r)
+	}
+	closed, err := s.CloseOpenBotOrders("Gateway restarted", 9000)
+	if err != nil || len(closed) != 3 {
+		t.Fatalf("closed: %+v %v", closed, err)
+	}
+	for _, r := range closed {
+		if r.Source != "app" {
+			t.Fatalf("closed row source: %+v", r)
+		}
 	}
 }

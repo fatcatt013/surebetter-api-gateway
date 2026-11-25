@@ -164,3 +164,20 @@ func TestBotAlertSettings_StoredJSON(t *testing.T) {
 		t.Fatalf("updated_at = %d (err %v)", updated, err)
 	}
 }
+
+func TestBotAlerts_ResolveTitled(t *testing.T) {
+	s, _, _ := newTestService(t)
+	user, _ := mustUser(t, s, "user@example.com", RoleUser)
+	other, _ := mustUser(t, s, "other@example.com", RoleUser)
+	a1 := alertRow("a1", user.UserID, "attention", "attention", 100)
+	a1.Title = "Auto paused"
+	a2 := alertRow("a2", user.UserID, "attention", "attention", 200)
+	a2.Title, a2.DismissedAt = "Auto paused", 250
+	a3 := alertRow("a3", other.UserID, "attention", "attention", 300)
+	a3.Title = "Auto paused"
+	insertAlerts(t, s, a1, a2, a3, alertRow("a4", user.UserID, "attention", "attention", 400))
+	got, err := s.ResolveBotAlertsTitled(user.UserID, "Auto paused", 700)
+	if err != nil || len(got) != 1 || got[0].ID != "a1" || got[0].ResolvedAt != 700 {
+		t.Fatalf("resolved: %+v %v", got, err)
+	}
+}
