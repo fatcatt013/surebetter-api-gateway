@@ -18,10 +18,10 @@ func TestBotLogins_SaveKeepsLastResultAndClearsFailing(t *testing.T) {
 	if err := s.SaveBotLogin(loginRow(p.UserID, code.ID, "tipsport-1", "tipsport", "t1")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.SetBotLoginResult(code.ID, "tipsport-1", "ok", 200); err != nil {
+	if _, _, err := s.SetBotLoginResult(code.ID, "tipsport-1", "ok", 200, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.SetBotLoginResult(code.ID, "tipsport-1", "wrong_password", 300); err != nil {
+	if _, _, err := s.SetBotLoginResult(code.ID, "tipsport-1", "wrong_password", 300, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RevealBotLogin(code.ID, "tipsport-1", "2026-11-25", func(BotLoginRow, int) error { return nil }); err != nil {
@@ -111,10 +111,10 @@ func TestBotLogins_ResultSpreadsFailingByTag(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, n, err := s.SetBotLoginResult(a.ID, "tipsport-1", "code", 5); err != nil || n != 0 {
+	if _, n, err := s.SetBotLoginResult(a.ID, "tipsport-1", "code", 5, nil); err != nil || n != 0 {
 		t.Fatalf("code: %d %v", n, err)
 	}
-	if _, n, err := s.SetBotLoginResult(a.ID, "tipsport-1", "blocked", 6); err != nil || n != 2 {
+	if _, n, err := s.SetBotLoginResult(a.ID, "tipsport-1", "blocked", 6, nil); err != nil || n != 2 {
 		t.Fatalf("blocked spread: %d %v", n, err)
 	}
 	want := map[string]string{"tipsport-1": "blocked", "tipsport-2": "blocked", "tipsport-3": "", "betano-1": ""}
@@ -130,7 +130,7 @@ func TestBotLogins_ResultSpreadsFailingByTag(t *testing.T) {
 	if r, _, _ := s.BotLogin(a.ID, "tipsport-2"); r.LastResult != "" || r.LastAt != 0 {
 		t.Fatalf("the other row's last result changed: %+v", r)
 	}
-	if _, _, err := s.SetBotLoginResult(a.ID, "fortuna-1", "ok", 7); !errors.Is(err, ErrNoLogin) {
+	if _, _, err := s.SetBotLoginResult(a.ID, "fortuna-1", "ok", 7, nil); !errors.Is(err, ErrNoLogin) {
 		t.Fatalf("no row: %v", err)
 	}
 }
@@ -214,5 +214,29 @@ func TestBotAlerts_OpenLoginAlerts(t *testing.T) {
 	rows, err := s.OpenBotLoginAlerts()
 	if err != nil || len(rows) != 1 || rows[0].ID != "login" {
 		t.Fatalf("open login alerts: %+v %v", rows, err)
+	}
+}
+
+func TestBotLogins_ResultOfAnOlderSave(t *testing.T) {
+	s, _, _ := newTestService(t)
+	p, _ := mustUser(t, s, "u@example.com", RoleUser)
+	a, _ := s.CreateCode(p.UserID, "A", KindBot)
+	s.SaveBotLogin(loginRow(p.UserID, a.ID, "tipsport-1", "tipsport", "t"))
+	s.SaveBotLogin(loginRow(p.UserID, a.ID, "tipsport-2", "tipsport", "t"))
+	stale, cur := int64(99), int64(100)
+	row, n, err := s.SetBotLoginResult(a.ID, "tipsport-1", "blocked", 5, &stale)
+	if !errors.Is(err, ErrStaleLogin) || n != 0 || row.UpdatedAt != 100 {
+		t.Fatalf("stale: %+v %d %v", row, n, err)
+	}
+	for _, w := range []string{"tipsport-1", "tipsport-2"} {
+		if r, _, _ := s.BotLogin(a.ID, w); r.Failing != "" || r.LastResult != "" || r.LastAt != 0 {
+			t.Fatalf("%s changed: %+v", w, r)
+		}
+	}
+	if _, n, err := s.SetBotLoginResult(a.ID, "tipsport-1", "blocked", 5, &cur); err != nil || n != 2 {
+		t.Fatalf("current: %d %v", n, err)
+	}
+	if _, _, err := s.SetBotLoginResult(a.ID, "fortuna-1", "ok", 5, &cur); !errors.Is(err, ErrNoLogin) {
+		t.Fatalf("no row first: %v", err)
 	}
 }

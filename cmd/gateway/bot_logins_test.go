@@ -389,7 +389,8 @@ func TestBotLogins_RevealSocketChecks(t *testing.T) {
 	expectBot(t, r.app, "on agent disconnect")
 	r.dialAgent(true, 5)
 	s, b, hdr := r.do("POST", "/api/me/bot/logins/tipsport-1/reveal", "", r.code, `{}`, httpsHeader)
-	if s != 200 || b != `{"password":"p1","username":"jan"}`+"\n" || hdr.Get("Cache-Control") != "no-store" {
+	want := `{"username":"jan","password":"p1","updatedAt":` + i64s(r.clk.now().UnixMilli()) + `}` + "\n"
+	if s != 200 || b != want || hdr.Get("Cache-Control") != "no-store" {
 		t.Fatalf("reveal: %d %s %v", s, b, hdr)
 	}
 }
@@ -418,7 +419,7 @@ func TestBotLogins_RevealOrderCapAndDay(t *testing.T) {
 		t.Fatalf("over the cap: %d %s", s, b)
 	}
 	// A failing login is refused before the cap is looked at.
-	r.svc.SetBotLoginResult(r.agent, "tipsport-1", "wrong_password", 1)
+	r.svc.SetBotLoginResult(r.agent, "tipsport-1", "wrong_password", 1, nil)
 	if s, b := reveal("tipsport-1"); s != 409 || !strings.Contains(b, `"login_failing"`) {
 		t.Fatalf("failing: %d %s", s, b)
 	}
@@ -544,5 +545,65 @@ func TestBotLogins_LoggingInWindowMakesTheOrderWait(t *testing.T) {
 	}
 	if o := readOrder(t, bot); o.OrderID != a.OrderID || o.Legs[1].WindowID != "betano-1" {
 		t.Fatalf("agent got %+v", o)
+	}
+}
+
+// A result echoes the updatedAt of the reveal it used; one for a login saved again since is ignored (contract §4.2).
+func TestBotLogins_ResultOfAnOlderSaveIsIgnored(t *testing.T) {
+	r := newLoginRig(t)
+	buf := captureLogs(t)
+	agent := r.dialAgent(true, 5)
+	r.put("tipsport-1", "jan", "old-pass")
+	readType(t, agent)
+	expectBot(t, r.app, "after PUT 1")
+	r.put("tipsport-2", "jan", "other")
+	readType(t, agent)
+	expectBot(t, r.app, "after PUT 2")
+	s, b := r.agentReq("POST", "/api/me/bot/logins/tipsport-1/reveal", `{}`)
+	var rev struct {
+		UpdatedAt *int64 `json:"updatedAt"`
+	}
+	if json.Unmarshal([]byte(b), &rev); s != 200 || rev.UpdatedAt == nil || *rev.UpdatedAt != r.list()[0].UpdatedAt {
+		t.Fatalf("reveal: %d %s", s, b)
+	}
+	old := *rev.UpdatedAt
+	// The user saves a corrected login while the agent's attempt with the old one runs.
+	r.clk.advance(time.Second)
+	r.put("tipsport-1", "jan", "new-pass")
+	readType(t, agent)
+	expectBot(t, r.app, "after the corrected PUT")
+	if s, b := r.agentReq("POST", "/api/me/bot/logins/tipsport-1/result", `{"result":"wrong_password","detail":"x","updatedAt":`+i64s(old)+`}`); s != 204 {
+		t.Fatalf("stale result: %d %s", s, b)
+	}
+	l := r.list()
+	if l[0].Failing != "" || l[0].LastResult != "" || l[0].LastAt != 0 || l[1].Failing != "" {
+		t.Fatalf("the stale result was applied: %+v", l)
+	}
+	if !strings.Contains(buf.String(), "bot login result ignored") || strings.Contains(buf.String(), "old-pass") || strings.Contains(buf.String(), `"jan"`) {
+		t.Fatalf("log:\n%s", buf)
+	}
+	// Not a number, or null treated as absent; a matching updatedAt and an absent one are applied.
+	if s, b := r.agentReq("POST", "/api/me/bot/logins/tipsport-1/result", `{"result":"ok","updatedAt":"`+i64s(old)+`"}`); s != 400 || !strings.Contains(b, `"bad_result"`) {
+		t.Fatalf("string updatedAt: %d %s", s, b)
+	}
+	cur := r.list()[0].UpdatedAt
+	if s, _ := r.agentReq("POST", "/api/me/bot/logins/tipsport-1/result", `{"result":"code","updatedAt":`+i64s(cur)+`}`); s != 204 {
+		t.Fatalf("current result: %d", s)
+	}
+	if l := r.list(); l[0].LastResult != "code" {
+		t.Fatalf("current result not applied: %+v", l[0])
+	}
+	// What the app got: nothing for the stale result (a {"type":"bot"} would come first), then the current one's alert.
+	if got := readType(t, r.app); got != "alert" {
+		t.Fatalf("app after the current result: %s", got)
+	}
+	if s, _ := r.agentReq("POST", "/api/me/bot/logins/tipsport-1/result", `{"result":"wrong_password"}`); s != 204 {
+		t.Fatalf("result without updatedAt: %d", s)
+	}
+	if l := r.list(); l[0].Failing != "wrong_password" {
+		t.Fatalf("result without updatedAt not applied: %+v", l[0])
+	}
+	if got := readType(t, agent); got != "logins" {
+		t.Fatalf("agent: %s", got)
 	}
 }

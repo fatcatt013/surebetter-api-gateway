@@ -313,6 +313,7 @@ func (b *botHub) handleReveal(w http.ResponseWriter, r *http.Request) {
 	}
 	day := b.now().In(prague).Format("2006-01-02")
 	var username, password string
+	var updatedAt int64
 	err := b.acc.RevealBotLogin(p.CodeID, windowID, day, func(row accounts.BotLoginRow, today int) error {
 		if row.UserID != p.UserID {
 			return accounts.ErrNoLogin
@@ -328,7 +329,7 @@ func (b *botHub) handleReveal(w http.ResponseWriter, r *http.Request) {
 			log.Error().Int64("user", p.UserID).Int64("code", p.CodeID).Str("window", windowID).Msg("bot login could not be decrypted")
 			return errLoginFailing
 		}
-		username, password = u, pw
+		username, password, updatedAt = u, pw, row.UpdatedAt
 		return nil
 	})
 	switch {
@@ -343,18 +344,28 @@ func (b *botHub) handleReveal(w http.ResponseWriter, r *http.Request) {
 		accounts.WriteError(w, http.StatusInternalServerError, "internal")
 	default:
 		log.Info().Int64("user", p.UserID).Int64("code", p.CodeID).Str("window", windowID).Msg("bot login revealed")
-		accounts.WriteJSON(w, http.StatusOK, map[string]string{"username": username, "password": password})
+		accounts.WriteJSON(w, http.StatusOK, revealAnswer{Username: username, Password: password, UpdatedAt: updatedAt})
 	}
 }
 
-// loginResultIn is the POST …/result body.
-type loginResultIn struct {
-	Result string `json:"result"`
-	Detail string `json:"detail"`
+// revealAnswer is the reveal's 200 body: the login and the row's updatedAt, which the agent echoes in its result.
+type revealAnswer struct {
+	Username  string `json:"username"`
+	Password  string `json:"password"`
+	UpdatedAt int64  `json:"updatedAt"`
 }
 
-// handleLoginResult is POST /api/me/bot/logins/{windowId}/result {"result","detail"?}: the window's last result is
-// stored; wrong_password and blocked make it (and its same-user-name siblings) failing and tell the agent; a result
+// loginResultIn is the POST …/result body. UpdatedAt: the reveal's updatedAt for this attempt (absent = no reveal,
+// accepted as it is).
+type loginResultIn struct {
+	Result    string `json:"result"`
+	Detail    string `json:"detail"`
+	UpdatedAt *int64 `json:"updatedAt"`
+}
+
+// handleLoginResult is POST /api/me/bot/logins/{windowId}/result {"result","detail"?,"updatedAt"?}: a result whose
+// updatedAt is not the row's (the login was saved again since that reveal) is ignored (204, one log line); else the
+// window's last result is stored; wrong_password and blocked make it (and its same-user-name siblings) failing and tell the agent; a result
 // that needs the user raises the window's login alert (one open per window). The app is told ({"type":"bot"}).
 func (b *botHub) handleLoginResult(w http.ResponseWriter, r *http.Request) {
 	var in loginResultIn
@@ -365,9 +376,15 @@ func (b *botHub) handleLoginResult(w http.ResponseWriter, r *http.Request) {
 	}
 	p := principalOf(r)
 	windowID := r.PathValue("windowId")
-	row, spread, err := b.acc.SetBotLoginResult(p.CodeID, windowID, in.Result, b.now().UnixMilli())
-	if errors.Is(err, accounts.ErrNoLogin) || (err == nil && row.UserID != p.UserID) {
+	row, spread, err := b.acc.SetBotLoginResult(p.CodeID, windowID, in.Result, b.now().UnixMilli(), in.UpdatedAt)
+	if errors.Is(err, accounts.ErrNoLogin) || (row.UserID != 0 && row.UserID != p.UserID) {
 		accounts.WriteError(w, http.StatusNotFound, "no_login")
+		return
+	}
+	if errors.Is(err, accounts.ErrStaleLogin) {
+		log.Info().Int64("user", p.UserID).Int64("code", p.CodeID).Str("window", windowID).Str("result", in.Result).
+			Int64("updated_at", *in.UpdatedAt).Int64("row_updated_at", row.UpdatedAt).Msg("bot login result ignored: the login was saved again since")
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if err != nil {

@@ -29,6 +29,9 @@ type BotLoginRow struct {
 // ErrNoLogin: no login is stored for that code and window.
 var ErrNoLogin = errors.New("no_login")
 
+// ErrStaleLogin: a result was for a login that has been saved again since (its updated_at differs).
+var ErrStaleLogin = errors.New("stale_login")
+
 const botLoginCols = `user_id, code_id, window_id, bookmaker, secret, key_id, user_tag, updated_at, last_ok_at, last_result, last_at,
 	failing, reveals_day, reveals`
 
@@ -106,8 +109,9 @@ func (s *Service) DeleteBotLogin(codeID int64, windowID string) (bool, error) {
 // SetBotLoginResult stores a login attempt's result on codeID's window at at: last_result and last_at, and last_ok_at
 // for ok. wrong_password and blocked also set failing on that row and on every row with the same user, code,
 // bookmaker and user tag (they would fail the same way); spread is how many rows that set. One transaction. The
-// returned row is the one before the change. ErrNoLogin without a row.
-func (s *Service) SetBotLoginResult(codeID int64, windowID, result string, at int64) (row BotLoginRow, spread int64, err error) {
+// returned row is the one before the change. ErrNoLogin without a row. With updatedAt set (the row's updated_at the
+// agent's reveal gave it) and the row's no longer equal, nothing changes and ErrStaleLogin is returned with the row.
+func (s *Service) SetBotLoginResult(codeID int64, windowID, result string, at int64, updatedAt *int64) (row BotLoginRow, spread int64, err error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return BotLoginRow{}, 0, err
@@ -119,6 +123,9 @@ func (s *Service) SetBotLoginResult(codeID int64, windowID, result string, at in
 	}
 	if err != nil {
 		return BotLoginRow{}, 0, err
+	}
+	if updatedAt != nil && *updatedAt != row.UpdatedAt {
+		return row, 0, ErrStaleLogin
 	}
 	if _, err := tx.Exec(`UPDATE bot_logins SET last_result = ?, last_at = ?, last_ok_at = CASE WHEN ? = 'ok' THEN ? ELSE last_ok_at END
 		WHERE code_id = ? AND window_id = ?`, result, at, result, at, codeID, windowID); err != nil {
