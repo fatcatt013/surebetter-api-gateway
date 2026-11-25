@@ -12,6 +12,10 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+
+	"github.com/rs/zerolog/log"
+
+	"github.com/surebetter/api-gateway/internal/accounts"
 )
 
 // loginKeyLen is the size of BOT_LOGINS_KEY after base64 decoding (AES-256).
@@ -21,9 +25,9 @@ const loginKeyLen = 32
 const loginNonceLen = 12
 
 var (
-	errBadLoginKey    = errors.New("not 32 bytes of standard base64")
+	errBadLoginKey     = errors.New("not 32 bytes of standard base64")
 	errUnknownLoginKey = errors.New("sealed with an unknown key")
-	errLoginOpen      = errors.New("cannot decrypt")
+	errLoginOpen       = errors.New("cannot decrypt")
 )
 
 // loginKey is one BOT_LOGINS_KEY: its AEAD, its id (lowercase hex of the first 8 bytes of SHA-256 of the key) and the
@@ -129,4 +133,47 @@ func (c *loginCipher) tag(username string) string {
 	m := hmac.New(sha256.New, c.cur.tagKey)
 	m.Write([]byte(strings.ToLower(username)))
 	return hex.EncodeToString(m.Sum(nil))
+}
+
+// setupBotLogins builds the cipher from cfg at start (nil = the feature is off, one error line) and, with a valid
+// previous key, seals every row of that key again with the current one (one transaction; the count is logged).
+// Neither key nor any login is ever logged.
+func setupBotLogins(cfg Config, acc *accounts.Service) *loginCipher {
+	if cfg.BotLoginsAllowHTTP {
+		log.Warn().Msg("BOT_LOGINS_ALLOW_HTTP=1: bot logins are served over plain HTTP (development only)")
+	}
+	cur, err := parseLoginKey(cfg.BotLoginsKey)
+	if err != nil {
+		log.Error().Msg("bot logins off: BOT_LOGINS_KEY missing or not 32 bytes")
+		return nil
+	}
+	c := &loginCipher{cur: cur}
+	if strings.TrimSpace(cfg.BotLoginsKeyPrevious) != "" {
+		prev, err := parseLoginKey(cfg.BotLoginsKeyPrevious)
+		switch {
+		case err != nil:
+			log.Warn().Msg("BOT_LOGINS_KEY_PREVIOUS ignored: not 32 bytes of standard base64")
+		case prev.id != cur.id:
+			c.prev = prev
+		}
+	}
+	if c.prev == nil || acc == nil {
+		return c
+	}
+	done, skipped, err := acc.RekeyBotLogins(c.prev.id, func(r accounts.BotLoginRow) ([]byte, string, string, error) {
+		u, p, err := c.open(r.Secret, r.KeyID, r.UserID, r.CodeID, r.WindowID)
+		if err != nil {
+			return nil, "", "", err
+		}
+		return c.seal(r.UserID, r.CodeID, r.WindowID, u, p)
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("bot logins re-encryption failed; the previous key's rows stay as they are")
+		return c
+	}
+	log.Info().Int("count", done).Msg("bot logins re-encrypted")
+	if skipped > 0 {
+		log.Warn().Int("count", skipped).Msg("bot logins not re-encrypted: they do not decrypt with BOT_LOGINS_KEY_PREVIOUS")
+	}
+	return c
 }

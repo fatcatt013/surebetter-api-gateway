@@ -511,10 +511,10 @@ func mustJSON(v any) string {
 	return string(js)
 }
 
-// hasWindow reports whether the agent has a window of book that is idle or busy (one that can become free).
+// hasWindow reports whether the agent has a window of book that is idle, busy or logging_in (one that can become free).
 func (p *botPresence) hasWindow(book string) bool {
 	for _, w := range p.windows {
-		if w.Bookmaker == book && (w.State == "idle" || w.State == "busy") {
+		if w.Bookmaker == book && (w.State == "idle" || w.State == "busy" || w.State == "logging_in") {
 			return true
 		}
 	}

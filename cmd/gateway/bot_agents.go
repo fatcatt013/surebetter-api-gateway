@@ -69,8 +69,10 @@ var (
 	windowIDPattern = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
 	windowDevices   = map[string]bool{"desktop": true, "phone": true}
 	// logged_out and blocked are reserved for later agent versions, accepted and shown already. off:
-	// inactive by the routine (reason sleep or inactive), neither ready nor usable.
-	windowStates = map[string]bool{"idle": true, "busy": true, "down": true, "logged_out": true, "blocked": true, "off": true}
+	// inactive by the routine (reason sleep or inactive), neither ready nor usable. logging_in (protocol 5): a
+	// login is queued or running; the window is held like busy (an order waits for it), never a window problem.
+	windowStates = map[string]bool{"idle": true, "busy": true, "down": true, "logged_out": true, "blocked": true, "off": true,
+		"logging_in": true}
 	// "" = an older agent that does not report modes.
 	windowModes = map[string]bool{"": true, "bot": true, "login": true, "stopped": true}
 )
@@ -201,6 +203,7 @@ func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 	p.books, p.dryRun, p.version, p.hostName, p.windowsJSON = st.books, st.dryRun, st.version, st.hostName, st.windowsJSON
 	p.windows, p.proto, p.cpu, p.mem, p.boot = st.windows, st.proto, st.cpu, st.mem, st.boot
 	p.windowsKey, p.humanActs, p.humanJSON = st.windowsKey, st.humanActs, st.humanJSON
+	b.alertLoginsLocked(userID, codeID, p, fx)
 	b.alertWindowsLocked(userID, codeID, p, fx)
 	if st.boot != "" {
 		for _, o := range b.ordersLocked(userID, orderRunning) {

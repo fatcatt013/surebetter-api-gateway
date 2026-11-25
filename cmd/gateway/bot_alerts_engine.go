@@ -245,20 +245,31 @@ func (b *botHub) resolveLocked(scope alertScope, fx *effects) {
 
 // alertsDismissed copies the dismissal of rows (just dismissed in the database) onto the engine's open window and
 // agent alerts, so their later resolution does not bring them back to the app. They stay open in the engine (one per
-// scope, and the re-alert pause after it resolves). Call it without b.mu, before telling the app.
+// scope, and the re-alert pause after it resolves). A dismissed login alert resolves (its row only): the window's next
+// result may alert again. Call it without b.mu, before telling the app.
 func (b *botHub) alertsDismissed(userID int64, rows []accounts.BotAlertRow) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.alerts == nil {
+		b.mu.Unlock()
 		return
 	}
+	fx := &effects{}
 	at := map[string]int64{}
 	for _, r := range rows {
 		at[r.ID] = r.DismissedAt
 	}
+	var logins []alertScope
 	for sc, oa := range b.alerts.open {
 		if t, ok := at[oa.alert.ID]; ok && sc.userID == userID && oa.alert.DismissedAt == 0 {
 			oa.alert.DismissedAt = t
+			if sc.kind == alertLogin {
+				logins = append(logins, sc)
+			}
 		}
 	}
+	slices.SortFunc(logins, compareScopes)
+	for _, sc := range logins {
+		b.resolveLocked(sc, fx)
+	}
+	b.release(fx)
 }

@@ -103,6 +103,10 @@ type botHub struct {
 	alerts *alertEngine
 	// tg sends alerts to the users' linked Telegram chats; nil = no TELEGRAM_TOKEN.
 	tg *telegramAlerts
+	// logins seals and opens the bookmaker logins (bot_logins.go); nil = BOT_LOGINS_KEY missing or bad: every login
+	// route answers 503. loginsAllowHTTP (BOT_LOGINS_ALLOW_HTTP=1, development) counts every request as secure.
+	logins          *loginCipher
+	loginsAllowHTTP bool
 }
 
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
@@ -133,7 +137,7 @@ func (b *botHub) view(userID int64) botView {
 
 // viewLocked aggregates userID's online agents and orders. No agents is the offline answer. A
 // bookmaker (from any online agent's books or windows) is ready when a protocol-2 agent has an idle
-// window of it that no order has reserved, usable when one has an idle or busy window of it; busy:
+// window of it that no order has reserved, usable when one has an idle, busy or logging_in window of it; busy:
 // online and no ready window at all; update: online and no protocol-2 agent. dryRun is the setting.
 // b.mu must be held.
 func (b *botHub) viewLocked(userID int64) botView {
@@ -175,7 +179,7 @@ func (b *botHub) viewLocked(userID int64) botView {
 			}
 			ok := w.State == "idle" && reserved[codeID][w.ID] == ""
 			bv.Ready = bv.Ready || ok
-			bv.Usable = bv.Usable || w.State == "idle" || w.State == "busy"
+			bv.Usable = bv.Usable || w.State == "idle" || w.State == "busy" || w.State == "logging_in"
 			free = free || ok
 		}
 	}
@@ -297,6 +301,13 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("POST /api/me/bot/alerts/{id}/dismiss", acc.RequireSession(http.HandlerFunc(b.handleDismissAlert)))
 	mux.Handle("GET /api/me/bot/alert-settings", acc.RequireSession(http.HandlerFunc(b.handleGetAlertSettings)))
 	mux.Handle("PUT /api/me/bot/alert-settings", acc.RequireSession(http.HandlerFunc(b.handlePutAlertSettings)))
+	// Bot logins: the feature switch and the HTTPS rule come before the auth (loginGate).
+	mux.Handle("GET /api/me/bot/logins", b.loginGate(acc.RequireSession(http.HandlerFunc(b.handleGetLogins))))
+	mux.Handle("PUT /api/me/bot/agents/{agentId}/windows/{windowId}/login", b.loginGate(acc.RequireSession(http.HandlerFunc(b.handlePutLogin))))
+	mux.Handle("DELETE /api/me/bot/agents/{agentId}/windows/{windowId}/login", b.loginGate(acc.RequireSession(http.HandlerFunc(b.handleDeleteLogin))))
+	mux.Handle("GET /api/me/bot/logins/mine", b.loginGate(acc.RequireBotCode(http.HandlerFunc(b.handleOwnLogins))))
+	mux.Handle("POST /api/me/bot/logins/{windowId}/reveal", b.loginGate(acc.RequireBotCode(http.HandlerFunc(b.handleReveal))))
+	mux.Handle("POST /api/me/bot/logins/{windowId}/result", b.loginGate(acc.RequireBotCode(http.HandlerFunc(b.handleLoginResult))))
 	return accounts.CSRF(mux)
 }
 

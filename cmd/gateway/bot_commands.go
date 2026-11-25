@@ -39,6 +39,7 @@ type commandResult struct {
 type pendingCommand struct {
 	userID, codeID int64
 	windowID       string             // "" for add and try; the scheduler does not pick this window meanwhile
+	action         string             // the command's action (an ok to remove deletes the window's login)
 	try            bool               // a Try: its ok answer must carry a result
 	done           chan commandResult // buffered (1): the answer never blocks
 }
@@ -145,7 +146,8 @@ func (b *botHub) runCommand(w http.ResponseWriter, r *http.Request, codeID int64
 		Type    string     `json:"type"`
 		Command botCommand `json:"command"`
 	}{"command", cmd})
-	pc := &pendingCommand{userID: userID, codeID: codeID, windowID: cmd.WindowID, try: cmd.Action == "try", done: make(chan commandResult, 1)}
+	pc := &pendingCommand{userID: userID, codeID: codeID, windowID: cmd.WindowID, action: cmd.Action, try: cmd.Action == "try",
+		done: make(chan commandResult, 1)}
 	b.mu.Lock()
 	p := b.presenceLocked(userID, codeID)
 	switch {
@@ -256,5 +258,8 @@ func (b *botHub) handleCommandAck(w http.ResponseWriter, r *http.Request) {
 	delete(b.commands, in.ID)
 	pc.done <- commandResult{ok: *in.OK, windowID: in.WindowID, err: in.Error, message: in.Message, result: result}
 	b.mu.Unlock()
+	if pc.action == "remove" && *in.OK && pc.windowID != "" {
+		b.loginRemoved(pc.userID, pc.codeID, pc.windowID) // the window is gone: so is its login
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

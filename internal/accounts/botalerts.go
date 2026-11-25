@@ -185,7 +185,7 @@ func (s *Service) SaveBotAlertSettings(userID int64, js string) error {
 // OpenBotLoginAlerts returns every user's open login alerts (kind attention about a window and no order, neither
 // resolved nor dismissed), oldest first: the gateway reads them back at start so they keep their scope.
 func (s *Service) OpenBotLoginAlerts() ([]BotAlertRow, error) {
-	rows, err := s.db.Query(`SELECT `+botAlertCols+` FROM bot_alerts WHERE kind = 'attention' AND window_id <> '' AND order_id = ''
+	rows, err := s.db.Query(`SELECT ` + botAlertCols + ` FROM bot_alerts WHERE kind = 'attention' AND window_id <> '' AND order_id = ''
 		AND resolved_at = 0 AND dismissed_at = 0 ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err

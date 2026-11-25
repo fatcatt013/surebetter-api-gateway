@@ -9,10 +9,10 @@ import (
 // windowProblemTitles: the window states that alert, and their titles.
 var windowProblemTitles = map[string]string{"logged_out": "Logged out", "blocked": "Blocked", "down": "Window down"}
 
-// windowProblem is the state a window alert is about, or "": not a problem (idle, busy, off), or a window the user
-// stopped or put in Login mode.
-func windowProblem(w botWindow) string {
-	if w.Mode == "stopped" || w.Mode == "login" {
+// windowProblem is the state a window alert is about, or "": not a problem (idle, busy, off, logging_in), a window the
+// user stopped or put in Login mode, or logged_out while the window has an open login alert (loginAlert).
+func windowProblem(w botWindow, loginAlert bool) string {
+	if w.Mode == "stopped" || w.Mode == "login" || (w.State == "logged_out" && loginAlert) {
 		return ""
 	}
 	if _, ok := windowProblemTitles[w.State]; ok {
@@ -39,7 +39,7 @@ func (b *botHub) alertWindowsLocked(userID, codeID int64, p *botPresence, fx *ef
 	for _, w := range p.windows {
 		seen[w.ID] = true
 		sc := alertScope{kind: alertWindow, userID: userID, codeID: codeID, windowID: w.ID}
-		if st := windowProblem(w); st != "" {
+		if st := windowProblem(w, b.hasLoginAlertLocked(userID, codeID, w.ID)); st != "" {
 			if pa := b.alerts.pending[sc]; pa != nil {
 				pa.state, pa.reason, pa.label = st, w.Reason, windowText(w)
 				continue
@@ -117,6 +117,9 @@ func (b *botHub) fireAlertsLocked(fx *effects) {
 				Detail: b.agentNameLocked(sc.codeID)}, &sc, fx)
 		case alertWindow:
 			delete(b.alerts.pending, sc)
+			if pa.state == "logged_out" && b.hasLoginAlertLocked(sc.userID, sc.codeID, sc.windowID) {
+				continue // the window's login alert covers it
+			}
 			b.raiseLocked(sc.userID, botAlert{Kind: alertWindow, Severity: severityProblem, AgentID: sc.codeID, WindowID: sc.windowID,
 				Title: windowProblemTitles[pa.state], Detail: joinDetail(pa.label+" ("+b.agentNameLocked(sc.codeID)+")", pa.reason)}, &sc, fx)
 		}

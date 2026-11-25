@@ -55,6 +55,13 @@ type Config struct {
 	TelegramTZ            string
 	TelegramPoll          bool   // TELEGRAM_POLL=1: Telegram bot alerts on (the getUpdates linker and the sends); one reader per token
 	AppPublicURL          string // APP_PUBLIC_URL: the app's address (https://host, no trailing slash) for links in alerts; "" = none
+
+	// Bot logins (bot_logins.go). BOT_LOGINS_KEY: 32 bytes in standard base64; missing or bad → the feature is off.
+	// BOT_LOGINS_KEY_PREVIOUS: the key before a rotation (re-encrypted at start). BOT_LOGINS_ALLOW_HTTP=1: every
+	// request and bot socket counts as secure (development only; never in docker-compose.yml).
+	BotLoginsKey         string
+	BotLoginsKeyPrevious string
+	BotLoginsAllowHTTP   bool
 }
 
 // authRequired fails closed: only the exact value "false" disables authentication.
@@ -88,6 +95,10 @@ func configFromEnv() Config {
 		TelegramTZ:            getenv("TELEGRAM_TZ", "Europe/Prague"),
 		TelegramPoll:          strings.TrimSpace(getenv("TELEGRAM_POLL", "")) == "1",
 		AppPublicURL:          strings.TrimRight(strings.TrimSpace(getenv("APP_PUBLIC_URL", "")), "/"),
+
+		BotLoginsKey:         getenv("BOT_LOGINS_KEY", ""),
+		BotLoginsKeyPrevious: getenv("BOT_LOGINS_KEY_PREVIOUS", ""),
+		BotLoginsAllowHTTP:   strings.TrimSpace(getenv("BOT_LOGINS_ALLOW_HTTP", "")) == "1",
 	}
 }
 
@@ -477,6 +488,7 @@ type Client struct {
 	cid       string             // client id from ?cid=; a state write skips the socket that made it
 	notify    bool               // receives {"type":"state"} messages (the /ws feed only)
 	bot       bool               // the user's bot socket (/ws?bot=1): gets orders, never bot/botEvent messages
+	secure    bool               // the upgrade request was secure (secureRequest): a bot socket that is not gets no login
 }
 
 func (c *Client) writePump(ctx context.Context) {
@@ -657,7 +669,8 @@ func wsHandler[T any](hub *StateHub[T], gate *wsGate, notify bool) http.HandlerF
 		ctx := conn.CloseRead(r.Context())
 
 		client := &Client{conn: conn, send: make(chan []byte, 64), principal: principal, notify: notify,
-			cid: accounts.ValidClientID(q.Get("cid")), bot: botSocket}
+			cid: accounts.ValidClientID(q.Get("cid")), bot: botSocket,
+			secure: secureRequest(r, gate != nil && gate.bots != nil && gate.bots.loginsAllowHTTP)}
 		if !feedOff {
 			hub.Register(client)
 			defer hub.Unregister(client)
@@ -800,6 +813,8 @@ func main() {
 	bots.shotsDir = filepath.Join(filepath.Dir(cfg.AccountsDB), "bot-screenshots") // same volume as the DB
 	bots.alerts = newAlertEngine(bots.now())
 	bots.tg = tgAlerts
+	bots.logins = setupBotLogins(cfg, acc)
+	bots.loginsAllowHTTP = cfg.BotLoginsAllowHTTP
 	reg.codeRevoked = bots.alertsCodeRevoked // a revoked agent is forgotten by the alerts
 	reg.userClosed = bots.alertsUserClosed   // and a disabled user's agents
 	// The window and agent alerts the previous process left open can no longer be resolved by it.
@@ -808,6 +823,8 @@ func main() {
 	} else if n > 0 {
 		log.Info().Int64("resolved", n).Msg("bot alerts left open by the previous process resolved")
 	}
+	// The open login alerts stay open: the agents do not post their results again.
+	bots.loadLoginAlerts()
 	// Orders the previous process left waiting or running end now (it lost them from memory).
 	bots.recoverOrders()
 	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired, bots: bots}
