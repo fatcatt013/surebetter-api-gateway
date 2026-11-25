@@ -115,8 +115,8 @@ func (s *Service) ListUsers() ([]UserInfo, error) {
 	return out, rows.Err()
 }
 
-// SetDisabled disables or re-enables a user. Disabling ends their sessions and closes their
-// sockets; their extension codes stop authenticating while disabled. Admins cannot disable themselves.
+// SetDisabled disables or re-enables a user. Disabling ends their sessions, deletes their bots' bookmaker logins and
+// closes their sockets; their extension codes stop authenticating while disabled. Admins cannot disable themselves.
 func (s *Service) SetDisabled(adminID, userID int64, disabled bool) error {
 	if adminID == userID {
 		return ErrSelf
@@ -137,6 +137,9 @@ func (s *Service) SetDisabled(adminID, userID int64, disabled bool) error {
 	}
 	if disabled {
 		if _, err := tx.Exec(`DELETE FROM sessions WHERE user_id = ?`, userID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM bot_logins WHERE user_id = ?`, userID); err != nil {
 			return err
 		}
 	}

@@ -441,8 +441,8 @@ func TestMigrate_BotAlerts(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 11 || version != len(migrations) {
-		t.Fatalf("user_version = %d (err %v), want 11", version, err)
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want %d", version, err, len(migrations))
 	}
 	for _, q := range []string{
 		`INSERT INTO bot_alert_settings (user_id, json, updated_at) VALUES (1, '{}', 5)`,
@@ -469,5 +469,60 @@ func TestMigrate_BotAlerts(t *testing.T) {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'bot_alerts_user_created'`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("index bot_alerts_user_created: %d (err %v)", n, err)
+	}
+}
+
+func TestMigrate_BotLogins(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The schema as shipped with bot alerts (version 11), one user and one open alert.
+	steps := append(append([]string{}, migrations[:11]...), `PRAGMA user_version = 11`,
+		`INSERT INTO users (id, email, password_hash, role, created_at) VALUES (1, 'u@example.com', 'x', 'user', 0)`,
+		`INSERT INTO bot_alerts (id, user_id, kind, severity, title, created_at) VALUES ('a', 1, 'window', 'problem', 'Logged out', 5)`)
+	for _, q := range steps {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%.60s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 12 || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want 12", version, err)
+	}
+	var alerts int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM bot_alerts`).Scan(&alerts); err != nil || alerts != 1 {
+		t.Fatalf("alerts kept: %d (err %v)", alerts, err)
+	}
+	if _, err := db.Exec(`INSERT INTO bot_logins (user_id, code_id, window_id, bookmaker, secret, key_id, user_tag, updated_at)
+		VALUES (1, 3, 'tipsport-1', 'tipsport', x'00', 'k', 't', 5)`); err != nil {
+		t.Fatal(err)
+	}
+	var defaults string
+	if err := db.QueryRow(`SELECT last_ok_at || '/' || last_result || '/' || last_at || '/' || failing || '/' || reveals_day || '/' || reveals
+		FROM bot_logins`).Scan(&defaults); err != nil || defaults != "0//0///0" {
+		t.Fatalf("defaults: %q (err %v)", defaults, err)
+	}
+	for _, q := range []string{
+		`INSERT INTO bot_logins (user_id, code_id, window_id, bookmaker, secret, key_id, user_tag, updated_at) VALUES (1, 3, 'tipsport-1', 'tipsport', x'00', 'k', 't', 5)`,
+		`INSERT INTO bot_logins (user_id, code_id, window_id, bookmaker, secret, key_id, user_tag, updated_at) VALUES (9, 3, 'tipsport-2', 'tipsport', x'00', 'k', 't', 5)`,
+		`UPDATE bot_logins SET last_result = 'maybe'`,
+		`UPDATE bot_logins SET failing = 'code'`,
+	} {
+		if _, err := db.Exec(q); err == nil {
+			t.Fatalf("accepted: %s", q)
+		}
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'bot_logins_user'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("index bot_logins_user: %d (err %v)", n, err)
 	}
 }

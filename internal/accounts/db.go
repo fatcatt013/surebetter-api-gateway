@@ -252,6 +252,26 @@ var migrations = []string{
 		chat_id   INTEGER NOT NULL,
 		linked_at INTEGER NOT NULL
 	);`,
+	// 12: bot auto-login: each window's bookmaker login (user name + password encrypted with
+	// BOT_LOGINS_KEY, AES-256-GCM), its last result and whether it is failing. Times are Unix ms.
+	`CREATE TABLE bot_logins (
+		user_id     INTEGER NOT NULL REFERENCES users (id),
+		code_id     INTEGER NOT NULL,
+		window_id   TEXT    NOT NULL,
+		bookmaker   TEXT    NOT NULL,
+		secret      BLOB    NOT NULL,
+		key_id      TEXT    NOT NULL,
+		user_tag    TEXT    NOT NULL,
+		updated_at  INTEGER NOT NULL,
+		last_ok_at  INTEGER NOT NULL DEFAULT 0,
+		last_result TEXT    NOT NULL DEFAULT '' CHECK (last_result IN ('', 'ok', 'code', 'captcha', 'unexpected', 'restricted', 'wrong_password', 'blocked', 'limit')),
+		last_at     INTEGER NOT NULL DEFAULT 0,
+		failing     TEXT    NOT NULL DEFAULT '' CHECK (failing IN ('', 'wrong_password', 'blocked')),
+		reveals_day TEXT    NOT NULL DEFAULT '',
+		reveals     INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (code_id, window_id)
+	);
+	CREATE INDEX bot_logins_user ON bot_logins (user_id);`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

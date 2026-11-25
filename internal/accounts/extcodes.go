@@ -100,15 +100,27 @@ func (s *Service) ListExtensionCodes(userID int64) ([]ExtCodeInfo, error) {
 	return out, rows.Err()
 }
 
-// RevokeExtensionCode revokes one of userID's own codes and closes its sockets.
+// RevokeExtensionCode revokes one of userID's own codes, deletes its agent's bookmaker logins (one transaction) and
+// closes its sockets.
 func (s *Service) RevokeExtensionCode(userID, id int64) error {
-	res, err := s.db.Exec(`UPDATE extension_codes SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL`,
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE extension_codes SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL`,
 		s.nowMs(), id, userID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
+	}
+	if _, err := tx.Exec(`DELETE FROM bot_logins WHERE code_id = ?`, id); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	s.conns.CloseCode(id)
 	return nil
