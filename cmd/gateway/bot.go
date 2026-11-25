@@ -108,6 +108,8 @@ type botHub struct {
 	// route answers 503. loginsAllowHTTP (BOT_LOGINS_ALLOW_HTTP=1, development) counts every request as secure.
 	logins          *loginCipher
 	loginsAllowHTTP bool
+	// codes are the open SMS code prompts (bot_login_codes.go), memory only. Guarded by mu.
+	codes map[codeKey]*codePrompt
 	// auto is the automatic mode's picker and memory (bot_auto*.go); autoPhase the deployment's phase (BOT_AUTO_PHASE:
 	// "A", "B" or "C"), which decides the modes it accepts.
 	auto      *autoPicker
@@ -117,8 +119,8 @@ type botHub struct {
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
 	return &botHub{reg: reg, acc: acc, now: time.Now, agents: map[int64]map[int64]*botPresence{}, orders: map[string]*botOrder{},
 		settings: map[int64]accounts.BotSettings{}, memPause: map[int64]string{}, commands: map[string]*pendingCommand{},
-		limits: map[int64][]limitEntry{},
-		logs:   &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}, auto: newAutoPicker(), autoPhase: "A"}
+		limits: map[int64][]limitEntry{}, codes: map[codeKey]*codePrompt{},
+		logs: &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}, auto: newAutoPicker(), autoPhase: "A"}
 }
 
 // view is userID's GET /api/me/bot body.
@@ -320,6 +322,12 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	login("GET /api/me/bot/logins/mine", acc.RequireBotCode(http.HandlerFunc(b.handleOwnLogins)))
 	login("POST /api/me/bot/logins/{windowId}/reveal", acc.RequireBotCode(http.HandlerFunc(b.handleReveal)))
 	login("POST /api/me/bot/logins/{windowId}/result", acc.RequireBotCode(http.HandlerFunc(b.handleLoginResult)))
+	// SMS codes from the app (bot_login_codes.go): the same gate.
+	login("POST /api/me/bot/logins/{windowId}/code-prompt", acc.RequireBotCode(http.HandlerFunc(b.handleOpenCodePrompt)))
+	login("POST /api/me/bot/logins/{windowId}/code-prompt/wrong", acc.RequireBotCode(http.HandlerFunc(b.handleWrongCode)))
+	login("POST /api/me/bot/logins/{windowId}/code", acc.RequireBotCode(http.HandlerFunc(b.handleFetchCode)))
+	login("GET /api/me/bot/login-codes", acc.RequireSession(http.HandlerFunc(b.handleGetLoginCodes)))
+	login("POST /api/me/bot/agents/{agentId}/windows/{windowId}/login-code", acc.RequireSession(http.HandlerFunc(b.handleSubmitCode)))
 	outer.Handle("/", accounts.CSRF(mux))
 	return outer
 }

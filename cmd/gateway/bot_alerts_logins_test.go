@@ -92,7 +92,7 @@ func TestBotLoginAlerts_Resolution(t *testing.T) {
 	r.status(loggedIn(alertWin("tipsport", 1, "idle", "bot", ""), true), t2, t3)
 	resolved("loggedIn true", "tipsport-1")
 	// Saved again (PUT) or deleted: loginChanged.
-	r.b.loginChanged(r.uid, r.code.ID, "tipsport-2")
+	r.b.loginChanged(r.uid, r.code.ID, "tipsport-2", false)
 	resolved("login saved", "tipsport-2")
 	// The window gone from the status.
 	r.status(loggedIn(alertWin("tipsport", 1, "idle", "bot", ""), true), t2)

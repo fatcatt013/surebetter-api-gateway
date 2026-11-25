@@ -201,11 +201,14 @@ func (b *botHub) loginTarget(w http.ResponseWriter, r *http.Request) (codeID int
 	return codeID, windowID, true
 }
 
-// loginChanged follows a PUT or DELETE of codeID's window login: its open login alert resolves, the agent gets
-// {"type":"logins"} (protocol 5) and the user's app sockets {"type":"bot"}.
-func (b *botHub) loginChanged(userID, codeID int64, windowID string) {
+// loginChanged follows a PUT or DELETE (deleted) of codeID's window login: a DELETE ends the window's code prompt, its
+// open login alert resolves, the agent gets {"type":"logins"} (protocol 5) and the user's app sockets {"type":"bot"}.
+func (b *botHub) loginChanged(userID, codeID int64, windowID string, deleted bool) {
 	b.mu.Lock()
 	fx := &effects{}
+	if deleted {
+		b.endPromptLocked(codeKey{codeID, windowID}, fx)
+	}
 	b.resolveLoginAlertLocked(userID, codeID, windowID, fx)
 	b.sendLoginsLocked(userID, codeID)
 	fx.notify(userID)
@@ -256,7 +259,7 @@ func (b *botHub) handlePutLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Info().Int64("user", userID).Int64("code", codeID).Str("window", windowID).Msg("bot login saved")
-	b.loginChanged(userID, codeID, windowID)
+	b.loginChanged(userID, codeID, windowID, false)
 	accounts.WriteJSON(w, http.StatusOK, b.loginViewOf(stored, username, false))
 }
 
@@ -273,7 +276,7 @@ func (b *botHub) handleDeleteLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Info().Int64("user", userID).Int64("code", codeID).Str("window", windowID).Msg("bot login removed")
-	b.loginChanged(userID, codeID, windowID)
+	b.loginChanged(userID, codeID, windowID, true)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -382,6 +385,10 @@ func (b *botHub) handleLoginResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errors.Is(err, accounts.ErrStaleLogin) {
+		b.mu.Lock()
+		fx := &effects{}
+		b.endPromptLocked(codeKey{p.CodeID, windowID}, fx) // any result ends the window's code prompt, an ignored one too
+		b.release(fx)
 		log.Info().Int64("user", p.UserID).Int64("code", p.CodeID).Str("window", windowID).Str("result", in.Result).
 			Int64("updated_at", *in.UpdatedAt).Int64("row_updated_at", row.UpdatedAt).Msg("bot login result ignored: the login was saved again since")
 		w.WriteHeader(http.StatusNoContent)
@@ -394,6 +401,7 @@ func (b *botHub) handleLoginResult(w http.ResponseWriter, r *http.Request) {
 	}
 	b.mu.Lock()
 	fx := &effects{}
+	b.endPromptLocked(codeKey{p.CodeID, windowID}, fx) // its code alert resolves before the result's own alert
 	if spread > 0 {
 		b.sendLoginsLocked(p.UserID, p.CodeID)
 	}
@@ -416,6 +424,7 @@ func (b *botHub) loginRemoved(userID, codeID int64, windowID string) {
 	}
 	b.mu.Lock()
 	fx := &effects{}
+	b.endPromptLocked(codeKey{codeID, windowID}, fx)
 	b.resolveLoginAlertLocked(userID, codeID, windowID, fx)
 	if deleted {
 		b.sendLoginsLocked(userID, codeID)

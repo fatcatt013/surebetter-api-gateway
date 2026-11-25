@@ -117,11 +117,12 @@ func (b *botHub) alertSettingsLocked(userID int64) alertSettings {
 // open window and agent alerts resolve, its pauses and name go, and it never alerts again. Call it without b.mu.
 func (b *botHub) alertsCodeRevoked(codeID int64) {
 	b.mu.Lock()
+	fx := &effects{}
+	b.endPromptsLocked(func(pr *codePrompt) bool { return pr.codeID == codeID }, fx) // its SMS code prompts end too
 	if b.alerts == nil {
-		b.mu.Unlock()
+		b.release(fx)
 		return
 	}
-	fx := &effects{}
 	b.alerts.revoked[codeID] = true
 	b.forgetAgentsLocked(func(sc alertScope) bool { return sc.codeID == codeID }, fx)
 	delete(b.alerts.names, codeID)
@@ -148,6 +149,7 @@ func (b *botHub) alertsUserClosed(userID int64) {
 	}
 	b.mu.Lock()
 	fx := &effects{}
+	b.endPromptsLocked(func(pr *codePrompt) bool { return pr.userID == userID }, fx)
 	b.alerts.disabled[userID] = true
 	for codeID := range b.agents[userID] {
 		delete(b.alerts.names, codeID)

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -27,13 +28,16 @@ type telegramAlerts struct {
 // severityIcons start each alert message.
 var severityIcons = map[string]string{severityAttention: "⚠️", severityProblem: "🔴", severityInfo: "🟢"}
 
-// alertPath is where an alert opens in the app: its order (Orders) or the Fleet.
+// alertPath is where an alert opens in the app: the auto page, its order (Orders), an SMS code prompt's Fleet row, or the Fleet.
 func alertPath(a botAlert) string {
 	if a.Title == titleAutoPaused {
 		return "/app/bots/auto"
 	}
 	if a.OrderID != "" {
 		return "/app/bots/orders?order=" + url.QueryEscape(a.OrderID)
+	}
+	if a.Title == titleCodeNeeded && a.AgentID != 0 && a.WindowID != "" { // the row where the SMS code is typed
+		return "/app/bots/fleet?agent=" + strconv.FormatInt(a.AgentID, 10) + "&window=" + url.QueryEscape(a.WindowID)
 	}
 	return "/app/bots/fleet"
 }

@@ -40,6 +40,8 @@ func newLoginRig(t *testing.T) *loginRig {
 	bots.now = clk.now
 	bots.alerts = newAlertEngine(clk.now().Add(-time.Hour))
 	bots.alerts.startChecked = true
+	bots.reg.codeRevoked = bots.alertsCodeRevoked // as main wires it
+	bots.reg.userClosed = bots.alertsUserClosed
 	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
 	code := newCode(t, srv, token, "bot")
 	p, ok, err := svc.AuthenticateCode(code)
@@ -158,6 +160,11 @@ func loginRoutes(r *loginRig) []struct{ method, path, body string } {
 		{"GET", "/api/me/bot/logins/mine", ""},
 		{"POST", "/api/me/bot/logins/tipsport-1/reveal", `{}`},
 		{"POST", "/api/me/bot/logins/tipsport-1/result", `{"result":"ok"}`},
+		{"POST", "/api/me/bot/logins/tipsport-1/code-prompt", `{"digits":6,"expiresAt":1}`},
+		{"POST", "/api/me/bot/logins/tipsport-1/code-prompt/wrong", `{"promptId":"0123456789abcdef"}`},
+		{"POST", "/api/me/bot/logins/tipsport-1/code", `{"promptId":"0123456789abcdef"}`},
+		{"GET", "/api/me/bot/login-codes", ""},
+		{"POST", "/api/me/bot/agents/" + i64s(r.agent) + "/windows/tipsport-1/login-code", `{"code":"123456"}`},
 	}
 }
 
