@@ -463,17 +463,29 @@ func (b *botHub) handleResumeAuto(w http.ResponseWriter, r *http.Request) {
 			accounts.WriteError(w, http.StatusConflict, "needs_check")
 			return
 		}
+		// Under dbMu: every change released before has written its rows (an order that just ended reads as ended).
+		b.dbMu.Lock()
+		code := ""
 		for _, id := range ids {
 			row, found, err := b.acc.BotOrderByID(userID, id)
 			if err != nil {
 				log.Error().Err(err).Msg("bot auto resume: order read failed")
-				accounts.WriteError(w, http.StatusInternalServerError, "internal")
-				return
+				code = "internal"
+				break
 			}
-			if found && checkableOf(row.State, row.DryRun, row.FlowJSON) && row.CheckedAt == 0 {
-				accounts.WriteError(w, http.StatusConflict, "needs_check")
-				return
+			if found && ((checkableOf(row.State, row.DryRun, row.FlowJSON) && row.CheckedAt == 0) || (!row.DryRun && !botEvents[row.State])) {
+				code = "needs_check" // unchecked, or a real order not over yet
+				break
 			}
+		}
+		b.dbMu.Unlock()
+		if code == "internal" {
+			accounts.WriteError(w, http.StatusInternalServerError, code)
+			return
+		}
+		if code != "" {
+			accounts.WriteError(w, http.StatusConflict, code)
+			return
 		}
 		b.mu.Lock()
 		st = b.settingsLocked(userID)
@@ -488,16 +500,20 @@ func (b *botHub) handleResumeAuto(w http.ResponseWriter, r *http.Request) {
 		st.AutoPausedReason, st.AutoPausedOrders = "", "[]"
 		fx := &effects{}
 		b.saveSettingsLocked(userID, st, fx)
+		// Resolved in the same ordered writes: an alert of a pause raised after this Resume stays open.
+		var rows []accounts.BotAlertRow
+		at := b.now().UnixMilli()
+		fx.write(func() error {
+			var err error
+			rows, err = b.acc.ResolveBotAlertsTitled(userID, titleAutoPaused, at)
+			return err
+		})
 		fx.notify(userID)
 		b.release(fx)
+		for _, row := range rows {
+			b.reg.sendUser(userID, alertMessage(alertOfRow(row)))
+		}
 		break
-	}
-	rows, err := b.acc.ResolveBotAlertsTitled(userID, titleAutoPaused, b.now().UnixMilli())
-	if err != nil {
-		log.Error().Err(err).Msg("bot auto resume: resolving the alerts failed")
-	}
-	for _, row := range rows {
-		b.reg.sendUser(userID, alertMessage(alertOfRow(row)))
 	}
 	log.Info().Int64("user", userID).Msg("bot auto resumed")
 	w.WriteHeader(http.StatusNoContent)

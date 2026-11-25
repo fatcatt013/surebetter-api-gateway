@@ -56,11 +56,16 @@ func (r *autoRec) legCounts(l storedLeg) bool {
 	return r.state == "placed" || r.state == "cashed_out"
 }
 
-// autoDay is a user's orders created in one Prague day [from, to) (Unix ms).
+// autoDay is a user's orders created in one Prague day [from, to) (Unix ms), and in prev those created in the hour
+// before it (only the gap and the cool-down read them: they reach over midnight).
 type autoDay struct {
 	from, to int64
 	recs     map[string]*autoRec
+	prev     map[string]*autoRec
 }
+
+// autoCarry is how far before the day the gap (at most 3600 s) and the cool-down (2 min) look.
+const autoCarry = time.Hour
 
 // autoDayFrom is the start of the current Prague day (Unix ms): the skip-log counts' day.
 func (b *botHub) autoDayFrom() int64 {
@@ -76,7 +81,7 @@ func (b *botHub) autoDayLocked(userID int64, fx *effects) (*autoDay, error) {
 	if d := b.auto.days[userID]; d != nil && d.from == from.UnixMilli() {
 		return d, nil
 	}
-	d := &autoDay{from: from.UnixMilli(), to: to.UnixMilli(), recs: map[string]*autoRec{}}
+	d := &autoDay{from: from.UnixMilli(), to: to.UnixMilli(), recs: map[string]*autoRec{}, prev: map[string]*autoRec{}}
 	if b.acc != nil {
 		b.dbMu.Lock()
 		for _, w := range fx.writes {
@@ -85,13 +90,13 @@ func (b *botHub) autoDayLocked(userID int64, fx *effects) (*autoDay, error) {
 			}
 		}
 		fx.writes = nil
-		rows, err := b.acc.BotOrdersOfDay(userID, d.from, d.to)
+		rows, err := b.acc.BotOrdersOfDay(userID, d.from-autoCarry.Milliseconds(), d.to)
 		b.dbMu.Unlock()
 		if err != nil {
 			return nil, err
 		}
 		for _, row := range rows {
-			d.recs[row.ID] = recOfRow(row)
+			d.recsOf(row.CreatedAt)[row.ID] = recOfRow(row)
 		}
 	}
 	b.auto.days[userID] = d
@@ -101,6 +106,17 @@ func (b *botHub) autoDayLocked(userID int64, fx *effects) (*autoDay, error) {
 		}
 	}
 	return d, nil
+}
+
+// recsOf is the map an order created at created (Unix ms) belongs in: recs (the day), prev (the hour before) or nil.
+func (d *autoDay) recsOf(created int64) map[string]*autoRec {
+	switch {
+	case created >= d.from && created < d.to:
+		return d.recs
+	case created >= d.from-autoCarry.Milliseconds() && created < d.from:
+		return d.prev
+	}
+	return nil
 }
 
 // recOfRow is a stored order as a record.
@@ -115,23 +131,27 @@ func recOfRow(r accounts.BotOrderRow) *autoRec {
 		firstSeen: info.FirstDetectedAt, created: r.CreatedAt, sent: r.SentAt, ended: r.EndedAt}
 }
 
-// autoTrackLocked copies o, now in state, into its user's day when that day is loaded and o was created in it.
-// b.mu must be held.
+// autoTrackLocked copies o, now in state, into its user's day when that day is loaded and o was created in it (or
+// in the hour before). b.mu must be held.
 func (b *botHub) autoTrackLocked(o *botOrder, state string) {
 	d := b.auto.days[o.userID]
 	created := o.created.UnixMilli()
-	if d == nil || created < d.from || created >= d.to {
+	if d == nil {
 		return
 	}
-	r := d.recs[o.id]
+	recs := d.recsOf(created)
+	if recs == nil {
+		return
+	}
+	r := recs[o.id]
 	if r == nil {
 		r = &autoRec{id: o.id}
-		d.recs[o.id] = r
+		recs[o.id] = r
 	}
 	r.source, r.eventID, r.arbKey, r.dry, r.state = o.sourceOrApp(), o.eventID, o.arbKey, o.dryRun, state
 	r.legs = slices.Clone(o.legs)
 	r.accepted = o.accepted
-	r.stuck = r.stuck || o.stuckSeen || flowIsStuck(o.flow)
+	r.stuck = flowIsStuck(o.flow) // the stored flow, as after a rebuild (contract §1)
 	r.firstSeen, r.created = o.info.FirstDetectedAt, created
 	if !o.sent.IsZero() {
 		r.sent = o.sent.UnixMilli()
@@ -196,6 +216,7 @@ func (b *botHub) autoStuckLocked(o *botOrder, fx *effects) {
 func (b *botHub) autoPauseLocked(userID int64, reason, orderID string, codeID int64, dry bool, fx *effects) {
 	st, ok := b.settings[userID]
 	if !ok {
+		log.Error().Int64("user", userID).Str("reason", reason).Msg("bot auto pause not applied: settings unreadable (auto evaluates nothing for the user meanwhile)")
 		return
 	}
 	if _, mode := b.autoModeLocked(userID); mode == autoOff {

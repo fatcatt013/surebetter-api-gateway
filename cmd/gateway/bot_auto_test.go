@@ -1043,3 +1043,44 @@ func TestAuto_AlertLinksTheAutoTab(t *testing.T) {
 		t.Fatalf("text %q", got)
 	}
 }
+
+// The pass reads each arb from the hub again: one removed since the snapshot is not evaluated, a changed one is
+// evaluated at its new prices.
+func TestAuto_StaleSnapshot(t *testing.T) {
+	e := newAutoEnv(t, "A")
+	e.agent(tipFortIdle...)
+	e.setAuto("log", "", "", "")
+	hub := NewHub(Config{})
+	e.bots.auto.src = hub
+	gone, changed := e.arb2("tennis-live:gone", "T", 1), e.arb2("tennis-live:chg", "T", 1)
+	now := changed
+	now.Stakes = []StakeAllocation{sl("tipsport", "OVER", 2.2), sl("fortuna", "UNDER", 2.1)}
+	hub.ApplyOpportunity(now)
+	e.eval(gone, changed)
+	if l := e.lines(); len(l) != 1 || l[0].EventID != "tennis-live:chg" || l[0].Legs[0].Odds != 2.2 {
+		t.Fatalf("lines %+v", l)
+	}
+}
+
+// The gap and the cool-down reach over Prague midnight.
+func TestAuto_GapOverMidnight(t *testing.T) {
+	e := newAutoEnv(t, "B")
+	e.clk.t = time.Date(2026, 11, 25, 23, 59, 55, 0, prague)
+	e.agent(win("tipsport", 1, "idle"), win("fortuna", 1, "idle"), win("tipsport", 2, "idle"), win("fortuna", 2, "idle"))
+	e.controller(func(st *accounts.BotSettings) { st.OrdersAtOnce = 2 })
+	e.setAuto("dry", "", "", `{"atOnce":2,"perDay":20,"stakePerDay":0,"gapSec":10,"books":[],"perBook":{}}`)
+	e.sendNext(e.arb2("tennis-live:aa", "T", 1))
+	e.clk.advance(7 * time.Second) // 00:00:02
+	e.expect(e.arb2("tennis-live:bb", "T", 1), "gap", "Gap · 3 s left")
+}
+
+// With mode live and the controller in Dry run the class is dry: a dry auto order placed on the match blocks it.
+func TestAuto_DryClassPlacedBlocks(t *testing.T) {
+	e := newAutoEnv(t, "C")
+	e.agent(tipFortIdle...)
+	e.controller(func(st *accounts.BotSettings) { st.DryRun = false })
+	e.setAuto("live", "", "", "")
+	e.controller(func(st *accounts.BotSettings) { st.DryRun = true })
+	e.injectRec(autoRec{id: "dryauto0", source: "auto", eventID: "tennis-live:aa", arbKey: "tennis-live:aa:T:1", dry: true, state: "placed"})
+	e.expect(e.arb2("tennis-live:aa", "GAME_HANDICAP", 1.5), "match_placed", "")
+}

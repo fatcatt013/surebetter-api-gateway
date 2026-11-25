@@ -53,7 +53,8 @@ type autoPicker struct {
 
 	hiddenMu  sync.Mutex
 	hidden    map[int64]*hiddenSet
-	hiddenGen map[int64]int // bumped by each write of the user's "hidden" key
+	hiddenGen map[int64]int       // bumped by each write of the user's "hidden" key
+	hiddenErr map[int64]time.Time // when a read error was last logged
 
 	logMu sync.Mutex
 	logs  map[int64]*autoUserLog
@@ -62,7 +63,7 @@ type autoPicker struct {
 func newAutoPicker() *autoPicker {
 	return &autoPicker{queue: make(chan string, autoQueueSize), kick: make(chan struct{}, 1), users: map[int64]bool{},
 		cfgs: map[int64]autoCfgCache{}, days: map[int64]*autoDay{}, streak: map[int64]int{}, dayErr: map[int64]time.Time{},
-		hidden: map[int64]*hiddenSet{}, hiddenGen: map[int64]int{}, logs: map[int64]*autoUserLog{}}
+		hidden: map[int64]*hiddenSet{}, hiddenGen: map[int64]int{}, hiddenErr: map[int64]time.Time{}, logs: map[int64]*autoUserLog{}}
 }
 
 // observe is the arb hub's listener: an applied arb's key is queued without blocking (removals need nothing: a
@@ -156,7 +157,10 @@ func (b *botHub) autoEvaluate(opps []ArbOpportunity) {
 		if b.loadSettings(userID) != nil {
 			continue
 		}
-		hidden := b.autoHidden(userID)
+		hidden, ok := b.autoHidden(userID)
+		if !ok {
+			continue // the Hidden list cannot be read: nothing is evaluated (an arb the user hid is never sent)
+		}
 		for _, opp := range opps {
 			b.autoEvalOne(userID, opp, hidden)
 		}
@@ -205,22 +209,27 @@ func (b *botHub) autoStateWritten(userID int64, key string) {
 }
 
 // autoHidden is userID's Hidden list, read from the account state at the first use and after each write of it (call
-// without b.mu). A read error is logged and nothing is hidden until a later read works.
-func (b *botHub) autoHidden(userID int64) *hiddenSet {
+// without b.mu). false: it cannot be read (logged at most once a minute); the caller evaluates nothing for the user.
+func (b *botHub) autoHidden(userID int64) (*hiddenSet, bool) {
 	p := b.auto
 	p.hiddenMu.Lock()
 	h, gen := p.hidden[userID], p.hiddenGen[userID]
 	p.hiddenMu.Unlock()
 	if h != nil {
-		return h
+		return h, true
 	}
 	if b.acc == nil {
-		return hiddenOf(nil)
+		return hiddenOf(nil), true
 	}
 	state, err := b.acc.GetState(userID)
 	if err != nil {
-		log.Error().Err(err).Int64("user", userID).Msg("bot auto: hidden read failed")
-		return hiddenOf(nil)
+		p.hiddenMu.Lock()
+		if now := time.Now(); now.Sub(p.hiddenErr[userID]) >= time.Minute {
+			p.hiddenErr[userID] = now
+			log.Error().Err(err).Int64("user", userID).Msg("bot auto: hidden read failed; nothing evaluated")
+		}
+		p.hiddenMu.Unlock()
+		return nil, false
 	}
 	h = hiddenOf(state["hidden"])
 	p.hiddenMu.Lock()
@@ -228,7 +237,7 @@ func (b *botHub) autoHidden(userID int64) *hiddenSet {
 		p.hidden[userID] = h
 	}
 	p.hiddenMu.Unlock()
-	return h
+	return h, true
 }
 
 // ── one arb for one user ──────────────────────────────────────────────────────
@@ -304,6 +313,13 @@ func (b *botHub) autoEvalOne(userID int64, opp ArbOpportunity, hidden *hiddenSet
 	cfg, mode := b.autoModeLocked(userID)
 	if mode == autoOff || cfg.Filter == nil || cfg.Bankroll == nil {
 		return
+	}
+	if b.auto.src != nil { // the arb as the hub holds it now: a removed one is never evaluated, a changed one at its new prices
+		cur, ok := b.auto.src.Get(oppStateKey(opp))
+		if !ok {
+			return
+		}
+		opp = cur
 	}
 	now := b.now()
 	day, err := b.autoDayLocked(userID, fx)
@@ -409,7 +425,7 @@ func (b *botHub) autoStage2Locked(userID int64, opp ArbOpportunity, r arbfilter.
 		line.Reason, line.Text = code, text
 		return line
 	}
-	ev := opp.EventID
+	ev := truncRunes(opp.EventID, 128) // as the order stores it
 	onMatch := func(rec *autoRec) bool { return ev != "" && rec.eventID == ev }
 
 	if hidden.arbs[key] || hidden.events[ev] {
@@ -427,7 +443,7 @@ func (b *botHub) autoStage2Locked(userID int64, opp ArbOpportunity, r arbfilter.
 		return skip("auto_paused", "Auto paused")
 	}
 	for _, rec := range day.recs {
-		if onMatch(rec) && rec.state == "placed" && (!rec.dry || (mode == autoDry && rec.source == sourceAuto)) {
+		if onMatch(rec) && rec.state == "placed" && (!rec.dry || (dry && rec.source == sourceAuto)) {
 			return skip("match_placed", "Already placed on this match today")
 		}
 	}
@@ -457,9 +473,11 @@ func (b *botHub) autoStage2Locked(userID int64, opp ArbOpportunity, r arbfilter.
 		}
 	}
 	var cool time.Duration // the longest cool-down left of an auto order on the match that stopped after it was accepted
-	for _, rec := range day.recs {
-		if onMatch(rec) && rec.source == sourceAuto && rec.state == "stopped" && rec.accepted {
-			cool = max(cool, time.UnixMilli(rec.ended).Add(autoCooldown).Sub(now))
+	for _, recs := range []map[string]*autoRec{day.recs, day.prev} {
+		for _, rec := range recs {
+			if onMatch(rec) && rec.source == sourceAuto && rec.state == "stopped" && rec.accepted {
+				cool = max(cool, time.UnixMilli(rec.ended).Add(autoCooldown).Sub(now))
+			}
 		}
 	}
 	if cool > 0 {
@@ -568,8 +586,16 @@ func (b *botHub) autoStage2Locked(userID int64, opp ArbOpportunity, r arbfilter.
 	if running >= st.OrdersAtOnce {
 		return skip("orders_at_once", fmt.Sprintf("Orders at once: %d running", running))
 	}
-	if last := day.lastRec(func(rec *autoRec) bool { return rec.source == sourceAuto && rec.sent > 0 }); last != nil {
-		if left := time.UnixMilli(last.sent).Add(time.Duration(cfg.Limits.GapSec) * time.Second).Sub(now); left > 0 {
+	var lastSent int64 // the last auto send, today or in the hour before (the gap is at most an hour)
+	for _, recs := range []map[string]*autoRec{day.recs, day.prev} {
+		for _, rec := range recs {
+			if rec.source == sourceAuto {
+				lastSent = max(lastSent, rec.sent)
+			}
+		}
+	}
+	if lastSent > 0 {
+		if left := time.UnixMilli(lastSent).Add(time.Duration(cfg.Limits.GapSec) * time.Second).Sub(now); left > 0 {
 			return skip("gap", fmt.Sprintf("Gap · %d s left", secondsLeft(left)))
 		}
 	}
