@@ -32,8 +32,14 @@ func TestReject_StepsInOrder(t *testing.T) {
 		{"passes", a, func(*Filter) {}, ""},
 		{"three legs excluded", three, func(f *Filter) { f.ThreeLeg = "exclude"; f.LiveState = "prematch" }, StepThreeLeg},
 		{"live state", a, func(f *Filter) { f.LiveState = "prematch"; f.Sports = []string{"football"} }, StepLiveState},
-		{"sport", a, func(f *Filter) { f.Sports = []string{"football"}; f.BlockedMarkets = map[string][]string{"tennis": {"TOTAL_GAMES"}} }, StepSport},
-		{"market", a, func(f *Filter) { f.BlockedMarkets = map[string][]string{"tennis": {"TOTAL_GAMES"}}; f.ProfitMin = f64(5) }, StepMarket},
+		{"sport", a, func(f *Filter) {
+			f.Sports = []string{"football"}
+			f.BlockedMarkets = map[string][]string{"tennis": {"TOTAL_GAMES"}}
+		}, StepSport},
+		{"market", a, func(f *Filter) {
+			f.BlockedMarkets = map[string][]string{"tennis": {"TOTAL_GAMES"}}
+			f.ProfitMin = f64(5)
+		}, StepMarket},
 		{"profit min", a, func(f *Filter) { f.ProfitMin = f64(5); f.ProfitMax = f64(1) }, StepProfitMin},
 		{"profit max", a, func(f *Filter) { f.ProfitMax = f64(1); f.MinAgeSec = 3600 }, StepProfitMax},
 		{"min age", a, func(f *Filter) { f.MinAgeSec = 61 }, StepMinAge},
