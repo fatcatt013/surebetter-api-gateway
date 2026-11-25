@@ -170,6 +170,17 @@ func TestBotLogins_OffWithoutAKey(t *testing.T) {
 				t.Fatalf("%s %s: %d %s", rt.method, rt.path, s, b)
 			}
 		}
+		// Before CSRF too: another site's write gets the same answer.
+		if s, b, _ := r.do(rt.method, rt.path, r.token, "", rt.body, map[string]string{"X-Forwarded-Proto": "https", "Origin": "https://evil.example",
+			"Content-Type": "text/plain"}); s != 503 {
+			t.Fatalf("%s %s cross-site: %d %s", rt.method, rt.path, s, b)
+		}
+	}
+	// With the key on, CSRF still guards the app's writes.
+	r.bots.logins = mustCipher(t, testLoginKey(0), "")
+	if s, b, _ := r.do("PUT", r.loginPath("tipsport-1"), r.token, "", `{"username":"u","password":"p"}`,
+		map[string]string{"X-Forwarded-Proto": "https", "Origin": "https://evil.example"}); s != 403 || !strings.Contains(b, `"bad_origin"`) {
+		t.Fatalf("cross-site PUT: %d %s", s, b)
 	}
 }
 
@@ -240,6 +251,7 @@ func TestBotLogins_PutValidation(t *testing.T) {
 		"body over 1 KiB":    `{"username":"u","password":"` + strings.Repeat("p", 1100) + `"}`,
 		"trailing junk":      `{"username":"u","password":"p"} x`,
 		"duplicate username": `{"username":"u","username":"v"}`,
+		"duplicate, 3 keys":  `{"username":"a","username":"b","password":"p"}`,
 	} {
 		if s, b := r.appReq("PUT", path, body); s != 400 || !strings.Contains(b, `"bad_login"`) {
 			t.Fatalf("%s: %d %s", name, s, b)
@@ -352,6 +364,13 @@ func TestBotLogins_ListShowsKeyLost(t *testing.T) {
 	r.bots.logins = mustCipher(t, testLoginKey(0), testLoginKey(9))
 	if l := r.list(); l[1].Username != "eva" || l[1].Failing != "" {
 		t.Fatalf("healed: %+v", l[1])
+	}
+	// A row of a known key that does not open (its secret moved here from another row) reads as key_lost too.
+	row, _, _ := r.svc.BotLogin(r.agent, "tipsport-1")
+	row.WindowID = "tipsport-3"
+	r.svc.SaveBotLogin(row)
+	if l := r.list(); len(l) != 3 || l[2].Username != "" || l[2].Failing != "key_lost" {
+		t.Fatalf("does not open: %+v", l)
 	}
 }
 

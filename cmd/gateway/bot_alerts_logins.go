@@ -55,8 +55,11 @@ func (b *botHub) alertLoginResultLocked(userID, codeID int64, windowID, book, re
 	if result == "restricted" {
 		d = joinDetail(d, bookLabel(book)+" logins stopped")
 	}
-	// A Logged out grace of the window ends: this alert covers it.
-	delete(b.alerts.pending, alertScope{kind: alertWindow, userID: userID, codeID: codeID, windowID: windowID})
+	// A Logged out grace of the window ends: this alert covers it (a down or blocked grace goes on).
+	ws := alertScope{kind: alertWindow, userID: userID, codeID: codeID, windowID: windowID}
+	if pa := b.alerts.pending[ws]; pa != nil && pa.state == "logged_out" {
+		delete(b.alerts.pending, ws)
+	}
 	b.raiseLocked(userID, botAlert{Kind: alertAttention, Severity: severityAttention, AgentID: codeID, WindowID: windowID,
 		Title: t.title, Detail: d}, &sc, fx)
 	log.Info().Int64("user", userID).Int64("code", codeID).Str("window", windowID).Str("result", result).Str("detail", detail).

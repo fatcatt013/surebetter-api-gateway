@@ -301,14 +301,17 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("POST /api/me/bot/alerts/{id}/dismiss", acc.RequireSession(http.HandlerFunc(b.handleDismissAlert)))
 	mux.Handle("GET /api/me/bot/alert-settings", acc.RequireSession(http.HandlerFunc(b.handleGetAlertSettings)))
 	mux.Handle("PUT /api/me/bot/alert-settings", acc.RequireSession(http.HandlerFunc(b.handlePutAlertSettings)))
-	// Bot logins: the feature switch and the HTTPS rule come before the auth (loginGate).
-	mux.Handle("GET /api/me/bot/logins", b.loginGate(acc.RequireSession(http.HandlerFunc(b.handleGetLogins))))
-	mux.Handle("PUT /api/me/bot/agents/{agentId}/windows/{windowId}/login", b.loginGate(acc.RequireSession(http.HandlerFunc(b.handlePutLogin))))
-	mux.Handle("DELETE /api/me/bot/agents/{agentId}/windows/{windowId}/login", b.loginGate(acc.RequireSession(http.HandlerFunc(b.handleDeleteLogin))))
-	mux.Handle("GET /api/me/bot/logins/mine", b.loginGate(acc.RequireBotCode(http.HandlerFunc(b.handleOwnLogins))))
-	mux.Handle("POST /api/me/bot/logins/{windowId}/reveal", b.loginGate(acc.RequireBotCode(http.HandlerFunc(b.handleReveal))))
-	mux.Handle("POST /api/me/bot/logins/{windowId}/result", b.loginGate(acc.RequireBotCode(http.HandlerFunc(b.handleLoginResult))))
-	return accounts.CSRF(mux)
+	// Bot logins: the feature switch and the HTTPS rule come first (loginGate), then CSRF and the auth.
+	outer := http.NewServeMux()
+	login := func(pattern string, h http.Handler) { outer.Handle(pattern, b.loginGate(accounts.CSRF(h))) }
+	login("GET /api/me/bot/logins", acc.RequireSession(http.HandlerFunc(b.handleGetLogins)))
+	login("PUT /api/me/bot/agents/{agentId}/windows/{windowId}/login", acc.RequireSession(http.HandlerFunc(b.handlePutLogin)))
+	login("DELETE /api/me/bot/agents/{agentId}/windows/{windowId}/login", acc.RequireSession(http.HandlerFunc(b.handleDeleteLogin)))
+	login("GET /api/me/bot/logins/mine", acc.RequireBotCode(http.HandlerFunc(b.handleOwnLogins)))
+	login("POST /api/me/bot/logins/{windowId}/reveal", acc.RequireBotCode(http.HandlerFunc(b.handleReveal)))
+	login("POST /api/me/bot/logins/{windowId}/result", acc.RequireBotCode(http.HandlerFunc(b.handleLoginResult)))
+	outer.Handle("/", accounts.CSRF(mux))
+	return outer
 }
 
 func (b *botHub) handleGet(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/surebetter/api-gateway/internal/accounts"
 )
@@ -143,8 +144,18 @@ func TestBotLoginAlerts_SuppressTheLoggedOutWindowAlert(t *testing.T) {
 	if got := r.alerts(); len(got) != 0 {
 		t.Fatalf("window alert despite the login alert: %+v", got)
 	}
-	// Another problem (down) still alerts.
-	r.status(alertWin("tipsport", 1, "down", "bot", ""), alertWin("tipsport", 2, "logged_out", "bot", ""))
+	// A down grace running when a login result comes goes on.
+	r.status(alertWin("tipsport", 3, "down", "bot", ""), alertWin("tipsport", 1, "logged_out", "bot", ""), alertWin("tipsport", 2, "logged_out", "bot", ""))
+	r.clk.advance(30 * time.Second)
+	r.loginResult("tipsport-3", "code")
+	r.alerts()
+	r.clk.advance(30 * time.Second)
+	r.b.tick()
+	if got := r.alerts(); len(got) != 1 || got[0].WindowID != "tipsport-3" || got[0].Title != "Window down" {
+		t.Fatalf("down grace kept: %+v", got)
+	}
+	// Another problem (down) still alerts, while its login alert is open.
+	r.status(alertWin("tipsport", 1, "down", "bot", ""), alertWin("tipsport", 2, "logged_out", "bot", ""), alertWin("tipsport", 3, "down", "bot", ""))
 	r.clk.advance(windowAlertGrace)
 	r.b.tick()
 	if got := r.alerts(); len(got) != 1 || got[0].Kind != alertWindow || got[0].Title != "Window down" {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -92,7 +93,8 @@ func (b *botHub) failingOf(r accounts.BotLoginRow) string {
 	return r.Failing
 }
 
-// loginViewOf is r as the app sees it; the user name is decrypted (none for key_lost or a row that does not open).
+// loginViewOf is r as the app sees it; the user name is decrypted (none for key_lost). A row of a known key that does
+// not open is shown as key_lost too ("Set again"): reveal refuses it (login_failing) all the same.
 func (b *botHub) loginViewOf(r accounts.BotLoginRow, username string, decrypt bool) loginView {
 	v := loginView{AgentID: r.CodeID, WindowID: r.WindowID, Bookmaker: r.Bookmaker, UpdatedAt: r.UpdatedAt, LastOkAt: r.LastOkAt,
 		LastResult: r.LastResult, LastAt: r.LastAt, Failing: b.failingOf(r), Username: username}
@@ -100,6 +102,7 @@ func (b *botHub) loginViewOf(r accounts.BotLoginRow, username string, decrypt bo
 		u, _, err := b.logins.open(r.Secret, r.KeyID, r.UserID, r.CodeID, r.WindowID)
 		if err != nil {
 			log.Error().Int64("user", r.UserID).Int64("code", r.CodeID).Str("window", r.WindowID).Msg("bot login could not be decrypted")
+			v.Failing = "key_lost"
 		}
 		v.Username = u
 	}
@@ -130,7 +133,7 @@ func noControl(s string) bool {
 // trimmed; it must be 1–100 runes, the password 1–200, neither with a control character.
 func loginBodyOf(body []byte) (username, password string, ok bool) {
 	var raw map[string]json.RawMessage
-	if json.Unmarshal(body, &raw) != nil || len(raw) != 2 {
+	if json.Unmarshal(body, &raw) != nil || len(raw) != 2 || !uniqueKeys(body) {
 		return "", "", false
 	}
 	for _, k := range []string{"username", "password"} {
@@ -150,6 +153,28 @@ func loginBodyOf(body []byte) (username, password string, ok bool) {
 		return "", "", false
 	}
 	return username, password, true
+}
+
+// uniqueKeys: the JSON object body names no key twice (json.Unmarshal would keep the last one).
+func uniqueKeys(body []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return false
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		t, err := dec.Token()
+		k, isKey := t.(string)
+		if err != nil || !isKey || seen[k] {
+			return false
+		}
+		seen[k] = true
+		var skip json.RawMessage
+		if dec.Decode(&skip) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // loginTarget reads the app's {agentId} and {windowId}: 400 bad_login for a bad window id, 404 unknown_agent when the
