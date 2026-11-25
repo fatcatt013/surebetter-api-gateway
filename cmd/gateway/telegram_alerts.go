@@ -29,6 +29,9 @@ var severityIcons = map[string]string{severityAttention: "⚠️", severityProbl
 
 // alertPath is where an alert opens in the app: its order (Orders) or the Fleet.
 func alertPath(a botAlert) string {
+	if a.Title == titleAutoPaused {
+		return "/app/bots/auto"
+	}
 	if a.OrderID != "" {
 		return "/app/bots/orders?order=" + url.QueryEscape(a.OrderID)
 	}

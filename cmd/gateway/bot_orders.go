@@ -60,6 +60,9 @@ type orderView struct {
 	// mark it checked (human mode). CheckedAt: when they did (Unix ms); 0 = not checked.
 	Checkable bool  `json:"checkable"`
 	CheckedAt int64 `json:"checkedAt"`
+	// Source: "app" or "auto" (the automatic mode); EventID: the order's match ("" for orders older than migration 13).
+	Source  string `json:"source"`
+	EventID string `json:"eventId"`
 }
 
 // checkableOf: an ended (final state), real order that ended outcome_unknown or whose last flow has
@@ -109,7 +112,8 @@ func (v orderView) withDetails(info orderInfo, flow string) orderView {
 func (o *botOrder) viewOf(names map[int64]string) orderView {
 	v := orderView{ID: o.id, ArbKey: o.arbKey, State: o.state, Reason: o.reason, DryRun: o.dryRun, AgentID: o.codeID, Agent: names[o.codeID],
 		Match: o.info.Match, Market: o.info.Market, Live: o.info.Live, ProfitPct: o.info.ProfitPct, Stake: o.stake,
-		CreatedAt: o.created.UnixMilli(), Legs: legViews(o.legs), OddsDrop: oddsDropMode(o.oddsDrop), MinProfitPct: o.info.MinProfitPct}
+		CreatedAt: o.created.UnixMilli(), Legs: legViews(o.legs), OddsDrop: oddsDropMode(o.oddsDrop), MinProfitPct: o.info.MinProfitPct,
+		Source: o.sourceOrApp(), EventID: o.eventID}
 	if o.state == orderRunning {
 		v.SentAt = o.sent.UnixMilli()
 	}
@@ -125,7 +129,16 @@ func rowView(r accounts.BotOrderRow) orderView {
 	return orderView{ID: r.ID, ArbKey: r.ArbKey, State: r.State, Reason: r.Reason, DryRun: r.DryRun, AgentID: r.CodeID, Agent: r.Agent,
 		Match: info.Match, Market: info.Market, Live: info.Live, ProfitPct: info.ProfitPct, Stake: r.Stake, CreatedAt: r.CreatedAt,
 		SentAt: r.SentAt, EndedAt: r.EndedAt, Legs: legViews(legs), Checkable: checkableOf(r.State, r.DryRun, r.FlowJSON),
-		CheckedAt: r.CheckedAt, OddsDrop: oddsDropMode(r.OddsDrop), MinProfitPct: r.MinProfitPct}.withDetails(info, r.FlowJSON)
+		CheckedAt: r.CheckedAt, OddsDrop: oddsDropMode(r.OddsDrop), MinProfitPct: r.MinProfitPct, Source: rowSource(r.Source),
+		EventID: r.EventID}.withDetails(info, r.FlowJSON)
+}
+
+// rowSource is a stored source as the API shows it: "auto", anything else "app".
+func rowSource(s string) string {
+	if s == sourceAuto {
+		return sourceAuto
+	}
+	return sourceApp
 }
 
 // ordersView is the GET /api/me/bot/orders body.

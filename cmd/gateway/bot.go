@@ -50,6 +50,7 @@ type botView struct {
 	Waiting      int           `json:"waiting"`
 	OrdersAtOnce int           `json:"ordersAtOnce"`
 	Today        botToday      `json:"today"`
+	Auto         autoSummary   `json:"auto"`
 }
 
 // botPresence is one agent's open bot socket (one per bot code) and its last status.
@@ -107,13 +108,17 @@ type botHub struct {
 	// route answers 503. loginsAllowHTTP (BOT_LOGINS_ALLOW_HTTP=1, development) counts every request as secure.
 	logins          *loginCipher
 	loginsAllowHTTP bool
+	// auto is the automatic mode's picker and memory (bot_auto*.go); autoPhase the deployment's phase (BOT_AUTO_PHASE:
+	// "A", "B" or "C"), which decides the modes it accepts.
+	auto      *autoPicker
+	autoPhase string
 }
 
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
 	return &botHub{reg: reg, acc: acc, now: time.Now, agents: map[int64]map[int64]*botPresence{}, orders: map[string]*botOrder{},
 		settings: map[int64]accounts.BotSettings{}, memPause: map[int64]string{}, commands: map[string]*pendingCommand{},
 		limits: map[int64][]limitEntry{},
-		logs:   &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}}
+		logs:   &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}, auto: newAutoPicker(), autoPhase: "A"}
 }
 
 // view is userID's GET /api/me/bot body.
@@ -123,6 +128,7 @@ func (b *botHub) view(userID int64) botView {
 	fx := &effects{}
 	b.expireLocked(fx)
 	v := b.viewLocked(userID)
+	v.Auto = b.autoSummaryLocked(userID, fx)
 	b.release(fx)
 	if b.acc != nil {
 		from, to := pragueDayOf(b.now())
@@ -296,6 +302,10 @@ func newBotAPI(acc *accounts.Service, b *botHub) http.Handler {
 	mux.Handle("GET /api/me/bot/agents/{agentId}/recordings", acc.RequireSession(http.HandlerFunc(b.handleAgentRecordings)))
 	mux.Handle("GET /api/me/bot/recordings", acc.RequireBotCode(http.HandlerFunc(b.handleOwnRecordings)))
 	mux.Handle("GET /api/me/bot/recordings/{kind}", acc.RequireBotCode(http.HandlerFunc(b.handleOwnRecording)))
+	mux.Handle("GET /api/me/bot/auto", acc.RequireSession(http.HandlerFunc(b.handleGetAuto)))
+	mux.Handle("PUT /api/me/bot/auto", acc.RequireSession(http.HandlerFunc(b.handlePutAuto)))
+	mux.Handle("POST /api/me/bot/auto/resume", acc.RequireSession(http.HandlerFunc(b.handleResumeAuto)))
+	mux.Handle("GET /api/me/bot/auto/log", acc.RequireSession(http.HandlerFunc(b.handleAutoLog)))
 	mux.Handle("GET /api/me/bot/alerts", acc.RequireSession(http.HandlerFunc(b.handleGetAlerts)))
 	mux.Handle("POST /api/me/bot/alerts/dismiss-all", acc.RequireSession(http.HandlerFunc(b.handleDismissAllAlerts)))
 	mux.Handle("POST /api/me/bot/alerts/{id}/dismiss", acc.RequireSession(http.HandlerFunc(b.handleDismissAlert)))

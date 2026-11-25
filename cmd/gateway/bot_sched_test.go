@@ -181,7 +181,8 @@ func TestBot_StatusAndPresence(t *testing.T) {
 	app := appSocket(t, srv, token)
 
 	if got := getBot(t, srv, token); got != `{"online":false,"books":[],"dryRun":true,"busy":false,"update":false,"paused":false,"pausedReason":"",`+
-		`"running":0,"waiting":0,"ordersAtOnce":1,"today":{"orders":0,"placed":0}}` {
+		`"running":0,"waiting":0,"ordersAtOnce":1,"today":{"orders":0,"placed":0},`+
+		`"auto":{"mode":"off","effectiveDryRun":true,"paused":false,"pausedReason":"","today":{"orders":0,"placed":0}}}` {
 		t.Fatalf("offline: %s", got)
 	}
 	if s, b := postStatus(t, srv, code, `{"books":[],"dryRun":true}`); s != 409 || !strings.Contains(b, `"bot_offline"`) {

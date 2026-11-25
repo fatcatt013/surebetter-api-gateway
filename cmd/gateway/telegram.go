@@ -40,13 +40,13 @@ func setupTelegram(ctx context.Context, cfg Config, hub *Hub, rdb *redis.Client,
 		log.Error().Err(err).Msg("Telegram notifier failed to start; feature off")
 		return nil
 	}
-	hub.onChange = func(key string, opp ArbOpportunity, removed, evicted bool) {
+	hub.listen(func(key string, opp ArbOpportunity, removed, evicted bool) {
 		if removed {
 			n.Observe(telegram.Event{Key: key, Removed: true, Evicted: evicted})
 			return
 		}
 		n.Observe(telegram.Event{Key: key, Arb: toTelegramArb(opp)})
-	}
+	})
 	return n
 }
 

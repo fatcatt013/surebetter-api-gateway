@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,9 @@ type Config struct {
 	BotLoginsKey         string
 	BotLoginsKeyPrevious string
 	BotLoginsAllowHTTP   bool
+	// BotAutoPhase (BOT_AUTO_PHASE): the automatic mode's phase this deployment runs, "A" (Log only), "B" (+ Dry run)
+	// or "C" (+ Live); anything else is "A".
+	BotAutoPhase string
 }
 
 // authRequired fails closed: only the exact value "false" disables authentication.
@@ -99,6 +103,7 @@ func configFromEnv() Config {
 		BotLoginsKey:         getenv("BOT_LOGINS_KEY", ""),
 		BotLoginsKeyPrevious: getenv("BOT_LOGINS_KEY_PREVIOUS", ""),
 		BotLoginsAllowHTTP:   strings.TrimSpace(getenv("BOT_LOGINS_ALLOW_HTTP", "")) == "1",
+		BotAutoPhase:         strings.ToUpper(strings.TrimSpace(getenv("BOT_AUTO_PHASE", "A"))),
 	}
 }
 
@@ -311,11 +316,47 @@ type StateHub[T any] struct {
 	connCount atomic.Int64
 	msgSent   atomic.Int64
 
-	// onChange, when set (arb hub with Telegram on), observes every state transition: an apply
-	// (removed=false), an explicit removal (removed=true) or an eviction (removed and evicted).
-	// Called outside stateMu; it must not block (the Telegram notifier's Observe is a non-blocking
-	// channel send).
-	onChange func(key string, item T, removed, evicted bool)
+	// listeners (listen; the arb hub: the Telegram notifier and the bots' auto mode) observe every state
+	// transition: an apply (removed=false), an explicit removal (removed=true) or an eviction (removed and
+	// evicted), each in turn. Called outside stateMu; none may block (the Telegram notifier's Observe and the
+	// auto picker's observe are non-blocking channel sends). Set them before the bridge starts.
+	listeners []func(key string, item T, removed, evicted bool)
+}
+
+// listen adds f to the hub's change listeners (call before the bridge starts feeding the hub).
+func (h *StateHub[T]) listen(f func(key string, item T, removed, evicted bool)) {
+	h.listeners = append(h.listeners, f)
+}
+
+// onChange tells every listener of one transition.
+func (h *StateHub[T]) onChange(key string, item T, removed, evicted bool) {
+	for _, f := range h.listeners {
+		f(key, item, removed, evicted)
+	}
+}
+
+// Get is key's current item; false when it is not in the state (removed or evicted).
+func (h *StateHub[T]) Get(key string) (T, bool) {
+	h.stateMu.RLock()
+	defer h.stateMu.RUnlock()
+	e, ok := h.state[key]
+	return e.opp, ok
+}
+
+// Items is every current item, by key.
+func (h *StateHub[T]) Items() []T {
+	h.stateMu.RLock()
+	keys := make([]string, 0, len(h.state))
+	for k := range h.state {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	out := make([]T, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, h.state[k].opp)
+	}
+	h.stateMu.RUnlock()
+	return out
 }
 
 // Hub is the arbitrage channel (/ws, arb.opportunities).
@@ -368,9 +409,7 @@ func (h *StateHub[T]) ApplyOpportunity(opp T) PatchOp {
 	h.state[key] = hubEntry[T]{opp: opp, lastSeen: time.Now()}
 	h.snapshotCache = nil
 	h.stateMu.Unlock()
-	if h.onChange != nil {
-		h.onChange(key, opp, false, false)
-	}
+	h.onChange(key, opp, false, false)
 	return PatchOp{
 		Op:    "replace",
 		Path:  h.spec.prefix + key,
@@ -395,9 +434,7 @@ func (h *StateHub[T]) RemoveOpportunity(opp T) (PatchOp, bool) {
 	if !present {
 		return PatchOp{}, false
 	}
-	if h.onChange != nil {
-		h.onChange(key, opp, true, false)
-	}
+	h.onChange(key, opp, true, false)
 	return PatchOp{Op: "remove", Path: h.spec.prefix + key}, true
 }
 
@@ -428,10 +465,8 @@ func (h *StateHub[T]) evictStale(prematchTTL, liveTTL time.Duration) []PatchOp {
 		h.snapshotCache = nil
 	}
 	h.stateMu.Unlock()
-	if h.onChange != nil {
-		for i, e := range evicted {
-			h.onChange(evictedKeys[i], e.opp, true, true)
-		}
+	for i, e := range evicted {
+		h.onChange(evictedKeys[i], e.opp, true, true)
 	}
 	return ops
 }
@@ -815,6 +850,12 @@ func main() {
 	bots.tg = tgAlerts
 	bots.logins = setupBotLogins(cfg, acc)
 	bots.loginsAllowHTTP = cfg.BotLoginsAllowHTTP
+	bots.autoPhase = cfg.BotAutoPhase
+	if !slices.Contains([]string{"A", "B", "C"}, bots.autoPhase) {
+		log.Warn().Str("phase", bots.autoPhase).Msg("BOT_AUTO_PHASE unknown; auto mode runs phase A (Off, Log only)")
+		bots.autoPhase = "A"
+	}
+	acc.SetStateHook(bots.autoStateWritten)  // a Hidden change reaches the auto picker
 	reg.codeRevoked = bots.alertsCodeRevoked // a revoked agent is forgotten by the alerts
 	reg.userClosed = bots.alertsUserClosed   // and a disabled user's agents
 	// The window and agent alerts the previous process left open can no longer be resolved by it.
@@ -855,8 +896,10 @@ func main() {
 	// Bot log lines and screenshots: 7 days, pruned at start and hourly
 	go bots.runPrune(ctx)
 
-	// Telegram bot: hook the arb hub before the bridge starts feeding it
+	// Telegram bot and the bots' auto mode: hook the arb hub before the bridge starts feeding it
 	tg := setupTelegram(ctx, cfg, hub, rdb, acc, tgOut)
+	hub.listen(bots.autoObserve)
+	bots.startAuto(ctx, hub)
 
 	// Start NATS→hub bridge
 	go runNATSBridge(ctx, nc, hub)

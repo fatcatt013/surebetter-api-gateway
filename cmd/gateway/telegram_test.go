@@ -17,9 +17,11 @@ import (
 func TestHub_OnChange_ApplyRemoveEvict(t *testing.T) {
 	hub := NewHub(Config{})
 	var got []string
-	hub.onChange = func(key string, _ ArbOpportunity, removed, evicted bool) {
+	hub.listen(func(key string, _ ArbOpportunity, removed, evicted bool) {
 		got = append(got, fmt.Sprintf("%s:%v:%v", key, removed, evicted))
-	}
+	})
+	var second int
+	hub.listen(func(string, ArbOpportunity, bool, bool) { second++ }) // the fan-out: Telegram and the auto picker
 	opp := ArbOpportunity{EventID: "e1", MarketType: "MATCH_WINNER", Sport: "tennis-live"}
 	hub.ApplyOpportunity(opp)
 	hub.RemoveOpportunity(opp)
@@ -28,8 +30,8 @@ func TestHub_OnChange_ApplyRemoveEvict(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 	hub.evictStale(time.Millisecond, time.Millisecond)
 	want := []string{"e1:MATCH_WINNER:0.00:false:false", "e1:MATCH_WINNER:0.00:true:false", "e1:MATCH_WINNER:0.00:false:false", "e1:MATCH_WINNER:0.00:true:true"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("callbacks = %v, want %v", got, want)
+	if !reflect.DeepEqual(got, want) || second != len(want) {
+		t.Fatalf("callbacks = %v (second listener %d), want %v", got, second, want)
 	}
 }
 

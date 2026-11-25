@@ -77,6 +77,9 @@ type botOrderIn struct {
 	// else 2); nil = none (an older app: the order goes strict).
 	MinProfitPct *float64     `json:"min_profit_pct"`
 	Bankroll     *botBankroll `json:"bankroll"` // nil = none (an older app: the order goes strict)
+	// EventID is the arb's match (auto-mode contract §4.2, at most 128 characters); "" = read it from the arb key
+	// (orderEventID).
+	EventID string `json:"event_id"`
 }
 
 // agentLeg is a leg as the agent receives it: the app's leg plus the window the gateway reserved.
@@ -107,6 +110,7 @@ type botOrderMsg struct {
 	MinProfitPct *float64     `json:"min_profit_pct,omitempty"`
 	Bankroll     *botBankroll `json:"bankroll,omitempty"`
 	MaxOrder     int64        `json:"max_order"`
+	Source       string       `json:"source"` // "app" or "auto" (the automatic mode); agents that do not know it ignore it
 }
 
 // orderInfo is an order's display fields and the arb's fields the agent gets (bot_orders.info_json).
@@ -124,6 +128,9 @@ type orderInfo struct {
 	// minimum profit % (0 = none), kept in its own column (bot_orders.min_profit_pct), not in info_json.
 	Bankroll     *botBankroll `json:"bankroll,omitempty"`
 	MinProfitPct float64      `json:"-"`
+	// FirstDetectedAt is the arb's first_detected_at when an auto order was made of it (auto mode's "same prices"
+	// rule reads it back after a restart); 0 for app orders.
+	FirstDetectedAt int64 `json:"firstDetectedAt,omitempty"`
 }
 
 // infoOf is in's display and arb fields as info_json keeps them (rounding 1 when absent), with its
@@ -189,6 +196,12 @@ type botOrder struct {
 	dayChecked   bool
 	accepted     bool // the agent posted "accepted" (a later stop is an order result alert)
 	stuckAlerted bool // its stuck alert was raised (once per order)
+	// source is "app" or "auto" (bot_orders.source); eventID its match (bot_orders.event_id, "" = unknown).
+	source  string
+	eventID string
+	// forceDry: an auto order in auto mode Dry run goes dry whatever the controller's mode (effectiveDryRun).
+	forceDry  bool
+	stuckSeen bool // its first stuck flow was seen (the auto pause trigger, dry runs too)
 }
 
 func (o *botOrder) legsJSON() string {
@@ -199,9 +212,13 @@ func (o *botOrder) legsJSON() string {
 // message is o as an agent receives it under the settings st, its legs in windows ("" = none) at
 // levels (the agent's limit index).
 func (o *botOrder) message(st accounts.BotSettings, windows [2]string, levels [2]int) botOrderMsg {
-	msg := botOrderMsg{OrderID: o.id, ArbKey: o.arbKey, DryRun: st.DryRun, MarketType: o.info.MarketType, Line: o.info.Line,
+	rules := rulesOnList(st.RulesOn)
+	if o.isAuto() { // rule 5 is never on for an auto order (auto-mode decision 6)
+		rules = slices.DeleteFunc(rules, func(id string) bool { return id == ruleGiantError })
+	}
+	msg := botOrderMsg{OrderID: o.id, ArbKey: o.arbKey, DryRun: st.DryRun || o.forceDry, MarketType: o.info.MarketType, Line: o.info.Line,
 		IsLive: o.info.IsLive, Sport: o.info.Sport, Match: o.info.Match, Rounding: o.info.Rounding, MaxLeg: st.MaxLeg,
-		RulesOn: rulesOnList(st.RulesOn), OddsDrop: oddsDropOf(st, o.info), Bankroll: o.info.Bankroll, MaxOrder: st.MaxOrder}
+		RulesOn: rules, OddsDrop: oddsDropOf(st, o.info), Bankroll: o.info.Bankroll, MaxOrder: st.MaxOrder, Source: o.sourceOrApp()}
 	if o.info.MinProfitPct > 0 {
 		min := o.info.MinProfitPct
 		msg.MinProfitPct = &min
@@ -211,6 +228,37 @@ func (o *botOrder) message(st accounts.BotSettings, windows [2]string, levels [2
 		msg.Legs = append(msg.Legs, agentLeg{botLeg: l.botLeg, WindowID: windows[i]})
 	}
 	return msg
+}
+
+// ruleGiantError is rule 5's id (one unhedged leg); auto orders never carry it.
+const ruleGiantError = "giant-error"
+
+// Order sources (bot_orders.source).
+const (
+	sourceApp  = "app"
+	sourceAuto = "auto"
+)
+
+func (o *botOrder) isAuto() bool { return o.source == sourceAuto }
+
+// sourceOrApp is o's source, "app" when unset (an app order, a Try).
+func (o *botOrder) sourceOrApp() string {
+	if o.isAuto() {
+		return sourceAuto
+	}
+	return sourceApp
+}
+
+// orderEventID is an order's match: the body's event_id, else the arb key's first two ":"-separated parts when it
+// has at least four (event ids are "<sport>:<hash>", arb keys "<event_id>:<market_type>:<line>"), else "".
+func orderEventID(in botOrderIn) string {
+	if in.EventID != "" {
+		return in.EventID
+	}
+	if parts := strings.Split(in.ArbKey, ":"); len(parts) >= 4 {
+		return parts[0] + ":" + parts[1]
+	}
+	return ""
 }
 
 // effects is what a hub change must do once b.mu is released: database writes, botEvent messages
@@ -379,10 +427,10 @@ func validTry(o botOrderIn) bool {
 }
 
 // validArbFields checks the fields the agent's rules read: market_type at most 64 and sport at most
-// 40 characters, rounding absent or 1, 10 or 100, each leg's outcome_id at most 120 characters and
+// 40 characters, event_id at most 128, rounding absent or 1, 10 or 100, each leg's outcome_id at most 120 characters and
 // its fair_odds absent, null or above 1.
 func validArbFields(o botOrderIn) bool {
-	if runeLen(o.MarketType) > 64 || runeLen(o.Sport) > 40 || (o.Rounding != nil && *o.Rounding != 1 && *o.Rounding != 10 && *o.Rounding != 100) {
+	if runeLen(o.MarketType) > 64 || runeLen(o.Sport) > 40 || runeLen(o.EventID) > 128 || (o.Rounding != nil && *o.Rounding != 1 && *o.Rounding != 10 && *o.Rounding != 100) {
 		return false
 	}
 	for _, l := range o.Legs {
@@ -477,7 +525,7 @@ func (b *botHub) submitLocked(userID int64, in botOrderIn, fx *effects) (submitt
 		return submitted{}, errBookNotReady
 	}
 	o := &botOrder{id: newOrderID(), userID: userID, arbKey: in.ArbKey, state: orderWaiting, dryRun: st.DryRun, stake: stake,
-		info: infoOf(in), created: now, dayChecked: dayChecked}
+		info: infoOf(in), created: now, dayChecked: dayChecked, source: sourceApp, eventID: orderEventID(in)}
 	o.oddsDrop = oddsDropOf(st, o.info)
 	for _, l := range in.Legs {
 		l.LimitLevel = nil // set from the chosen agent's limit index when it is sent
@@ -486,9 +534,11 @@ func (b *botHub) submitLocked(userID int64, in botOrderIn, fx *effects) (submitt
 	b.orders[o.id] = o
 	if b.acc != nil {
 		row := accounts.BotOrderRow{ID: o.id, UserID: userID, ArbKey: o.arbKey, State: orderWaiting, DryRun: o.dryRun, Stake: stake,
-			InfoJSON: mustJSON(o.info), LegsJSON: o.legsJSON(), CreatedAt: now.UnixMilli(), OddsDrop: o.oddsDrop, MinProfitPct: o.info.MinProfitPct}
+			InfoJSON: mustJSON(o.info), LegsJSON: o.legsJSON(), CreatedAt: now.UnixMilli(), OddsDrop: o.oddsDrop, MinProfitPct: o.info.MinProfitPct,
+			Source: o.source, EventID: o.eventID}
 		fx.write(func() error { return b.acc.InsertBotOrder(row) })
 	}
+	b.autoTrackLocked(o, orderWaiting)
 	fx.notify(userID)
 	b.dispatchLocked(userID, fx)
 	o.dayChecked = false // from now on a live send checks the day limit again
@@ -671,34 +721,53 @@ func (b *botHub) startLocked(o *botOrder, fx *effects) bool {
 				return false
 			}
 		}
-		levels := b.limitLevelsLocked(codeID, o)
-		payload, _ := json.Marshal(struct {
-			Type  string      `json:"type"`
-			Order botOrderMsg `json:"order"`
-		}{"order", o.message(st, wins, levels)})
-		if !p.client.trySend(payload) {
+		if !b.trySendLocked(o, codeID, p, wins, st) {
 			skip[codeID] = true
 			continue
 		}
-		now := b.now()
-		o.state, o.codeID, o.boot, o.sent, o.dryRun, o.reason = orderRunning, codeID, p.boot, now, st.DryRun, ""
-		o.oddsDrop = oddsDropOf(st, o.info)
-		o.deadline = now.Add(orderMemory)
-		for i := range o.legs {
-			o.legs[i].WindowID, o.legs[i].LimitLevel = wins[i], &levels[i]
-			delete(p.idleSince, wins[i])
-		}
-		p.reservedAt = now
 		if b.acc != nil {
-			id, dryRun, oddsDrop, legs := o.id, o.dryRun, o.oddsDrop, o.legsJSON()
-			fx.write(func() error { return b.acc.MarkBotOrderSent(id, codeID, dryRun, oddsDrop, legs, now.UnixMilli()) })
+			id, dryRun, oddsDrop, legs, at := o.id, o.dryRun, o.oddsDrop, o.legsJSON(), o.sent.UnixMilli()
+			fx.write(func() error { return b.acc.MarkBotOrderSent(id, codeID, dryRun, oddsDrop, legs, at) })
 		}
-		b.relayLocked(fx, o, botEventMsg{Event: "sent"})
-		fx.notify(o.userID)
-		log.Info().Int64("user", o.userID).Int64("code", codeID).Str("order_id", o.id).Str("arb_key", o.arbKey).
-			Strs("windows", wins[:]).Bool("dry_run", o.dryRun).Msg("bot order sent")
+		b.sentLocked(o, fx)
 		return true
 	}
+}
+
+// trySendLocked sends o to agent codeID (presence p) for windows wins under the settings st, without blocking. On
+// success o is running there: its agent, boot, send time, mode (the setting, or dry for an auto Dry run), odds-drop
+// mode, deadline, windows and limit levels are set and the windows are no longer idle. false: the socket did not
+// take it (o unchanged). b.mu must be held.
+func (b *botHub) trySendLocked(o *botOrder, codeID int64, p *botPresence, wins [2]string, st accounts.BotSettings) bool {
+	levels := b.limitLevelsLocked(codeID, o)
+	payload, _ := json.Marshal(struct {
+		Type  string      `json:"type"`
+		Order botOrderMsg `json:"order"`
+	}{"order", o.message(st, wins, levels)})
+	if !p.client.trySend(payload) {
+		return false
+	}
+	now := b.now()
+	o.state, o.codeID, o.boot, o.sent, o.dryRun, o.reason = orderRunning, codeID, p.boot, now, st.DryRun || o.forceDry, ""
+	o.oddsDrop = oddsDropOf(st, o.info)
+	o.deadline = now.Add(orderMemory)
+	for i := range o.legs {
+		o.legs[i].WindowID, o.legs[i].LimitLevel = wins[i], &levels[i]
+		delete(p.idleSince, wins[i])
+	}
+	p.reservedAt = now
+	return true
+}
+
+// sentLocked tells the app that o was sent (botEvent "sent", {"type":"bot"}), keeps auto mode's day current and
+// logs it. b.mu must be held.
+func (b *botHub) sentLocked(o *botOrder, fx *effects) {
+	b.relayLocked(fx, o, botEventMsg{Event: "sent"})
+	fx.notify(o.userID)
+	b.autoTrackLocked(o, orderRunning)
+	wins := []string{o.legs[0].WindowID, o.legs[1].WindowID}
+	log.Info().Int64("user", o.userID).Int64("code", o.codeID).Str("order_id", o.id).Str("arb_key", o.arbKey).Str("source", o.sourceOrApp()).
+		Strs("windows", wins).Bool("dry_run", o.dryRun).Msg("bot order sent")
 }
 
 // overSettings is why o may not be sent under st ("" = it may): paused, or over the leg or order limit.
@@ -750,6 +819,17 @@ func (b *botHub) waitReasonLocked(o *botOrder) string {
 	if n := len(b.ordersLocked(o.userID, orderRunning)); n >= st.OrdersAtOnce {
 		return fmt.Sprintf("Orders at once: %d running", n)
 	}
+	missing := b.missingBooksLocked(o)
+	if len(missing) == 1 {
+		return "Needs a free " + bookLabel(missing[0]) + " window"
+	}
+	return "Needs a free " + bookLabel(missing[0]) + " and " + bookLabel(missing[1]) + " window"
+}
+
+// missingBooksLocked is the bookmakers of o's legs the best placed protocol-2 agent (fewest missing, then lowest code
+// id) has no free window of; both legs' books when no agent has them all free (none at all, or one whose socket does
+// not drain). b.mu must be held.
+func (b *botHub) missingBooksLocked(o *botOrder) []string {
 	reserved := b.reservedLocked(o.userID)
 	commanded := b.commandWindowsLocked(o.userID)
 	codes := make([]int64, 0, len(b.agents[o.userID]))
@@ -777,10 +857,7 @@ func (b *botHub) waitReasonLocked(o *botOrder) string {
 	if len(missing) == 0 { // no agent at all, or one whose socket does not drain
 		missing = []string{o.legs[0].Bookmaker, o.legs[1].Bookmaker}
 	}
-	if len(missing) == 1 {
-		return "Needs a free " + bookLabel(missing[0]) + " window"
-	}
-	return "Needs a free " + bookLabel(missing[0]) + " and " + bookLabel(missing[1]) + " window"
+	return missing
 }
 
 // dispatchLocked sends every waiting order of userID that can go now, oldest first (one that
@@ -832,6 +909,8 @@ func (b *botHub) endLocked(o *botOrder, state, reason string, relay bool, fx *ef
 	if pausing {
 		b.pauseLocked(o.userID, "Outcome unknown · order "+shortID(o.id), fx)
 	}
+	b.autoTrackLocked(o, state)
+	b.autoOrderEndedLocked(o, state, fx)
 }
 
 var pauseMsg = []byte(`{"type":"pause"}`)
@@ -893,6 +972,7 @@ func (b *botHub) expireLocked(fx *effects) {
 // tick expires orders and retries every user's waiting orders (the scheduler's 1 s beat).
 func (b *botHub) tick() {
 	b.checkAgentsAfterStart()
+	defer b.autoKick() // the picker's pass over every arb (min age, limits that only need time)
 	b.mu.Lock()
 	fx := &effects{}
 	b.expireLocked(fx)
@@ -1136,11 +1216,18 @@ func (b *botHub) event(userID, codeID int64, in botEventIn, flow string) error {
 		}
 	case "accepted":
 		o.accepted = true
+		b.autoTrackLocked(o, o.state)
 	case "flow":
 		o.flow, ev.Flow = flow, json.RawMessage(flow)
-		if !o.dryRun && !o.stuckAlerted && flowIsStuck(flow) {
+		stuck := flowIsStuck(flow)
+		if !o.dryRun && !o.stuckAlerted && stuck {
 			o.stuckAlerted = true
 			b.alertStuckLocked(o, fx)
+		}
+		if stuck && !o.stuckSeen {
+			o.stuckSeen = true
+			b.autoTrackLocked(o, o.state)
+			b.autoStuckLocked(o, fx)
 		}
 		if d := b.now().Add(orderMemory); d.After(o.deadline) {
 			o.deadline = d // the agent still works on it (a stuck mode may last minutes)
@@ -1216,6 +1303,7 @@ func (b *botHub) recoverOrders() {
 		if pausing {
 			b.pauseLocked(o.UserID, "Outcome unknown · order "+shortID(o.ID), fx)
 		}
+		b.autoPauseLocked(o.UserID, "Outcome unknown · order "+shortID(o.ID), o.ID, o.CodeID, o.DryRun, fx)
 		b.release(fx)
 	}
 }
