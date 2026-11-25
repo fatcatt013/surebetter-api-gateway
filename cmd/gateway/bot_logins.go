@@ -381,14 +381,12 @@ func (b *botHub) handleLoginResult(w http.ResponseWriter, r *http.Request) {
 	windowID := r.PathValue("windowId")
 	row, spread, err := b.acc.SetBotLoginResult(p.CodeID, windowID, in.Result, b.now().UnixMilli(), in.UpdatedAt)
 	if errors.Is(err, accounts.ErrNoLogin) || (row.UserID != 0 && row.UserID != p.UserID) {
+		b.endCode(p.UserID, p.CodeID, windowID) // a prompt opened as the login was deleted
 		accounts.WriteError(w, http.StatusNotFound, "no_login")
 		return
 	}
 	if errors.Is(err, accounts.ErrStaleLogin) {
-		b.mu.Lock()
-		fx := &effects{}
-		b.endPromptLocked(codeKey{p.CodeID, windowID}, fx) // any result ends the window's code prompt, an ignored one too
-		b.release(fx)
+		b.endCode(p.UserID, p.CodeID, windowID) // any result ends the window's code prompt, an ignored one too
 		log.Info().Int64("user", p.UserID).Int64("code", p.CodeID).Str("window", windowID).Str("result", in.Result).
 			Int64("updated_at", *in.UpdatedAt).Int64("row_updated_at", row.UpdatedAt).Msg("bot login result ignored: the login was saved again since")
 		w.WriteHeader(http.StatusNoContent)
@@ -401,7 +399,10 @@ func (b *botHub) handleLoginResult(w http.ResponseWriter, r *http.Request) {
 	}
 	b.mu.Lock()
 	fx := &effects{}
-	b.endPromptLocked(codeKey{p.CodeID, windowID}, fx) // its code alert resolves before the result's own alert
+	// The prompt ends and its code alert resolves before the result's own alert, also a code alert read back after a
+	// restart (no prompt in memory).
+	b.endPromptLocked(codeKey{p.CodeID, windowID}, fx)
+	b.resolveCodeAlertLocked(p.UserID, p.CodeID, windowID, fx)
 	if spread > 0 {
 		b.sendLoginsLocked(p.UserID, p.CodeID)
 	}
@@ -409,6 +410,16 @@ func (b *botHub) handleLoginResult(w http.ResponseWriter, r *http.Request) {
 	fx.notify(p.UserID)
 	b.release(fx)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// endCode ends the window's code prompt and resolves its code alert (also one read back after a restart). Call it
+// without b.mu.
+func (b *botHub) endCode(userID, codeID int64, windowID string) {
+	b.mu.Lock()
+	fx := &effects{}
+	b.endPromptLocked(codeKey{codeID, windowID}, fx)
+	b.resolveCodeAlertLocked(userID, codeID, windowID, fx)
+	b.release(fx)
 }
 
 // loginRemoved deletes codeID's window login after the agent removed the window (its ok to a remove command) and

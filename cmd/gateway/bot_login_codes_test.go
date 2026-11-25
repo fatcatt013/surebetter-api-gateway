@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -97,8 +98,8 @@ func newCodeRig(t *testing.T) (*loginRig, *websocket.Conn, func() ([]string, []b
 func TestLoginCodes_Open(t *testing.T) {
 	r := newLoginRig(t)
 	exp := r.clk.now().Add(5 * time.Minute).UnixMilli()
-	if s, b := r.openPrompt("tipsport-1", 6, exp); s != 409 || !strings.Contains(b, `"agent_offline"`) {
-		t.Fatalf("no socket: %d %s", s, b)
+	if s, b := r.openPrompt("tipsport-1", 6, exp); s != 404 || !strings.Contains(b, `"no_login"`) {
+		t.Fatalf("no socket, no login: %d %s", s, b)
 	}
 	old := r.dialAgent(true, 5)
 	if s, b := r.openPrompt("tipsport-1", 6, exp); s != 409 || !strings.Contains(b, `"agent_update"`) {
@@ -244,8 +245,7 @@ func TestLoginCodes_SubmitFetchWrong(t *testing.T) {
 		t.Fatalf("bad prompt id: %d %s", s, b)
 	}
 	// The agent offline, or on plain ws: agent_offline (after every other check).
-	id2 := r.mustPrompt("tipsport-2", 6)
-	_ = id2
+	r.mustPrompt("tipsport-2", 6)
 	agent.Close(websocket.StatusNormalClosure, "")
 	waitBot(t, r.bots, r.uid, false)
 	if s, b := r.submit("tipsport-2", "123456"); s != 409 || !strings.Contains(b, `"agent_offline"`) {
@@ -351,15 +351,46 @@ func TestLoginCodes_PromptEnds(t *testing.T) {
 	}
 }
 
-func TestLoginCodes_RevokeEndsPrompts(t *testing.T) {
-	r, _, _ := newCodeRig(t)
+func TestLoginCodes_RevokeAndDisableEndPrompts(t *testing.T) {
+	r, _, drain := newCodeRig(t)
 	r.mustPrompt("tipsport-1", 6)
-	r.bots.reg.CloseCode(r.agent) // what a revoke calls
+	drain()
+	if err := r.svc.RevokeExtensionCode(r.uid, r.agent); err != nil {
+		t.Fatal(err)
+	}
 	r.bots.mu.Lock()
 	n := len(r.bots.codes)
 	r.bots.mu.Unlock()
+	types, alerts := drain()
+	if n != 0 || len(alerts) != 1 || alerts[0].Title != titleCodeNeeded || alerts[0].ResolvedAt == 0 || !strings.Contains(strings.Join(types, ","), "bot") {
+		t.Fatalf("after revoke: %d prompts, %v %+v", n, types, alerts)
+	}
+	// A disabled user's prompts end too.
+	other, _ := r.svc.CreateCode(r.uid, "Other", accounts.KindBot)
+	r.bots.mu.Lock()
+	r.bots.codes[codeKey{other.ID, "betano-1"}] = &codePrompt{id: "cccccccccccccccc", userID: r.uid, codeID: other.ID, windowID: "betano-1",
+		digits: 4, expiresAt: r.clk.now().Add(time.Minute), state: codeStateWaiting}
+	r.bots.mu.Unlock()
+	inv, _ := r.svc.CreateInvite(0, accounts.RoleAdmin)
+	admin, _, err := r.svc.Register("10.0.0.1", inv.Code, "admin@example.com", "correct horse battery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.bots.reg.mu.Lock()
+	for c := range r.bots.reg.clients {
+		if c.conn == nil { // the app channel: CloseUser would close it as a socket
+			delete(r.bots.reg.clients, c)
+		}
+	}
+	r.bots.reg.mu.Unlock()
+	if err := r.svc.SetDisabled(admin.UserID, r.uid, true); err != nil {
+		t.Fatal(err)
+	}
+	r.bots.mu.Lock()
+	n = len(r.bots.codes)
+	r.bots.mu.Unlock()
 	if n != 0 {
-		t.Fatalf("prompts after revoke: %d", n)
+		t.Fatalf("prompts after disable: %d", n)
 	}
 }
 
@@ -372,6 +403,7 @@ func TestLoginCodes_AfterARestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.b.loadLoginAlerts()
+	r.attach()
 	pr := &codePrompt{id: "aaaaaaaaaaaaaaaa", userID: r.uid, codeID: r.code.ID, windowID: "fortuna-1", digits: 6,
 		expiresAt: r.clk.now().Add(time.Minute), state: codeStateWaiting}
 	r.b.mu.Lock()
@@ -402,12 +434,11 @@ func TestLoginCodes_AfterARestart(t *testing.T) {
 	if len(got) != 2 || got[0].Title != "Log in needed" || got[0].ResolvedAt == 0 || got[1].Title != titleCodeNeeded {
 		t.Fatalf("superseded: %+v", got)
 	}
-	// Telegram link: the window's Fleet row.
-	if jobs := r.out.take(); len(jobs) != 0 {
-		_ = jobs
-	}
-	if p := alertPath(got[1]); p != "/app/bots/fleet?agent="+i64s(r.code.ID)+"&window=fortuna-2" {
-		t.Fatalf("link: %s", p)
+	// Telegram: the line and the link to the window's Fleet row.
+	want := "⚠️ SMS code needed · Fortuna 2 (Home PC) · " + time.UnixMilli(got[1].CreatedAt).In(prague).Format("15:04") +
+		"\nhttps://sb.example/app/bots/fleet?agent=" + i64s(r.code.ID) + "&window=fortuna-2"
+	if txt := alertText(got[1], "https://sb.example", prague); txt != want {
+		t.Fatalf("telegram text:\n%s\nwant\n%s", txt, want)
 	}
 	if p := alertPath(botAlert{Title: "Log in needed", AgentID: 3, WindowID: "fortuna-2"}); p != "/app/bots/fleet" {
 		t.Fatalf("other login alert link: %s", p)
@@ -436,5 +467,127 @@ func TestLoginCodes_NeverLogged(t *testing.T) {
 	}
 	if strings.Contains(out, code) {
 		t.Fatalf("the code in the log:\n%s", out)
+	}
+}
+
+// An agent with no bot socket, or whose socket has posted no status yet (right after a gateway restart), may open its
+// prompt again; a status of protocol 1–5 may not.
+func TestLoginCodes_OpenWithoutAStatus(t *testing.T) {
+	r := newLoginRig(t)
+	r.put("tipsport-1", "jan", "p1")
+	if s, b := r.openPrompt("tipsport-1", 6, r.clk.now().Add(time.Minute).UnixMilli()); s != 200 {
+		t.Fatalf("no socket: %d %s", s, b)
+	}
+	conn, _, err := dial(t, r.srv, "/ws?ticket="+wsTicket(t, r.srv, r.code)+"&feed=0&bot=1", http.Header{"X-Forwarded-Proto": {"https"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	waitBot(t, r.bots, r.uid, true)
+	drain := r.appChan()
+	if s, b := r.openPrompt("tipsport-1", 6, r.clk.now().Add(time.Minute).UnixMilli()); s != 200 {
+		t.Fatalf("socket without a status: %d %s", s, b)
+	}
+	if _, alerts := drain(); len(alerts) != 0 {
+		t.Fatalf("the reopened prompt alerted again: %+v", alerts)
+	}
+}
+
+func TestLoginCodes_SubmitCheckOrder(t *testing.T) {
+	r, agent, _ := newCodeRig(t)
+	id := r.mustPrompt("tipsport-1", 6)
+	r.submit("tipsport-1", "123456")
+	readJSON(t, agent)
+	agent.Close(websocket.StatusNormalClosure, "")
+	waitBot(t, r.bots, r.uid, false)
+	// Offline, yet the earlier checks answer first: digits before code_pending before agent_offline.
+	if s, b := r.submit("tipsport-1", "1234"); s != 400 || !strings.Contains(b, `"bad_code"`) {
+		t.Fatalf("digits first: %d %s", s, b)
+	}
+	if s, b := r.submit("tipsport-1", "123456"); s != 409 || !strings.Contains(b, `"code_pending"`) {
+		t.Fatalf("code_pending before agent_offline: %d %s", s, b)
+	}
+	// A late wrong report while a code waits (not checked) changes nothing.
+	if s, b := r.wrong("tipsport-1", id); s != 200 || strings.TrimSpace(b) != `{"triesLeft":2}` {
+		t.Fatalf("wrong while sent: %d %s", s, b)
+	}
+	if s, b := r.fetch("tipsport-1", id); s != 200 || !strings.Contains(b, "123456") {
+		t.Fatalf("the waiting code was dropped: %d %s", s, b)
+	}
+	r.bots.mu.Lock()
+	r.bots.codes[codeKey{r.agent, "tipsport-1"}].tries, r.bots.codes[codeKey{r.agent, "tipsport-1"}].state = 3, codeStateWaiting
+	r.bots.mu.Unlock()
+	if s, b := r.submit("tipsport-1", "123456"); s != 429 || !strings.Contains(b, `"too_many_codes"`) {
+		t.Fatalf("too_many_codes before agent_offline: %d %s", s, b)
+	}
+}
+
+func TestLoginCodes_SubmitAfterExpiresAt(t *testing.T) {
+	r, _, _ := newCodeRig(t)
+	s, b := r.openPrompt("tipsport-1", 6, r.clk.now().Add(time.Minute).UnixMilli())
+	if s != 200 {
+		t.Fatalf("open: %d %s", s, b)
+	}
+	r.clk.advance(time.Minute)
+	if s, b := r.submit("tipsport-1", "123456"); s != 404 || !strings.Contains(b, `"no_prompt"`) {
+		t.Fatalf("after expiresAt: %d %s", s, b)
+	}
+	if p := r.prompts(); len(p) != 1 {
+		t.Fatalf("listed until expiresAt + 30 s: %+v", p)
+	}
+}
+
+func TestLoginCodes_EveryChangeTellsTheApp(t *testing.T) {
+	r, agent, drain := newCodeRig(t)
+	bots := func(what string) {
+		t.Helper()
+		types, _ := drain()
+		if !strings.Contains(strings.Join(types, ","), "bot") {
+			t.Fatalf("%s: %v", what, types)
+		}
+	}
+	id := r.mustPrompt("tipsport-1", 6)
+	bots("open")
+	r.submit("tipsport-1", "123456")
+	readJSON(t, agent)
+	bots("sent")
+	r.fetch("tipsport-1", id)
+	bots("checking")
+	r.wrong("tipsport-1", id)
+	bots("wrong")
+	r.agentReq("POST", "/api/me/bot/logins/tipsport-1/result", `{"result":"ok"}`)
+	bots("end")
+}
+
+// After a gateway restart: the code alert read back, no prompt in memory, the agent posts its result: the code alert
+// resolves and the result's own alert is raised. A read-back code alert nobody reopens resolves on its own after 6 min.
+func TestLoginCodes_ResultAfterARestart(t *testing.T) {
+	r, _, drain := newCodeRig(t)
+	insert := func(id, window string, at int64) {
+		if err := r.svc.InsertBotAlert(accounts.BotAlertRow{ID: id, UserID: r.uid, Kind: alertAttention, Severity: severityAttention,
+			AgentCodeID: r.agent, WindowID: window, Title: titleCodeNeeded, Detail: "x", CreatedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("aaaaaaaaaaaaaaaa", "tipsport-1", r.clk.now().UnixMilli())
+	insert("bbbbbbbbbbbbbbbb", "tipsport-2", r.clk.now().UnixMilli())
+	r.bots.loadLoginAlerts()
+	if s, _ := r.agentReq("POST", "/api/me/bot/logins/tipsport-1/result", `{"result":"code"}`); s != 204 {
+		t.Fatal("result")
+	}
+	_, alerts := drain()
+	if len(alerts) != 2 || alerts[0].ID != "aaaaaaaaaaaaaaaa" || alerts[0].ResolvedAt == 0 || alerts[1].Title != "Log in needed" ||
+		alerts[1].Detail != "Tipsport 1 (Test) · code asked" {
+		t.Fatalf("alerts: %+v", alerts)
+	}
+	r.clk.advance(codePromptAhead + codePromptGrace - time.Millisecond)
+	r.bots.tick()
+	if _, alerts := drain(); len(alerts) != 0 {
+		t.Fatalf("resolved early: %+v", alerts)
+	}
+	r.clk.advance(time.Millisecond)
+	r.bots.tick()
+	if _, alerts := drain(); len(alerts) != 1 || alerts[0].ID != "bbbbbbbbbbbbbbbb" || alerts[0].ResolvedAt == 0 {
+		t.Fatalf("stale code alert: %+v", alerts)
 	}
 }
