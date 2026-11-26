@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 )
 
 // Each window's balance (bot balance contract 2026-11-26): a protocol-7 agent reports the money its bookmaker's header
@@ -64,4 +65,54 @@ func balancesOf(ws []botWindow, proto int) {
 			ws[i].Balance = &botBalance{Null: true}
 		}
 	}
+}
+
+// freshBalance: bl is a known read at most balanceFreshMs old.
+func (b *botHub) freshBalance(bl *botBalance) bool {
+	return bl != nil && !bl.Null && b.now().UnixMilli()-bl.At <= balanceFreshMs
+}
+
+// canPay: window w of agent p can take a leg of stake Kč: always for an agent below balanceProto (exempt), else when
+// its balance is fresh and at least the stake.
+func (b *botHub) canPay(p *botPresence, w *botWindow, stake float64) bool {
+	return p.proto < balanceProto || (b.freshBalance(w.Balance) && w.Balance.Amount >= stake)
+}
+
+// balanceShort is a leg whose book has free windows (idle, unreserved, no command) none of which can pay its stake.
+type balanceShort struct {
+	book   string
+	stake  float64
+	fresh  bool    // one of those windows has a fresh known balance
+	amount float64 // the largest such balance
+}
+
+// shortOf is the balanceShort of a leg of book and stake over its free windows ws (all unable to pay).
+func (b *botHub) shortOf(book string, stake float64, ws []*botWindow) *balanceShort {
+	s := &balanceShort{book: book, stake: stake}
+	for _, w := range ws {
+		if b.freshBalance(w.Balance) && (!s.fresh || w.Balance.Amount > s.amount) {
+			s.fresh, s.amount = true, w.Balance.Amount
+		}
+	}
+	return s
+}
+
+// floorKc is v rounded down to whole crowns.
+func floorKc(v float64) int64 { return int64(math.Floor(v)) }
+
+// waitText is an app order's waiting reason: "Not enough money at <Book> (<amount> Kč)" or "<Book> balance unknown".
+func (s *balanceShort) waitText() string {
+	if s.fresh {
+		return "Not enough money at " + bookLabel(s.book) + " (" + fmtKc(floorKc(s.amount)) + " Kč)"
+	}
+	return bookLabel(s.book) + " balance unknown"
+}
+
+// skipReason is the picker's reason code and text: balance_low ("Not enough money at <Book>: <amount> < <stake> Kč")
+// or balance_unknown ("<Book> balance unknown").
+func (s *balanceShort) skipReason() (string, string) {
+	if s.fresh {
+		return "balance_low", "Not enough money at " + bookLabel(s.book) + ": " + fmtKc(floorKc(s.amount)) + " < " + fmtKc(floorKc(s.stake)) + " Kč"
+	}
+	return "balance_unknown", bookLabel(s.book) + " balance unknown"
 }

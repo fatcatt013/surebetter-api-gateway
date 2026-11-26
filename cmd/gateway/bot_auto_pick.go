@@ -619,7 +619,10 @@ func (b *botHub) autoStage2Locked(userID int64, opp ArbOpportunity, r arbfilter.
 		o.legs = append(o.legs, storedLeg{botLeg: l})
 	}
 	noWindow := func() autoLogLine {
-		missing := b.missingBooksLocked(o)
+		missing, short := b.blockedLocked(o)
+		if short != nil {
+			return skip(short.skipReason())
+		}
 		if len(missing) == 1 {
 			return skip("no_free_window", "No free "+bookLabel(missing[0])+" window")
 		}

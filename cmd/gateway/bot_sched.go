@@ -635,15 +635,27 @@ func (b *botHub) ordersLocked(userID int64, state string) []*botOrder {
 	return out
 }
 
-// freeWindowLocked is the agent's window of book to use: idle, not reserved, no window command
-// pending for it, the one idle longest (gateway time of the first status that showed it idle and
-// unreserved), then the lowest number. "" = none. b.mu must be held.
-func (b *botHub) freeWindowLocked(p *botPresence, book string, reserved map[string]string, commanded map[string]bool) string {
-	var pick *botWindow
-	var pickSince time.Time
+// idleWindows is the agent's windows of book that are free as far as the scheduler goes: idle, not reserved, no window
+// command pending for it.
+func (p *botPresence) idleWindows(book string, reserved map[string]string, commanded map[string]bool) []*botWindow {
+	var out []*botWindow
 	for i := range p.windows {
 		w := &p.windows[i]
-		if w.Bookmaker != book || w.State != "idle" || reserved[w.ID] != "" || commanded[w.ID] {
+		if w.Bookmaker == book && w.State == "idle" && reserved[w.ID] == "" && !commanded[w.ID] {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// freeWindowLocked is the agent's window of book to use for a leg of stake Kč: one of idleWindows that can pay the
+// stake (canPay: every window of an agent below protocol 7), the one idle longest (gateway time of the first status
+// that showed it idle and unreserved), then the lowest number. "" = none. b.mu must be held.
+func (b *botHub) freeWindowLocked(p *botPresence, book string, stake float64, reserved map[string]string, commanded map[string]bool) string {
+	var pick *botWindow
+	var pickSince time.Time
+	for _, w := range p.idleWindows(book, reserved, commanded) {
+		if !b.canPay(p, w, stake) {
 			continue
 		}
 		since, ok := p.idleSince[w.ID]
@@ -672,8 +684,8 @@ func (b *botHub) pickLocked(o *botOrder, reserved map[int64]map[string]string, s
 		if skip[codeID] || p.proto < botProto {
 			continue
 		}
-		w0 := b.freeWindowLocked(p, o.legs[0].Bookmaker, reserved[codeID], commanded[codeID])
-		w1 := b.freeWindowLocked(p, o.legs[1].Bookmaker, reserved[codeID], commanded[codeID])
+		w0 := b.freeWindowLocked(p, o.legs[0].Bookmaker, o.legs[0].Stake, reserved[codeID], commanded[codeID])
+		w1 := b.freeWindowLocked(p, o.legs[1].Bookmaker, o.legs[1].Stake, reserved[codeID], commanded[codeID])
 		if w0 == "" || w1 == "" {
 			continue
 		}
@@ -811,25 +823,30 @@ func (b *botHub) overDayLocked(o *botOrder, st accounts.BotSettings, fx *effects
 	return o.stake > st.PerDay-used, nil
 }
 
-// waitReasonLocked says why o cannot go now: "Orders at once: <n> running", else the bookmakers
-// the best placed protocol-2 agent (fewest missing, then lowest code id) has no free window of:
-// "Needs a free <Book> window" or "Needs a free <Book> and <Book> window". b.mu must be held.
+// waitReasonLocked says why o cannot go now: "Orders at once: <n> running", else what the best placed protocol-2 agent
+// (blockedLocked) lacks: money at the first leg's book whose free windows cannot pay ("Not enough money at <Book>
+// (<amount> Kč)" or "<Book> balance unknown"), else a free window: "Needs a free <Book> window" or "Needs a free
+// <Book> and <Book> window". b.mu must be held.
 func (b *botHub) waitReasonLocked(o *botOrder) string {
 	st := b.settingsLocked(o.userID)
 	if n := len(b.ordersLocked(o.userID, orderRunning)); n >= st.OrdersAtOnce {
 		return fmt.Sprintf("Orders at once: %d running", n)
 	}
-	missing := b.missingBooksLocked(o)
+	missing, short := b.blockedLocked(o)
+	if short != nil {
+		return short.waitText()
+	}
 	if len(missing) == 1 {
 		return "Needs a free " + bookLabel(missing[0]) + " window"
 	}
 	return "Needs a free " + bookLabel(missing[0]) + " and " + bookLabel(missing[1]) + " window"
 }
 
-// missingBooksLocked is the bookmakers of o's legs the best placed protocol-2 agent (fewest missing, then lowest code
-// id) has no free window of; both legs' books when no agent has them all free (none at all, or one whose socket does
-// not drain). b.mu must be held.
-func (b *botHub) missingBooksLocked(o *botOrder) []string {
+// blockedLocked is the bookmakers of o's legs the best placed protocol-2 agent (fewest missing, then lowest code id)
+// has no free window of that can pay the leg's stake; both legs' books when no agent has them all (none at all, or
+// one whose socket does not drain). short: for that agent, the first leg (order of o.legs) whose book has free
+// windows none of which can pay (nil = none such). b.mu must be held.
+func (b *botHub) blockedLocked(o *botOrder) ([]string, *balanceShort) {
 	reserved := b.reservedLocked(o.userID)
 	commanded := b.commandWindowsLocked(o.userID)
 	codes := make([]int64, 0, len(b.agents[o.userID]))
@@ -838,6 +855,7 @@ func (b *botHub) missingBooksLocked(o *botOrder) []string {
 	}
 	slices.Sort(codes)
 	var missing []string
+	var short *balanceShort
 	found := false
 	for _, codeID := range codes {
 		p := b.agents[o.userID][codeID]
@@ -845,19 +863,24 @@ func (b *botHub) missingBooksLocked(o *botOrder) []string {
 			continue
 		}
 		var m []string
+		var sh *balanceShort
 		for _, l := range o.legs {
-			if b.freeWindowLocked(p, l.Bookmaker, reserved[codeID], commanded[codeID]) == "" {
-				m = append(m, l.Bookmaker)
+			if b.freeWindowLocked(p, l.Bookmaker, l.Stake, reserved[codeID], commanded[codeID]) != "" {
+				continue
+			}
+			m = append(m, l.Bookmaker)
+			if ws := p.idleWindows(l.Bookmaker, reserved[codeID], commanded[codeID]); sh == nil && len(ws) > 0 {
+				sh = b.shortOf(l.Bookmaker, l.Stake, ws)
 			}
 		}
 		if !found || len(m) < len(missing) {
-			found, missing = true, m
+			found, missing, short = true, m, sh
 		}
 	}
 	if len(missing) == 0 { // no agent at all, or one whose socket does not drain
-		missing = []string{o.legs[0].Bookmaker, o.legs[1].Bookmaker}
+		missing, short = []string{o.legs[0].Bookmaker, o.legs[1].Bookmaker}, nil
 	}
-	return missing
+	return missing, short
 }
 
 // dispatchLocked sends every waiting order of userID that can go now, oldest first (one that

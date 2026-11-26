@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"nhooyr.io/websocket"
 
@@ -101,4 +102,160 @@ func TestBotBalance_FleetEncoding(t *testing.T) {
 			t.Fatalf("offline window %d: %s %s", i, w["state"], w["balance"])
 		}
 	}
+}
+
+// The enough-money rule: an exempt agent's window always pays; a protocol-7 window needs a fresh known balance of at
+// least the stake (12 min inclusive).
+func TestBotBalance_CanPay(t *testing.T) {
+	b := newBotHub(nil, nil)
+	clk := &botClock{t: time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)}
+	b.now = clk.now
+	now := clk.now().UnixMilli()
+	cases := []struct {
+		name  string
+		proto int
+		bal   *botBalance
+		stake float64
+		want  bool
+	}{
+		{"protocol 6 without a balance", 6, nil, 500, true},
+		{"protocol 7 null", 7, &botBalance{Null: true}, 500, false},
+		{"protocol 7 none", 7, nil, 500, false},
+		{"fresh, exactly the stake", 7, &botBalance{Amount: 500, At: now}, 500, true},
+		{"fresh, more", 7, &botBalance{Amount: 4230.5, At: now}, 500, true},
+		{"fresh, low", 7, &botBalance{Amount: 499.99, At: now}, 500, false},
+		{"12 min old", 7, &botBalance{Amount: 1000, At: now - balanceFreshMs}, 500, true},
+		{"12 min and 1 ms old", 7, &botBalance{Amount: 1000, At: now - balanceFreshMs - 1}, 500, false},
+		{"stale but exempt", 6, &botBalance{Amount: 1000, At: 0}, 500, true},
+	}
+	for _, c := range cases {
+		p := &botPresence{proto: c.proto}
+		if got := b.canPay(p, &botWindow{Balance: c.bal}, c.stake); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// Two agents, one exempt (protocol 6) and one of protocol 7 whose Tipsport window cannot pay: the order goes to the
+// exempt one, although the other would be picked first (it connected first).
+func TestBotSched_BalanceMixedAgents(t *testing.T) {
+	srv, svc, _ := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	now := time.Now().UnixMilli()
+	a, _ := newBotCode(t, srv, token, "A")
+	b, _ := newBotCode(t, srv, token, "B")
+	botA := startAgentWith(t, srv, a, protoStatus(7, winBal("tipsport", 1, "idle", bal(50, now)), winBal("betano", 1, "idle", bal(5000, now))), app)
+	botB := startAgentWith(t, srv, b, protoStatus(6, win("tipsport", 1, "idle"), win("betano", 1, "idle")), app)
+	ans := postOrderOK(t, srv, token, tipBetOrder("arb-1")) // 100 / 102
+	if ans.State != "sent" {
+		t.Fatalf("order %+v, want sent", ans)
+	}
+	if o := readOrder(t, botB); o.OrderID != ans.OrderID {
+		t.Fatalf("exempt agent got %+v", o)
+	}
+	expectNoMessage(t, botA, "the agent that cannot pay")
+}
+
+// An app order waits for money with the §3.2 texts and goes on the status whose fresh read covers the stake.
+func TestBotSched_WaitsForMoneyThenGoes(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	clk := &botClock{t: time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now
+	now := clk.now().UnixMilli()
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	code := newCode(t, srv, token, "bot")
+	tip := func(balance string) string {
+		return protoStatus(7, winBal("tipsport", 1, "idle", balance), winBal("tipsport", 2, "idle", bal(100, now)),
+			winBal("betano", 1, "idle", bal(5000, now)))
+	}
+	bot := startAgentWith(t, srv, code, tip(bal(412.9, now)), app)
+	a := postOrderOK(t, srv, token, orderJSON("arb-1", legJSON("tipsport", "s1", 2.1, 500), legJSON("betano", "s2", 2.05, 102)))
+	if a.State != "waiting" || a.Reason != "Not enough money at Tipsport (412 Kč)" {
+		t.Fatalf("order %+v", a)
+	}
+	expectEvent(t, app, a.OrderID, "waiting", "Not enough money at Tipsport (412 Kč)")
+	expectBot(t, app, "on the waiting order")
+	post := func(body string) {
+		t.Helper()
+		if s, b := postStatus(t, srv, code, body); s != 204 {
+			t.Fatalf("status: %d %s", s, b)
+		}
+	}
+	// The largest fresh balance of the book's free windows; a stale one does not count.
+	post(protoStatus(7, winBal("tipsport", 1, "idle", bal(12000.5, now-balanceFreshMs-1)), winBal("tipsport", 2, "idle", bal(499, now)),
+		winBal("betano", 1, "idle", bal(5000, now))))
+	expectEvent(t, app, a.OrderID, "waiting", "Not enough money at Tipsport (499 Kč)")
+	post(tip("null"))
+	expectEvent(t, app, a.OrderID, "waiting", "Not enough money at Tipsport (100 Kč)")
+	post(protoStatus(7, winBal("tipsport", 1, "idle", "null"), winBal("tipsport", 2, "idle", bal(12000, now-balanceFreshMs-1)),
+		winBal("betano", 1, "idle", bal(5000, now))))
+	expectEvent(t, app, a.OrderID, "waiting", "Tipsport balance unknown")
+	// A covering fresh read: it goes, on that window.
+	clk.advance(time.Second)
+	post(tip(bal(500, clk.now().UnixMilli())))
+	expectEvent(t, app, a.OrderID, "sent", "")
+	if o := readOrder(t, bot); o.OrderID != a.OrderID || o.Legs[0].WindowID != "tipsport-1" {
+		t.Fatalf("agent got %+v", o)
+	}
+}
+
+// status7 posts the agent's windows as a protocol-7 status.
+func (e *autoEnv) status7(windows ...string) {
+	e.t.Helper()
+	if s, b := postStatus(e.t, e.srv, e.code, protoStatus(7, windows...)); s != 204 {
+		e.t.Fatalf("status: %d %s", s, b)
+	}
+}
+
+// The picker's balance reasons in place of no_free_window (Dry run and Log only alike), the first leg first; an
+// exempt agent sends.
+func TestAuto_BalanceReasons(t *testing.T) {
+	e := newAutoEnv(t, "B")
+	e.agent()
+	now := e.clk.now().UnixMilli()
+	// 2.1 / 2.1 split 25 000: 12 500 / 12 500.
+	e.setAuto("dry", "", `{"mode":"split","total":25000,"max_leg":0,"anchor_book":null,"rounding":1}`, "")
+	tip := func(state, balance string) string { return winBal("tipsport", 1, state, balance) }
+	fort := func(state, balance string) string { return winBal("fortuna", 1, state, balance) }
+	steps := []struct {
+		tip, fort    string
+		reason, text string
+	}{
+		{tip("idle", bal(12000.7, now)), fort("idle", bal(20000, now)), "balance_low", "Not enough money at Tipsport: 12 000 < 12 500 Kč"},
+		{tip("idle", "null"), fort("idle", bal(20000, now)), "balance_unknown", "Tipsport balance unknown"},
+		{tip("idle", bal(20000, now-balanceFreshMs-1)), fort("idle", bal(20000, now)), "balance_unknown", "Tipsport balance unknown"},
+		{tip("idle", "null"), fort("idle", bal(10, now)), "balance_unknown", "Tipsport balance unknown"},
+		{tip("idle", bal(412, now)), fort("idle", "null"), "balance_low", "Not enough money at Tipsport: 412 < 12 500 Kč"},
+		{tip("busy", bal(20000, now)), fort("idle", bal(10, now)), "balance_low", "Not enough money at Fortuna: 10 < 12 500 Kč"},
+		{tip("busy", bal(20000, now)), fort("idle", bal(20000, now)), "no_free_window", "No free Tipsport window"},
+	}
+	for i, s := range steps {
+		e.status7(s.tip, s.fort)
+		e.expect(e.arb2(fmt.Sprintf("tennis-live:s%d", i), "T", 1), s.reason, s.text)
+	}
+	if e.orderCount() != 0 {
+		t.Fatal("no order is kept for a window that cannot pay")
+	}
+	// Log only: the same rule.
+	e.bots.autoPhase = "A"
+	e.setAuto("log", "", `{"mode":"split","total":25000,"max_leg":0,"anchor_book":null,"rounding":1}`, "")
+	e.status7(tip("idle", bal(12000, now)), fort("idle", bal(20000, now)))
+	e.expect(e.arb2("tennis-live:log", "T", 1), "balance_low", "Not enough money at Tipsport: 12 000 < 12 500 Kč")
+	e.status7(tip("idle", bal(12500, now)), fort("idle", bal(12500, now)))
+	if l := e.expect(e.arb2("tennis-live:log2", "T", 1), "", ""); l.Kind != "would_send" {
+		t.Fatalf("exactly the stake: %+v", l)
+	}
+	// Dry run with covering balances: sent. An exempt agent (protocol 6) sends without balances.
+	e.bots.autoPhase = "B"
+	e.setAuto("dry", "", `{"mode":"split","total":25000,"max_leg":0,"anchor_book":null,"rounding":1}`, "")
+	e.sendNext(e.arb2("tennis-live:ok", "T", 1))
+	e2 := newAutoEnv(t, "B")
+	e2.agent()
+	if s, b := postStatus(t, e2.srv, e2.code, protoStatus(6, tip("idle", bal(1, 0)), fort("idle", "null"))); s != 204 {
+		t.Fatalf("status: %d %s", s, b)
+	}
+	e2.setAuto("dry", "", `{"mode":"split","total":25000,"max_leg":0,"anchor_book":null,"rounding":1}`, "")
+	e2.sendNext(e2.arb2("tennis-live:ok", "T", 1))
 }

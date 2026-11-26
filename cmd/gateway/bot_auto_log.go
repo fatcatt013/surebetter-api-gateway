@@ -18,7 +18,7 @@ var autoReasonCodes = []string{
 	"hidden", "no_selection_id", "bots_paused", "auto_paused", "match_placed", "match_blocked", "order_open", "match_running",
 	"match_cooldown", "same_prices", "arb_attempts", "rounded_below_min", "stake_under_min", "stake_over_max", "limit_leg",
 	"limit_order", "auto_day_count", "auto_day_stake", "book_day_stake", "limit_day", "auto_at_once", "orders_at_once", "gap",
-	"no_agent", "no_free_window",
+	"no_agent", "no_free_window", "balance_low", "balance_unknown",
 }
 
 // autoLogLeg is one leg of a log line: its stake is 0 when the reason came before the sizing.
