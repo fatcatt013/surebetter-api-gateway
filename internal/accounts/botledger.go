@@ -147,11 +147,25 @@ func (s *Service) InsertBotLedgerLegs(legs []BotLedgerLeg) error {
 	return tx.Commit()
 }
 
+const ledgerColumns = `order_id, leg, user_id, code_id, window_id, bookmaker, source, match, market, market_type, line, label,
+	odds, stake, placed_at, voidable, COALESCE(ticket_id, ''), result, payout, settled_at, result_source, updated_at`
+
 // BotLedgerLegs returns every ledger leg of userID, by order id and leg.
 func (s *Service) BotLedgerLegs(userID int64) ([]BotLedgerLeg, error) {
-	rows, err := s.db.Query(`SELECT order_id, leg, user_id, code_id, window_id, bookmaker, source, match, market, market_type, line, label,
-			odds, stake, placed_at, voidable, COALESCE(ticket_id, ''), result, payout, settled_at, result_source, updated_at
-		FROM bot_ledger_legs WHERE user_id = ? ORDER BY order_id, leg`, userID)
+	return scanLedger(s.db.Query(`SELECT `+ledgerColumns+` FROM bot_ledger_legs WHERE user_id = ? ORDER BY order_id, leg`, userID))
+}
+
+// BotLedgerLegOf returns userID's ledger leg (orderID, leg); found false when there is none.
+func (s *Service) BotLedgerLegOf(userID int64, orderID string, leg int) (BotLedgerLeg, bool, error) {
+	legs, err := scanLedger(s.db.Query(`SELECT `+ledgerColumns+` FROM bot_ledger_legs WHERE user_id = ? AND order_id = ? AND leg = ?`,
+		userID, orderID, leg))
+	if err != nil || len(legs) == 0 {
+		return BotLedgerLeg{}, false, err
+	}
+	return legs[0], true, nil
+}
+
+func scanLedger(rows *sql.Rows, err error) ([]BotLedgerLeg, error) {
 	if err != nil {
 		return nil, err
 	}

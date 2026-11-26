@@ -67,12 +67,13 @@ func legPayout(result string, stake, odds float64, cashed *float64) *float64 {
 const pendingAfterMs = 24 * 3600 * 1000
 
 // ledgerOrder is one order as the bankroll reads it: its stored row and info, its ledger legs (by leg index; none
-// for an order that only needs a check) and whether it needs a check (outcome_unknown or a stuck last flow).
+// for an order that only needs a check), its stored legs and whether it needs a check (outcome_unknown or a stuck last flow).
 type ledgerOrder struct {
-	row   accounts.BotOrderRow
-	info  orderInfo
-	legs  []accounts.BotLedgerLeg
-	check bool
+	row    accounts.BotOrderRow
+	info   orderInfo
+	stored []storedLeg // the order's legs as bot_orders keeps them
+	legs   []accounts.BotLedgerLeg
+	check  bool
 }
 
 // orderEval is an order's state for the bankroll at one time.
