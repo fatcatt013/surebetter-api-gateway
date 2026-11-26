@@ -850,6 +850,12 @@ func main() {
 	bots.tg = tgAlerts
 	bots.logins = setupBotLogins(cfg, acc)
 	bots.loginsAllowHTTP = cfg.BotLoginsAllowHTTP
+	// The same key seals the extension codes (under a key derived from it) so the app can show them again.
+	if bots.logins != nil {
+		acc.SetCodeCipher(bots.logins, cfg.BotLoginsAllowHTTP)
+	} else {
+		acc.SetCodeCipher(nil, cfg.BotLoginsAllowHTTP)
+	}
 	bots.autoPhase = cfg.BotAutoPhase
 	if !slices.Contains([]string{"A", "B", "C"}, bots.autoPhase) {
 		log.Warn().Str("phase", bots.autoPhase).Msg("BOT_AUTO_PHASE unknown; auto mode runs phase A (Off, Log only)")

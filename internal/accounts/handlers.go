@@ -32,6 +32,7 @@ func (s *Service) Handler() http.Handler {
 	session("GET /api/me/extension-codes", s.handleListCodes)
 	session("POST /api/me/extension-codes", s.handleCreateCode)
 	session("DELETE /api/me/extension-codes/{id}", s.handleRevokeCode)
+	mux.Handle("GET /api/me/extension-codes/{id}/code", s.requireSecure(s.RequireSession(http.HandlerFunc(s.handleRevealCode))))
 
 	admin("GET /api/admin/invites", s.handleListInvites)
 	admin("POST /api/admin/invites", s.handleCreateInvite)
@@ -203,11 +204,47 @@ func (s *Service) handleRevokeCode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.RevokeExtensionCode(principal(r).UserID, id); err != nil {
+	var err error
+	switch r.URL.Query().Get("permanent") {
+	case "":
+		err = s.RevokeExtensionCode(principal(r).UserID, id)
+	case "1":
+		err = s.DeleteExtensionCode(principal(r).UserID, id)
+	default:
+		writeErr(w, http.StatusBadRequest, "bad_query")
+		return
+	}
+	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// requireSecure answers 403 https_required, before any auth, to a request that did not come over HTTPS (the bot
+// logins' rule, BOT_LOGINS_ALLOW_HTTP included).
+func (s *Service) requireSecure(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !SecureRequest(r, s.codesHTTP) {
+			writeErr(w, http.StatusForbidden, "https_required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// handleRevealCode is GET /api/me/extension-codes/{id}/code: the code in clear (never logged; no-store).
+func (s *Service) handleRevealCode(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	code, err := s.RevealExtensionCode(principal(r).UserID, id)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"code": code})
 }
 
 func (s *Service) handleListInvites(w http.ResponseWriter, r *http.Request) {

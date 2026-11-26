@@ -41,13 +41,7 @@ var loginResults = map[string]bool{"ok": true, "code": true, "captcha": true, "u
 
 // secureRequest: the request came over TLS (r.TLS, or nginx's X-Forwarded-Proto: exactly one value, exactly
 // "https"), or BOT_LOGINS_ALLOW_HTTP=1 (development).
-func secureRequest(r *http.Request, allowHTTP bool) bool {
-	if allowHTTP || r.TLS != nil {
-		return true
-	}
-	v := r.Header.Values("X-Forwarded-Proto")
-	return len(v) == 1 && v[0] == "https"
-}
+func secureRequest(r *http.Request, allowHTTP bool) bool { return accounts.SecureRequest(r, allowHTTP) }
 
 // loginGate runs before every login route's auth: 503 logins_unavailable without a key, 403 https_required on a
 // request that is not secure.

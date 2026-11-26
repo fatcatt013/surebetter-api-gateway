@@ -182,6 +182,16 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any, max int64) bool {
 	return false
 }
 
+// SecureRequest: the request came over TLS (r.TLS, or nginx's X-Forwarded-Proto: exactly one value, exactly "https"),
+// or allowHTTP (BOT_LOGINS_ALLOW_HTTP=1, development).
+func SecureRequest(r *http.Request, allowHTTP bool) bool {
+	if allowHTTP || r.TLS != nil {
+		return true
+	}
+	v := r.Header.Values("X-Forwarded-Proto")
+	return len(v) == 1 && v[0] == "https"
+}
+
 func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -236,6 +246,8 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, ErrNotFound):
 		writeErr(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrCodeRevoked), errors.Is(err, ErrNotViewable):
+		writeErr(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrTooLarge):
 		writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
 	case errors.Is(err, ErrInvalidEmail), errors.Is(err, ErrWeakPassword), errors.Is(err, ErrResetInvalid),

@@ -60,6 +60,8 @@ var (
 	ErrBadName            = errors.New("invalid_name")
 	ErrBadRole            = errors.New("invalid_role")
 	ErrBadKind            = errors.New("bad_kind")
+	ErrCodeRevoked        = errors.New("revoked")
+	ErrNotViewable        = errors.New("not_viewable")
 )
 
 // LockedError: too many failures from this IP or for this email; try again after RetryAfter.
@@ -81,6 +83,8 @@ type Service struct {
 	ipLimit    *limiter // failed logins, unknown invite and reset codes per client IP
 	tickets    *tickets
 	stateHook  func(userID int64, key string) // SetStateHook; nil = none
+	codes      CodeCipher                     // SetCodeCipher; nil = new codes are not viewable
+	codesHTTP  bool                           // SetCodeCipher: the code route also answers over plain HTTP (dev)
 }
 
 // NewService wraps an opened database (OpenDB). now may be nil (time.Now).

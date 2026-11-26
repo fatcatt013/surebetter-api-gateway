@@ -30,12 +30,14 @@ var (
 	errLoginOpen       = errors.New("cannot decrypt")
 )
 
-// loginKey is one BOT_LOGINS_KEY: its AEAD, its id (lowercase hex of the first 8 bytes of SHA-256 of the key) and the
-// key of the user name tags (HMAC-SHA256(key, "bot-login user tag v1")).
+// loginKey is one BOT_LOGINS_KEY: its AEAD, its id (lowercase hex of the first 8 bytes of SHA-256 of the key), the
+// key of the user name tags (HMAC-SHA256(key, "bot-login user tag v1")) and the AEAD of the extension codes, under a
+// key of its own (HMAC-SHA256(key, "extension code key v1")), so a login secret never opens as a code or back.
 type loginKey struct {
-	aead   cipher.AEAD
-	id     string
-	tagKey []byte
+	aead     cipher.AEAD
+	id       string
+	tagKey   []byte
+	codeAEAD cipher.AEAD
 }
 
 // parseLoginKey reads a key in standard base64; anything that is not exactly 32 bytes after decoding is refused. The
@@ -56,7 +58,17 @@ func parseLoginKey(s string) (*loginKey, error) {
 	sum := sha256.Sum256(raw)
 	m := hmac.New(sha256.New, raw)
 	m.Write([]byte("bot-login user tag v1"))
-	return &loginKey{aead: aead, id: hex.EncodeToString(sum[:8]), tagKey: m.Sum(nil)}, nil
+	ck := hmac.New(sha256.New, raw)
+	ck.Write([]byte("extension code key v1"))
+	codeBlock, err := aes.NewCipher(ck.Sum(nil))
+	if err != nil {
+		return nil, errBadLoginKey
+	}
+	codeAEAD, err := cipher.NewGCM(codeBlock)
+	if err != nil {
+		return nil, errBadLoginKey
+	}
+	return &loginKey{aead: aead, id: hex.EncodeToString(sum[:8]), tagKey: m.Sum(nil), codeAEAD: codeAEAD}, nil
 }
 
 // loginCipher seals and opens the bot logins (contract §3). cur is BOT_LOGINS_KEY; prev, when set, is a valid
@@ -128,6 +140,60 @@ func (c *loginCipher) open(secret []byte, keyID string, userID, codeID int64, wi
 	return p.U, p.P, nil
 }
 
+// codeAAD binds a sealed extension code to its row: extension_code:v1:<user_id>:<code_id>.
+func codeAAD(userID, codeID int64) []byte {
+	return []byte("extension_code:v1:" + strconv.FormatInt(userID, 10) + ":" + strconv.FormatInt(codeID, 10))
+}
+
+// SealCode seals an extension code for its row with the current key's code AEAD: nonce ‖ AES-256-GCM
+// (accounts.CodeCipher). The stored value carries no key id: OpenCode tries the current key, then the previous one.
+func (c *loginCipher) SealCode(userID, codeID int64, code string) ([]byte, error) {
+	nonce := make([]byte, loginNonceLen)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return c.cur.codeAEAD.Seal(nonce, nonce, []byte(code), codeAAD(userID, codeID)), nil
+}
+
+// OpenCode opens a sealed extension code of its row with the current key, else the previous one (accounts.CodeCipher).
+// Errors never hold the code.
+func (c *loginCipher) OpenCode(userID, codeID int64, sealed []byte) (string, error) {
+	code, _, err := c.openCodeKey(userID, codeID, sealed)
+	return code, err
+}
+
+// openCodeKey is OpenCode that also tells which key opened it.
+func (c *loginCipher) openCodeKey(userID, codeID int64, sealed []byte) (code string, k *loginKey, err error) {
+	for _, k := range []*loginKey{c.cur, c.prev} {
+		if k == nil || len(sealed) < loginNonceLen+k.codeAEAD.Overhead() {
+			continue
+		}
+		plain, err := k.codeAEAD.Open(nil, sealed[:loginNonceLen], sealed[loginNonceLen:], codeAAD(userID, codeID))
+		if err == nil {
+			return string(plain), k, nil
+		}
+	}
+	return "", nil, errLoginOpen
+}
+
+// resealCodes seals again with the current key every live extension code that opens only with the previous one (one
+// transaction; the count is logged, never a code).
+func (c *loginCipher) resealCodes(acc *accounts.Service) {
+	done, err := acc.ResealCodes(func(sc accounts.SealedCode) ([]byte, bool) {
+		code, k, err := c.openCodeKey(sc.UserID, sc.CodeID, sc.Sealed)
+		if err != nil || k == c.cur {
+			return nil, false
+		}
+		enc, err := c.SealCode(sc.UserID, sc.CodeID, code)
+		return enc, err == nil
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("extension codes re-encryption failed; they stay as they are")
+		return
+	}
+	log.Info().Int("count", done).Msg("extension codes re-encrypted")
+}
+
 // tag is the user name's tag under the current key: lowercase hex of HMAC-SHA256(tagKey, lower-cased user name).
 func (c *loginCipher) tag(username string) string {
 	m := hmac.New(sha256.New, c.cur.tagKey)
@@ -160,6 +226,7 @@ func setupBotLogins(cfg Config, acc *accounts.Service) *loginCipher {
 	if c.prev == nil || acc == nil {
 		return c
 	}
+	c.resealCodes(acc)
 	done, skipped, err := acc.RekeyBotLogins(c.prev.id, func(r accounts.BotLoginRow) ([]byte, string, string, error) {
 		u, p, err := c.open(r.Secret, r.KeyID, r.UserID, r.CodeID, r.WindowID)
 		if err != nil {

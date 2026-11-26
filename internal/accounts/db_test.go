@@ -553,8 +553,8 @@ func TestMigrate_BotAutoMode(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 13 || version != len(migrations) {
-		t.Fatalf("user_version = %d (err %v), want 13", version, err)
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want %d", version, err, len(migrations))
 	}
 	var settings, order string
 	if err := db.QueryRow(`SELECT max_leg || '/' || auto_json || '/' || auto_paused_reason || '/' || auto_paused_orders FROM bot_settings`).
@@ -567,5 +567,57 @@ func TestMigrate_BotAutoMode(t *testing.T) {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'bot_orders_user_event'`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("index bot_orders_user_event: %d (err %v)", n, err)
+	}
+}
+
+func TestMigrate_ExtensionCodesViewDelete(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The schema as shipped with bot automatic mode (version 13): one user, a revoked and a live bot code with an agent,
+	// a recording, a login and an order.
+	steps := append(append([]string{}, migrations[:13]...), `PRAGMA user_version = 13`,
+		`INSERT INTO users (id, email, password_hash, role, created_at) VALUES (1, 'u@example.com', 'x', 'user', 0)`,
+		`INSERT INTO extension_codes (id, user_id, name, code_hash, hint, created_at, revoked_at, kind) VALUES (1, 1, 'Old', 'h1', 'AAAA', 1, 2, 'bot')`,
+		`INSERT INTO extension_codes (id, user_id, name, code_hash, hint, created_at, kind) VALUES (2, 1, 'PC', 'h2', 'BBBB', 3, 'bot')`,
+		`INSERT INTO bot_agents (code_id, user_id, first_seen_at, last_seen_at) VALUES (2, 1, 4, 5)`,
+		`INSERT INTO bot_recordings (code_id, user_id, kind, body_json, count, updated_at) VALUES (2, 1, 'mouse', '[]', 0, 6)`,
+		`INSERT INTO bot_logins (user_id, code_id, window_id, bookmaker, secret, key_id, user_tag, updated_at) VALUES (1, 2, 'tipsport-1', 'tipsport', x'00', 'k', 't', 7)`,
+		`INSERT INTO bot_orders (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json, created_at)
+			VALUES ('o1', 1, 'k', 2, 'placed', '', 0, 200, '{}', '[]', 8)`)
+	for _, q := range steps {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%.60s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 14 || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want 14", version, err)
+	}
+	var codes string
+	if err := db.QueryRow(`SELECT group_concat(id || ':' || name || ':' || COALESCE(revoked_at, '-') || ':' || (code_enc IS NULL), ',')
+		FROM (SELECT * FROM extension_codes ORDER BY id)`).Scan(&codes); err != nil || codes != "1:Old:2:1,2:PC:-:1" {
+		t.Fatalf("codes after the migration: %q (err %v)", codes, err)
+	}
+	var floor int64
+	if err := db.QueryRow(`SELECT max_deleted FROM extension_code_ids WHERE id = 1`).Scan(&floor); err != nil || floor != 0 {
+		t.Fatalf("floor: %d (err %v)", floor, err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM bot_agents) + (SELECT COUNT(*) FROM bot_recordings) + (SELECT COUNT(*) FROM bot_logins)
+		+ (SELECT COUNT(*) FROM bot_orders)`).Scan(&n); err != nil || n != 4 {
+		t.Fatalf("bot rows after the migration: %d (err %v)", n, err)
+	}
+	if _, err := db.Exec(`INSERT INTO extension_code_ids (id, max_deleted) VALUES (2, 0)`); err == nil {
+		t.Fatal("a second floor row was accepted")
 	}
 }
