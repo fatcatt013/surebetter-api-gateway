@@ -601,8 +601,8 @@ func TestMigrate_ExtensionCodesViewDelete(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 14 || version != len(migrations) {
-		t.Fatalf("user_version = %d (err %v), want 14", version, err)
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version < 14 || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want %d", version, err, len(migrations))
 	}
 	var codes string
 	if err := db.QueryRow(`SELECT group_concat(id || ':' || name || ':' || COALESCE(revoked_at, '-') || ':' || (code_enc IS NULL), ',')

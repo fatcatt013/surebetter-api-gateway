@@ -293,6 +293,53 @@ var migrations = []string{
 	INSERT INTO extension_code_ids (id, max_deleted) SELECT 1, MAX(
 		(SELECT COALESCE(MAX(code_id), 0) FROM bot_orders), (SELECT COALESCE(MAX(code_id), 0) FROM bot_logs),
 		(SELECT COALESCE(MAX(agent_code_id), 0) FROM bot_alerts), (SELECT COALESCE(MAX(code_id), 0) FROM bot_logins));`,
+	// 15: bot bankroll Phase 1: each window's stored balance reads (a row on a change or at most hourly), each
+	// account's point 0 (its first stored read, never changed) and the ledger: one row per really placed leg of a live
+	// order, with its result. Kept for good (no pruning); a removed window or code keeps its rows. Times are Unix ms.
+	`CREATE TABLE bot_balances (
+		user_id   INTEGER NOT NULL REFERENCES users (id),
+		code_id   INTEGER NOT NULL,
+		window_id TEXT    NOT NULL,
+		bookmaker TEXT    NOT NULL,
+		amount    REAL    NOT NULL,
+		at        INTEGER NOT NULL
+	);
+	CREATE INDEX bot_balances_user_at ON bot_balances (user_id, at);
+	CREATE TABLE bot_accounts (
+		user_id      INTEGER NOT NULL REFERENCES users (id),
+		code_id      INTEGER NOT NULL,
+		window_id    TEXT    NOT NULL,
+		bookmaker    TEXT    NOT NULL,
+		start_amount REAL    NOT NULL,
+		start_at     INTEGER NOT NULL,
+		PRIMARY KEY (code_id, window_id)
+	);
+	CREATE TABLE bot_ledger_legs (
+		order_id      TEXT    NOT NULL,
+		leg           INTEGER NOT NULL,
+		user_id       INTEGER NOT NULL REFERENCES users (id),
+		code_id       INTEGER NOT NULL,
+		window_id     TEXT    NOT NULL,
+		bookmaker     TEXT    NOT NULL,
+		source        TEXT    NOT NULL,
+		match         TEXT    NOT NULL,
+		market        TEXT    NOT NULL,
+		market_type   TEXT    NOT NULL,
+		line          REAL,
+		label         TEXT    NOT NULL,
+		odds          REAL    NOT NULL,
+		stake         REAL    NOT NULL,
+		placed_at     INTEGER NOT NULL,
+		voidable      INTEGER NOT NULL,
+		ticket_id     TEXT,
+		result        TEXT    NOT NULL DEFAULT 'open' CHECK (result IN ('open', 'won', 'lost', 'void', 'half_won', 'half_lost', 'cashed_out')),
+		payout        REAL,
+		settled_at    INTEGER,
+		result_source TEXT    NOT NULL DEFAULT '' CHECK (result_source IN ('', 'manual', 'bot')),
+		updated_at    INTEGER NOT NULL,
+		PRIMARY KEY (order_id, leg)
+	);
+	CREATE INDEX bot_ledger_legs_user_placed ON bot_ledger_legs (user_id, placed_at);`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)
