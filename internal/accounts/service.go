@@ -13,16 +13,17 @@ const (
 )
 
 // Principal is who a request or a WebSocket acts as: a user signed in with a session cookie
-// (SessionID set) or with an extension code (CodeID set). It marshals to the /api/auth/me body.
+// (SessionID set) or with an extension code (CodeID set). It marshals to the /api/auth/me body;
+// code_id and code_kind appear only for a code (a session, login or register answer has neither).
 type Principal struct {
 	UserID    int64  `json:"-"`
 	Email     string `json:"email"`
 	Role      string `json:"role"`
 	Onboarded bool   `json:"onboarded"`
 	SessionID int64  `json:"-"`
-	CodeID    int64  `json:"-"`
+	CodeID    int64  `json:"code_id,omitempty"`
 	CodeName  string `json:"code_name,omitempty"`
-	CodeKind  string `json:"-"` // KindExtension or KindBot when CodeID is set; "" for a session
+	CodeKind  string `json:"code_kind,omitempty"` // KindExtension or KindBot when CodeID is set; "" for a session
 }
 
 func (p Principal) IsAdmin() bool { return p.Role == RoleAdmin }

@@ -318,3 +318,25 @@ func TestHTTP_RequireBotCode(t *testing.T) {
 		t.Fatalf("no credential: %d", code)
 	}
 }
+
+func TestHTTP_MeCodeFields(t *testing.T) {
+	s, _, _ := newTestService(t)
+	a := newAPI(t, s)
+	user, token := mustUser(t, s, "u@example.com", RoleUser)
+	bot, _ := s.CreateCode(user.UserID, "Bot", KindBot)
+	ext, _ := s.CreateCode(user.UserID, "Laptop", KindExtension)
+	bare := &http.Client{}
+
+	code, b := a.call(bare, "GET", "/api/auth/me", nil, map[string]string{"Authorization": "Bearer " + bot.Code})
+	if m := obj(t, b); code != 200 || m["code_id"] != float64(bot.ID) || m["code_kind"] != "bot" {
+		t.Fatalf("me with bot code: %d %s", code, b)
+	}
+	code, b = a.call(bare, "GET", "/api/auth/me", nil, map[string]string{"Authorization": "Bearer " + ext.Code})
+	if m := obj(t, b); code != 200 || m["code_id"] != float64(ext.ID) || m["code_kind"] != "extension" {
+		t.Fatalf("me with extension code: %d %s", code, b)
+	}
+	code, b = a.call(bare, "GET", "/api/auth/me", nil, map[string]string{"Cookie": CookieName + "=" + token})
+	if m := obj(t, b); code != 200 || m["email"] != "u@example.com" || m["code_id"] != nil || m["code_kind"] != nil {
+		t.Fatalf("me with session must carry neither field: %d %s", code, b)
+	}
+}
