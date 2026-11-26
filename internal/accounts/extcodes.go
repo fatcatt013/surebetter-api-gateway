@@ -124,8 +124,18 @@ func (s *Service) CreateCode(userID int64, name, kind string) (NewExtCode, error
 	return NewExtCode{ID: id, Name: name, Kind: kind, Code: code, Hint: hint(code)}, nil
 }
 
-// ListExtensionCodes returns userID's codes (both kinds), newest first, revoked ones included.
+// ListExtensionCodes returns userID's codes (both kinds), newest first, revoked ones included. Viewable is not
+// worked out (always false): ListExtensionCodesViewable does, for GET /api/me/extension-codes.
 func (s *Service) ListExtensionCodes(userID int64) ([]ExtCodeInfo, error) {
+	return s.listCodes(userID, false)
+}
+
+// ListExtensionCodesViewable is ListExtensionCodes with Viewable (each live sealed code is opened, then dropped).
+func (s *Service) ListExtensionCodesViewable(userID int64) ([]ExtCodeInfo, error) {
+	return s.listCodes(userID, true)
+}
+
+func (s *Service) listCodes(userID int64, viewable bool) ([]ExtCodeInfo, error) {
 	rows, err := s.db.Query(`SELECT id, name, kind, hint, created_at, last_used_at, revoked_at, code_enc FROM extension_codes
 		WHERE user_id = ? ORDER BY created_at DESC, id DESC`, userID)
 	if err != nil {
@@ -141,7 +151,7 @@ func (s *Service) ListExtensionCodes(userID int64) ([]ExtCodeInfo, error) {
 			return nil, err
 		}
 		c.LastUsedAt, c.RevokedAt = nullable(used), nullable(revoked)
-		if !revoked.Valid {
+		if viewable && !revoked.Valid {
 			_, c.Viewable = s.openCode(userID, c.ID, enc)
 		}
 		out = append(out, c)

@@ -283,13 +283,16 @@ var migrations = []string{
 	CREATE INDEX bot_orders_user_event ON bot_orders (user_id, event_id, created_at);`,
 	// 14: extension codes shown again and deleted for good: each new code sealed (nonce ‖ AES-256-GCM under a key
 	// derived from BOT_LOGINS_KEY; NULL = not viewable: older codes, no key, revoked), and the highest id ever deleted,
-	// so a deleted code's id is never handed out again (the kept order, log and alert rows still carry it).
+	// so a deleted code's id is never handed out again (the kept order, log and alert rows still carry it; it starts at
+	// the highest code id those rows already carry, in case a code row was ever removed by hand).
 	`ALTER TABLE extension_codes ADD COLUMN code_enc BLOB;
 	CREATE TABLE extension_code_ids (
 		id          INTEGER PRIMARY KEY CHECK (id = 1),
 		max_deleted INTEGER NOT NULL
 	);
-	INSERT INTO extension_code_ids (id, max_deleted) VALUES (1, 0);`,
+	INSERT INTO extension_code_ids (id, max_deleted) SELECT 1, MAX(
+		(SELECT COALESCE(MAX(code_id), 0) FROM bot_orders), (SELECT COALESCE(MAX(code_id), 0) FROM bot_logs),
+		(SELECT COALESCE(MAX(agent_code_id), 0) FROM bot_alerts), (SELECT COALESCE(MAX(code_id), 0) FROM bot_logins));`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

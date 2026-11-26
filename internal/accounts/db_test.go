@@ -586,7 +586,8 @@ func TestMigrate_ExtensionCodesViewDelete(t *testing.T) {
 		`INSERT INTO bot_recordings (code_id, user_id, kind, body_json, count, updated_at) VALUES (2, 1, 'mouse', '[]', 0, 6)`,
 		`INSERT INTO bot_logins (user_id, code_id, window_id, bookmaker, secret, key_id, user_tag, updated_at) VALUES (1, 2, 'tipsport-1', 'tipsport', x'00', 'k', 't', 7)`,
 		`INSERT INTO bot_orders (id, user_id, arb_key, code_id, state, reason, dry_run, stake, info_json, legs_json, created_at)
-			VALUES ('o1', 1, 'k', 2, 'placed', '', 0, 200, '{}', '[]', 8)`)
+			VALUES ('o1', 1, 'k', 2, 'placed', '', 0, 200, '{}', '[]', 8)`,
+		`INSERT INTO bot_logs (user_id, code_id, ts, level, msg) VALUES (1, 1, 9, 'info', 'x')`)
 	for _, q := range steps {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("%.60s: %v", q, err)
@@ -609,12 +610,12 @@ func TestMigrate_ExtensionCodesViewDelete(t *testing.T) {
 		t.Fatalf("codes after the migration: %q (err %v)", codes, err)
 	}
 	var floor int64
-	if err := db.QueryRow(`SELECT max_deleted FROM extension_code_ids WHERE id = 1`).Scan(&floor); err != nil || floor != 0 {
+	if err := db.QueryRow(`SELECT max_deleted FROM extension_code_ids WHERE id = 1`).Scan(&floor); err != nil || floor != 2 {
 		t.Fatalf("floor: %d (err %v)", floor, err)
 	}
 	var n int
 	if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM bot_agents) + (SELECT COUNT(*) FROM bot_recordings) + (SELECT COUNT(*) FROM bot_logins)
-		+ (SELECT COUNT(*) FROM bot_orders)`).Scan(&n); err != nil || n != 4 {
+		+ (SELECT COUNT(*) FROM bot_orders) + (SELECT COUNT(*) FROM bot_logs)`).Scan(&n); err != nil || n != 5 {
 		t.Fatalf("bot rows after the migration: %d (err %v)", n, err)
 	}
 	if _, err := db.Exec(`INSERT INTO extension_code_ids (id, max_deleted) VALUES (2, 0)`); err == nil {

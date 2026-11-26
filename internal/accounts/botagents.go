@@ -24,12 +24,16 @@ type BotAgentRow struct {
 	HumanMode   bool  // the agent's human-mode switch
 }
 
+// codeExists (one argument: the code id) keeps the agent inserts from re-creating the row of a code deleted for good
+// meanwhile (its socket's last touch, an in-flight status): nothing is inserted then, and no foreign-key error.
+const codeExists = `EXISTS (SELECT 1 FROM extension_codes WHERE id = ?)`
+
 // TouchBotAgent records that codeID's agent is connected (or just disconnected): it inserts the
 // agent's row (first and last seen now) or moves its last seen to now.
 func (s *Service) TouchBotAgent(userID, codeID int64) error {
 	now := s.nowMs()
-	_, err := s.db.Exec(`INSERT INTO bot_agents (code_id, user_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)
-		ON CONFLICT (code_id) DO UPDATE SET last_seen_at = excluded.last_seen_at`, codeID, userID, now, now)
+	_, err := s.db.Exec(`INSERT INTO bot_agents (code_id, user_id, first_seen_at, last_seen_at) SELECT ?, ?, ?, ? WHERE `+codeExists+`
+		ON CONFLICT (code_id) DO UPDATE SET last_seen_at = excluded.last_seen_at`, codeID, userID, now, now, codeID)
 	return err
 }
 
@@ -41,10 +45,10 @@ func (s *Service) SaveBotAgentStatus(userID, codeID int64, st BotAgentStatus) er
 	}
 	now := s.nowMs()
 	_, err := s.db.Exec(`INSERT INTO bot_agents (code_id, user_id, version, host_name, windows_json, first_seen_at, last_seen_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		SELECT ?, ?, ?, ?, ?, ?, ? WHERE `+codeExists+`
 		ON CONFLICT (code_id) DO UPDATE SET version = excluded.version, host_name = excluded.host_name,
 			windows_json = excluded.windows_json, last_seen_at = excluded.last_seen_at`,
-		codeID, userID, st.Version, st.HostName, st.WindowsJSON, now, now)
+		codeID, userID, st.Version, st.HostName, st.WindowsJSON, now, now, codeID)
 	return err
 }
 
@@ -75,9 +79,9 @@ func (s *Service) ListBotAgents(userID int64) ([]BotAgentRow, error) {
 func (s *Service) SaveBotAgentFlows(userID, codeID int64, flowsJSON string) (changed bool, err error) {
 	now := s.nowMs()
 	res, err := s.db.Exec(`INSERT INTO bot_agents (code_id, user_id, first_seen_at, last_seen_at, flows_json, flows_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		SELECT ?, ?, ?, ?, ?, ? WHERE `+codeExists+`
 		ON CONFLICT (code_id) DO UPDATE SET flows_json = excluded.flows_json, flows_at = excluded.flows_at
-			WHERE bot_agents.flows_json <> excluded.flows_json`, codeID, userID, now, now, flowsJSON, now)
+			WHERE bot_agents.flows_json <> excluded.flows_json`, codeID, userID, now, now, flowsJSON, now, codeID)
 	if err != nil {
 		return false, err
 	}

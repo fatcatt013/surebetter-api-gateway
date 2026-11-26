@@ -165,9 +165,17 @@ func TestExtensionCodes_DeleteAgentAndNeverLogged(t *testing.T) {
 	if s, _ := r.agentReq("GET", "/api/me/bot/logins/mine", ""); s != 401 {
 		t.Fatalf("the deleted code still authenticates: %d", s)
 	}
+	time.Sleep(50 * time.Millisecond) // the agent socket's last touch
+	out := buf.String()
+	if !strings.Contains(out, `"code":`+i64s(created.ID)+`,"message":"extension code shown"`) {
+		t.Fatalf("no audit line:\n%s", out)
+	}
+	if strings.Contains(out, `"level":"error"`) {
+		t.Fatalf("an error was logged:\n%s", out)
+	}
 	for _, s := range []string{created.Code, r.code} {
-		if strings.Contains(buf.String(), s) {
-			t.Fatalf("a code in the log:\n%s", buf)
+		if strings.Contains(out, s) {
+			t.Fatalf("a code in the log:\n%s", out)
 		}
 	}
 }

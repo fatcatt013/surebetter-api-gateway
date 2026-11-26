@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"github.com/rs/zerolog/log"
 )
 
 const smallBody = 16 << 10
@@ -175,7 +177,7 @@ func (s *Service) handlePutState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleListCodes(w http.ResponseWriter, r *http.Request) {
-	list, err := s.ListExtensionCodes(principal(r).UserID)
+	list, err := s.ListExtensionCodesViewable(principal(r).UserID)
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -239,11 +241,13 @@ func (s *Service) handleRevealCode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	code, err := s.RevealExtensionCode(principal(r).UserID, id)
+	userID := principal(r).UserID
+	code, err := s.RevealExtensionCode(userID, id)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
+	log.Info().Int64("user", userID).Int64("code", id).Msg("extension code shown") // ids only, never the code
 	writeJSON(w, http.StatusOK, map[string]string{"code": code})
 }
 

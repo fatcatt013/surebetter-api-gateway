@@ -37,9 +37,12 @@ func (f fakeCodeCipher) OpenCode(userID, codeID int64, sealed []byte) (string, e
 
 func viewableOf(t *testing.T, s *Service, userID, id int64) bool {
 	t.Helper()
-	list, err := s.ListExtensionCodes(userID)
+	list, err := s.ListExtensionCodesViewable(userID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if plain, _ := s.ListExtensionCodes(userID); len(plain) != len(list) || (len(plain) > 0 && plain[0].Viewable) {
+		t.Fatal("ListExtensionCodes must not work out viewable")
 	}
 	for _, c := range list {
 		if c.ID == id {
@@ -223,6 +226,26 @@ func TestExtensionCodes_DeleteForGood(t *testing.T) {
 	}
 	if n := count(`SELECT COUNT(*) FROM bot_logs WHERE code_id = ?`, bot.ID) + count(`SELECT COUNT(*) FROM bot_alerts WHERE agent_code_id = ?`, bot.ID); n != 2 {
 		t.Fatalf("logs and alerts after delete: %d", n)
+	}
+	// The agent's socket closing, an in-flight status or Flows upload, a login saved by a request checked before: none
+	// re-creates a row of the deleted code, and none fails.
+	if err := s.TouchBotAgent(user.UserID, bot.ID); err != nil {
+		t.Fatalf("touch after delete: %v", err)
+	}
+	if err := s.SaveBotAgentStatus(user.UserID, bot.ID, BotAgentStatus{Version: "1"}); err != nil {
+		t.Fatalf("status after delete: %v", err)
+	}
+	if changed, err := s.SaveBotAgentFlows(user.UserID, bot.ID, `{"x":1}`); err != nil || changed {
+		t.Fatalf("flows after delete: %v %v", changed, err)
+	}
+	if err := s.SaveBotLogin(BotLoginRow{UserID: user.UserID, CodeID: bot.ID, WindowID: "tipsport-2", Bookmaker: "tipsport", Secret: []byte{1}, KeyID: "k", UserTag: "t"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("login after delete: %v", err)
+	}
+	if n := count(`SELECT COUNT(*) FROM bot_agents WHERE code_id = ?`, bot.ID) + count(`SELECT COUNT(*) FROM bot_logins WHERE code_id = ?`, bot.ID); n != 0 {
+		t.Fatalf("rows re-created after delete: %d", n)
+	}
+	if err := s.SaveBotLogin(BotLoginRow{UserID: other.UserID, CodeID: keep.ID, WindowID: "tipsport-2", Bookmaker: "tipsport", Secret: []byte{1}, KeyID: "k", UserTag: "t"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("login for another user's code: %v", err)
 	}
 	if n := count(`SELECT COUNT(*) FROM pragma_foreign_key_check`); n != 0 {
 		t.Fatalf("foreign key violations: %d", n)

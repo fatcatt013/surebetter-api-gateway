@@ -56,15 +56,22 @@ func collectBotLogins(rows *sql.Rows) ([]BotLoginRow, error) {
 }
 
 // SaveBotLogin inserts or replaces the login of (r.CodeID, r.WindowID): the new secret, key id, user tag and
-// updated_at, failing cleared and the reveal count reset; the last result and last OK are kept.
+// updated_at, failing cleared and the reveal count reset; the last result and last OK are kept. ErrNotFound (nothing
+// stored) when r.CodeID is not a live code of r.UserID (revoked or deleted since the caller checked).
 func (s *Service) SaveBotLogin(r BotLoginRow) error {
-	_, err := s.db.Exec(`INSERT INTO bot_logins (user_id, code_id, window_id, bookmaker, secret, key_id, user_tag, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	res, err := s.db.Exec(`INSERT INTO bot_logins (user_id, code_id, window_id, bookmaker, secret, key_id, user_tag, updated_at)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM extension_codes WHERE id = ? AND user_id = ? AND revoked_at IS NULL)
 		ON CONFLICT (code_id, window_id) DO UPDATE SET user_id = excluded.user_id, bookmaker = excluded.bookmaker,
 			secret = excluded.secret, key_id = excluded.key_id, user_tag = excluded.user_tag, updated_at = excluded.updated_at,
 			failing = '', reveals_day = '', reveals = 0`,
-		r.UserID, r.CodeID, r.WindowID, r.Bookmaker, r.Secret, r.KeyID, r.UserTag, r.UpdatedAt)
-	return err
+		r.UserID, r.CodeID, r.WindowID, r.Bookmaker, r.Secret, r.KeyID, r.UserTag, r.UpdatedAt, r.CodeID, r.UserID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // BotLogin returns the login of codeID's window; found is false without one.

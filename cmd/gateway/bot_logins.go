@@ -241,7 +241,10 @@ func (b *botHub) handlePutLogin(w http.ResponseWriter, r *http.Request) {
 	book := windowID[:strings.LastIndexByte(windowID, '-')]
 	row := accounts.BotLoginRow{UserID: userID, CodeID: codeID, WindowID: windowID, Bookmaker: book, Secret: secret, KeyID: keyID,
 		UserTag: tag, UpdatedAt: b.now().UnixMilli()}
-	if err := b.acc.SaveBotLogin(row); err != nil {
+	if err := b.acc.SaveBotLogin(row); errors.Is(err, accounts.ErrNotFound) {
+		accounts.WriteError(w, http.StatusNotFound, "unknown_agent") // revoked or deleted meanwhile
+		return
+	} else if err != nil {
 		log.Error().Err(err).Int64("code", codeID).Str("window", windowID).Msg("bot login save failed")
 		accounts.WriteError(w, http.StatusInternalServerError, "internal")
 		return
