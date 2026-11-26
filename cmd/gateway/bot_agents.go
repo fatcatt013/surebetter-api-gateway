@@ -188,6 +188,7 @@ func statusOf(in botStatusIn) botStatus {
 func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 	b.loadSettings(userID)
 	b.loadLimitIndex(userID, codeID) // before the agent can be picked for an order
+	b.loadBalanceMarks(userID, codeID)
 	b.mu.Lock()
 	p := b.presenceLocked(userID, codeID)
 	if p == nil {
@@ -208,6 +209,7 @@ func (b *botHub) setStatus(userID, codeID int64, st botStatus) bool {
 	p.windowsKey, p.humanActs, p.humanJSON = st.windowsKey, st.humanActs, st.humanJSON
 	b.alertLoginsLocked(userID, codeID, p, fx)
 	b.alertWindowsLocked(userID, codeID, p, fx)
+	b.recordBalancesLocked(userID, codeID, st.proto, st.windows, fx)
 	if st.boot != "" {
 		for _, o := range b.ordersLocked(userID, orderRunning) {
 			if o.codeID == codeID && o.boot != st.boot {

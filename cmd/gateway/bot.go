@@ -114,13 +114,18 @@ type botHub struct {
 	// "A", "B" or "C"), which decides the modes it accepts.
 	auto      *autoPicker
 	autoPhase string
+	// balMarks is each account's last stored balance read (bot_bankroll_api.go: a read is stored on a change or hourly),
+	// loaded per code from the database once (balLoaded) before mu is taken. Guarded by mu.
+	balMarks  map[acctKey]balMark
+	balLoaded map[int64]bool
 }
 
 func newBotHub(reg *connRegistry, acc *accounts.Service) *botHub {
 	return &botHub{reg: reg, acc: acc, now: time.Now, agents: map[int64]map[int64]*botPresence{}, orders: map[string]*botOrder{},
 		settings: map[int64]accounts.BotSettings{}, memPause: map[int64]string{}, commands: map[string]*pendingCommand{},
 		limits: map[int64][]limitEntry{}, codes: map[codeKey]*codePrompt{},
-		logs: &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}, auto: newAutoPicker(), autoPhase: "A"}
+		logs: &minuteLimiter{limit: logsPerMinute}, shots: &minuteLimiter{limit: shotsPerMinute}, auto: newAutoPicker(), autoPhase: "A",
+		balMarks: map[acctKey]balMark{}, balLoaded: map[int64]bool{}}
 }
 
 // view is userID's GET /api/me/bot body.
