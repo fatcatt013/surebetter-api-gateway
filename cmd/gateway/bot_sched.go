@@ -921,6 +921,7 @@ func (b *botHub) endLocked(o *botOrder, state, reason string, relay bool, fx *ef
 		id, legs, stake := o.id, o.legsJSON(), o.countedStake(state)
 		fx.write(func() error { return b.acc.EndBotOrder(id, state, reason, legs, stake, now.UnixMilli()) })
 	}
+	b.ledgerOnEndLocked(o, now.UnixMilli(), fx)
 	if relay {
 		b.relayLocked(fx, o, botEventMsg{Event: state, Reason: reason})
 	}

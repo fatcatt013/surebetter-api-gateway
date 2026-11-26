@@ -874,6 +874,8 @@ func main() {
 	bots.loadLoginAlerts()
 	// Orders the previous process left waiting or running end now (it lost them from memory).
 	bots.recoverOrders()
+	// Live orders' placed legs that have no ledger row yet get one (orders from before the ledger; idempotent).
+	bots.backfillLedger()
 	gate := &wsGate{acc: acc, reg: reg, required: cfg.AuthRequired, bots: bots}
 
 	hub := NewHub(cfg)
