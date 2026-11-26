@@ -26,6 +26,8 @@ type botWindow struct {
 	Mode      string  `json:"mode,omitempty"` // bot, login or stopped (protocol 2); absent for older agents
 	// Human is what the window does in human mode (protocol 4); nil = nothing (Page open).
 	Human *botHuman `json:"human,omitempty"`
+	// Balance is the last balance read (protocol 7, bot_balance.go): nil = not supported (left out), Null = unknown.
+	Balance *botBalance `json:"balance,omitempty"`
 	// Set by the gateway on the Fleet for a window reserved for an order (never taken from a status).
 	OrderID string `json:"orderId,omitempty"`
 	Step    string `json:"step,omitempty"` // that leg's last step
@@ -115,7 +117,7 @@ func validStatus(in botStatusIn) bool {
 	for _, w := range in.Windows {
 		if !windowIDPattern.MatchString(w.ID) || seen[w.ID] || w.Bookmaker == "" || runeLen(w.Bookmaker) > 40 || w.Number < 1 ||
 			!windowDevices[w.Device] || !windowStates[w.State] || runeLen(w.Reason) > 200 || (w.Proxy != nil && runeLen(*w.Proxy) > 100) ||
-			!windowModes[w.Mode] || (w.Human != nil && !validHuman(*w.Human)) {
+			!windowModes[w.Mode] || (w.Human != nil && !validHuman(*w.Human)) || !validBalance(w.Balance) {
 			return false
 		}
 		seen[w.ID] = true
@@ -157,11 +159,12 @@ func statusOf(in botStatusIn) botStatus {
 	for i := range in.Windows {
 		in.Windows[i].OrderID, in.Windows[i].Step = "", "" // the gateway's overlay, not the agent's
 	}
+	balancesOf(in.Windows, in.Proto) // taken from protocol-7 statuses only
 	st.windows = in.Windows
 	st.windowsJSON = mustJSON(in.Windows)
 	bare := slices.Clone(in.Windows)
 	for i := range bare {
-		bare[i].Human = nil
+		bare[i].Human, bare[i].Balance = nil, nil // neither alone tells the app
 	}
 	st.windowsKey = mustJSON(bare)
 	st.humanActs = map[string][]string{}
@@ -299,6 +302,7 @@ func (b *botHub) fleet(userID int64) ([]agentView, error) {
 				v.HumanActivities = p.humanActs
 			}
 			v.Windows = windowsOf(p.windowsJSON)
+			balancesOf(v.Windows, p.proto)
 			for i := range v.Windows {
 				if o := b.orders[reserved[row.CodeID][v.Windows[i].ID]]; o != nil {
 					v.Windows[i].State, v.Windows[i].OrderID = "busy", o.id
@@ -312,6 +316,7 @@ func (b *botHub) fleet(userID int64) ([]agentView, error) {
 		} else {
 			v.DryRun, v.Version, v.Host = true, row.Version, botHost{Name: row.HostName}
 			v.Windows = windowsOf(row.WindowsJSON)
+			balancesOf(v.Windows, 0) // offline: no balance
 			for i := range v.Windows {
 				v.Windows[i].State, v.Windows[i].Reason, v.Windows[i].Human = "down", "Agent offline", nil
 			}
