@@ -17,7 +17,7 @@ var autoReasonCodes = []string{
 	"three_legs", "books", "live_state", "sport", "market", "profit_min", "profit_max", "min_age",
 	"hidden", "no_selection_id", "bots_paused", "auto_paused", "match_placed", "match_blocked", "order_open", "match_running",
 	"match_cooldown", "same_prices", "arb_attempts", "rounded_below_min", "stake_under_min", "stake_over_max", "limit_leg",
-	"limit_order", "auto_day_count", "auto_day_stake", "book_day_stake", "limit_day", "auto_at_once", "orders_at_once", "gap",
+	"limit_order", "auto_day_count", "auto_day_placed", "auto_day_stake", "book_day_stake", "limit_day", "auto_at_once", "orders_at_once", "gap",
 	"no_agent", "no_free_window", "balance_low", "balance_unknown",
 }
 

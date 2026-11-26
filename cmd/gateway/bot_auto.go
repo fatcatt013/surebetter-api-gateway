@@ -53,12 +53,14 @@ type autoBookLimits struct {
 
 // autoLimits is the auto mode's own limits (0 = none, except atOnce 1–20).
 type autoLimits struct {
-	AtOnce      int                       `json:"atOnce"`
-	PerDay      int                       `json:"perDay"`
-	StakePerDay int64                     `json:"stakePerDay"`
-	GapSec      int                       `json:"gapSec"`
-	Books       []string                  `json:"books"` // [] = every bot book
-	PerBook     map[string]autoBookLimits `json:"perBook"`
+	AtOnce int `json:"atOnce"`
+	PerDay int `json:"perDay"`
+	// PlacedPerDay caps today's placed auto orders of the class (0 = none).
+	PlacedPerDay int                       `json:"placedPerDay"`
+	StakePerDay  int64                     `json:"stakePerDay"`
+	GapSec       int                       `json:"gapSec"`
+	Books        []string                  `json:"books"` // [] = every bot book
+	PerBook      map[string]autoBookLimits `json:"perBook"`
 }
 
 func defaultAutoLimits() autoLimits {
@@ -356,10 +358,10 @@ func validAutoBankroll(br botBankroll) bool {
 		((br.Mode == "split" && br.Total > 0) || (br.Mode == "maxleg" && br.MaxLeg > 0))
 }
 
-// validAutoLimits: atOnce 1–20, perDay 0–1000, stakePerDay 0–maxKc, gapSec 0–3600, books ≤ 20 ids, perBook ≤ 20
+// validAutoLimits: atOnce 1–20, perDay 0–1000, placedPerDay 0–1000, stakePerDay 0–maxKc, gapSec 0–3600, books ≤ 20 ids, perBook ≤ 20
 // entries keyed by id with stakes 0–maxKc and maxStake 0 or ≥ minStake.
 func validAutoLimits(l autoLimits) bool {
-	if l.AtOnce < 1 || l.AtOnce > 20 || l.PerDay < 0 || l.PerDay > 1000 || l.StakePerDay < 0 || l.StakePerDay > maxKc ||
+	if l.AtOnce < 1 || l.AtOnce > 20 || l.PerDay < 0 || l.PerDay > 1000 || l.PlacedPerDay < 0 || l.PlacedPerDay > 1000 || l.StakePerDay < 0 || l.StakePerDay > maxKc ||
 		l.GapSec < 0 || l.GapSec > 3600 || len(l.Books) > 20 || len(l.PerBook) > 20 {
 		return false
 	}

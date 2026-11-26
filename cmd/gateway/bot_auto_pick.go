@@ -536,10 +536,13 @@ func (b *botHub) autoStage2Locked(userID int64, opp ArbOpportunity, r arbfilter.
 	if st.MaxOrder > 0 && total > float64(st.MaxOrder) {
 		return skip("limit_order", "Over the order limit")
 	}
-	autoCount, autoStake, liveStake := 0, int64(0), int64(0)
+	autoCount, placedCount, autoStake, liveStake := 0, 0, int64(0), int64(0)
 	for _, rec := range day.recs {
 		if rec.source == sourceAuto && rec.dry == dry {
 			autoCount++
+			if rec.state == "placed" { // a dry run's successful end is placed too; one-sided ends are not
+				placedCount++
+			}
 		}
 		if !rec.dry {
 			liveStake += rec.stake
@@ -550,6 +553,9 @@ func (b *botHub) autoStage2Locked(userID int64, opp ArbOpportunity, r arbfilter.
 	}
 	if cfg.Limits.PerDay > 0 && autoCount >= cfg.Limits.PerDay {
 		return skip("auto_day_count", fmt.Sprintf("Auto orders today: %d", autoCount))
+	}
+	if cfg.Limits.PlacedPerDay > 0 && placedCount >= cfg.Limits.PlacedPerDay {
+		return skip("auto_day_placed", fmt.Sprintf("Placed arbs today: %d", placedCount))
 	}
 	stake := int64(math.Round(total))
 	if !dry && cfg.Limits.StakePerDay > 0 && autoStake+stake > cfg.Limits.StakePerDay {

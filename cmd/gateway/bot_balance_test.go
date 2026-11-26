@@ -259,3 +259,44 @@ func TestAuto_BalanceReasons(t *testing.T) {
 	e2.setAuto("dry", "", `{"mode":"split","total":25000,"max_leg":0,"anchor_book":null,"rounding":1}`, "")
 	e2.sendNext(e2.arb2("tennis-live:ok", "T", 1))
 }
+
+// limits.placedPerDay: 0–1000 whole, missing = 0 (off); placed auto orders of the class count (stopped,
+// outcome_unknown, the other class and app orders do not); checked right after auto_day_count.
+func TestAuto_PlacedPerDay(t *testing.T) {
+	e := newAutoEnv(t, "B")
+	e.agent(tipFortIdle...)
+	for _, l := range []string{`{"limits":{"placedPerDay":1001}}`, `{"limits":{"placedPerDay":-1}}`, `{"limits":{"placedPerDay":2.5}}`} {
+		if s, b := e.put(l); s != 400 || !strings.Contains(b, `"bad_auto"`) {
+			t.Errorf("%s: %d %s, want 400 bad_auto", l, s, b)
+		}
+	}
+	if s, b := e.put(`{"limits":{"atOnce":1}}`); s != 200 || !strings.Contains(b, `"perDay":20,"placedPerDay":0,`) {
+		t.Fatalf("missing placedPerDay: %d %s", s, b)
+	}
+	lim := func(perDay, placed int) string {
+		return fmt.Sprintf(`{"atOnce":1,"perDay":%d,"placedPerDay":%d,"stakePerDay":0,"gapSec":0,"books":[],"perBook":{}}`, perDay, placed)
+	}
+	e.setAuto("dry", "", "", lim(20, 2))
+	if s, b := request(t, e.srv, "GET", "/api/me/bot/auto", e.token, "", nil); s != 200 || !strings.Contains(b, `"placedPerDay":2`) {
+		t.Fatalf("GET: %d %s", s, b)
+	}
+	rec := func(id, source string, dry bool, state string) {
+		e.injectRec(autoRec{id: id, source: source, eventID: "tennis-live:" + id, arbKey: "tennis-live:" + id + ":T:1", dry: dry, state: state})
+	}
+	rec("dryplac1", "auto", true, "placed")
+	rec("drystop1", "auto", true, "stopped")
+	rec("dryunkn1", "auto", true, "outcome_unknown")
+	rec("drycash1", "auto", true, "cashed_out")
+	rec("liveplc1", "auto", false, "placed")
+	rec("dryapp01", "app", true, "placed")
+	o := e.sendNext(e.arb2("tennis-live:aa", "T", 1)) // one placed of class dry: under 2
+	e.event(`{"order_id":"` + o["order_id"].(string) + `","event":"placed"}`)
+	e.expect(e.arb2("tennis-live:bb", "T", 1), "auto_day_placed", "Placed arbs today: 2")
+	e.setAuto("dry", "", "", lim(5, 2)) // 5 auto orders of the class today: auto_day_count first
+	e.expect(e.arb2("tennis-live:cc", "T", 1), "auto_day_count", "Auto orders today: 5")
+	e.setAuto("dry", "", "", lim(20, 0)) // off
+	e.sendNext(e.arb2("tennis-live:dd", "T", 1))
+	if c := e.counts()["auto_day_placed"]; c != 1 {
+		t.Fatalf("counts %v", e.counts())
+	}
+}

@@ -629,7 +629,7 @@ func TestAuto_PutChecks(t *testing.T) {
 	e := newAutoEnv(t, "A")
 	s, b := request(t, e.srv, "GET", "/api/me/bot/auto", e.token, "", nil)
 	if s != 200 || !strings.HasPrefix(b, `{"settings":{"mode":"off","preset":null,"filter":null,"bankroll":null,"limits":{"atOnce":1,"perDay":20,`+
-		`"stakePerDay":0,"gapSec":10,"books":[],"perBook":{}},"updatedAt":0},"effectiveDryRun":true,"paused":false,"pausedReason":"","pausedOrders":[],`+
+		`"placedPerDay":0,"stakePerDay":0,"gapSec":10,"books":[],"perBook":{}},"updatedAt":0},"effectiveDryRun":true,"paused":false,"pausedReason":"","pausedOrders":[],`+
 		`"today":{"orders":0,"placed":0,"stake":0},"counts":{},"botBooks":[]}`) {
 		t.Fatalf("defaults: %d %s", s, b)
 	}
@@ -680,7 +680,7 @@ func TestAuto_PutChecks(t *testing.T) {
 		t.Fatalf("log: %d %s", s, b)
 	}
 	// Limits replace the stored object whole; a field left out takes its default.
-	if s, b := e.put(`{"limits":{"atOnce":2}}`); s != 200 || !strings.Contains(b, `"limits":{"atOnce":2,"perDay":20,"stakePerDay":0,"gapSec":10,"books":[],"perBook":{}}`) {
+	if s, b := e.put(`{"limits":{"atOnce":2}}`); s != 200 || !strings.Contains(b, `"limits":{"atOnce":2,"perDay":20,"placedPerDay":0,"stakePerDay":0,"gapSec":10,"books":[],"perBook":{}}`) {
 		t.Fatalf("limits: %d %s", s, b)
 	}
 	var stored string
