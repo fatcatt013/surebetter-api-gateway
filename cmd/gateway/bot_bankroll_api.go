@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"slices"
@@ -180,16 +181,107 @@ func (b *botHub) loadLedger(userID int64) ([]*ledgerOrder, error) {
 	return out, nil
 }
 
-// bankrollView is the GET /api/me/bot/bankroll body.
-type bankrollView struct {
-	Accounts []bankrollAccount `json:"accounts"`
-	Books    []bankrollBook    `json:"books"`
-	Total    bankrollTotal     `json:"total"`
-	Series   []bankrollPoint   `json:"series"`
+// agentQuery reads ?agent= (the agent's code id, as the Fleet calls it): 0 = every agent; false: not a whole number ≥ 1.
+func agentQuery(r *http.Request) (int64, bool) {
+	s := r.URL.Query().Get("agent")
+	if s == "" {
+		return 0, true
+	}
+	id, err := strconv.ParseInt(s, 10, 64)
+	return id, err == nil && id >= 1
 }
 
-// handleBankroll is GET /api/me/bot/bankroll?range=7d|30d|all (default 7d): the cards at now (each account's newest
-// balance: the stored one, or the agent's last status when that read is newer) and the curve over the range.
+// botCodeNames is userID's bot codes' names by id, revoked ones included (a removed agent keeps its bankroll).
+func (b *botHub) botCodeNames(userID int64) (map[int64]string, error) {
+	codes, err := b.acc.ListExtensionCodes(userID)
+	if err != nil {
+		return nil, err
+	}
+	names := map[int64]string{}
+	for _, c := range codes {
+		if c.Kind == accounts.KindBot {
+			names[c.ID] = c.Name
+		}
+	}
+	return names, nil
+}
+
+// agentName is the name of agent id: its bot code's, else "#<id>" (a code deleted for good).
+func agentName(names map[int64]string, id int64) string {
+	if n, ok := names[id]; ok {
+		return n
+	}
+	return "#" + strconv.FormatInt(id, 10)
+}
+
+// knownAgent: agent is one of the user's bot codes (names) or has bankroll rows (a code deleted for good).
+func knownAgent(agent int64, names map[int64]string, accs []accounts.BotAccountRow, orders []*ledgerOrder) bool {
+	_, ok := names[agent]
+	return ok || slices.ContainsFunc(accs, func(a accounts.BotAccountRow) bool { return a.CodeID == agent }) ||
+		slices.ContainsFunc(orders, func(o *ledgerOrder) bool { return o.row.CodeID == agent })
+}
+
+// bankrollAgent is one agent in GET /api/me/bot/bankroll: one with an account (point 0) or an order on the bankroll.
+type bankrollAgent struct {
+	AgentID  int64  `json:"agentId"`
+	Name     string `json:"name"`
+	Online   bool   `json:"online"`
+	Accounts int    `json:"accounts"` // its accounts with point 0
+}
+
+// bankrollAgents lists the agents with an account or an order, by name (case-insensitive), then id.
+func bankrollAgents(accs []accounts.BotAccountRow, orders []*ledgerOrder, names map[int64]string, online map[int64]bool) []bankrollAgent {
+	n := map[int64]int{}
+	for _, a := range accs {
+		n[a.CodeID]++
+	}
+	for _, o := range orders {
+		if _, ok := n[o.row.CodeID]; !ok && o.row.CodeID != 0 {
+			n[o.row.CodeID] = 0
+		}
+	}
+	out := make([]bankrollAgent, 0, len(n))
+	for id, count := range n {
+		out = append(out, bankrollAgent{AgentID: id, Name: agentName(names, id), Online: online[id], Accounts: count})
+	}
+	slices.SortFunc(out, func(x, y bankrollAgent) int {
+		if c := strings.Compare(strings.ToLower(x.Name), strings.ToLower(y.Name)); c != 0 {
+			return c
+		}
+		return int(x.AgentID - y.AgentID)
+	})
+	return out
+}
+
+// ofAgent keeps the items of agent (0 = all) by their code id.
+func ofAgent[T any](items []T, agent int64, code func(T) int64) []T {
+	if agent == 0 {
+		return items
+	}
+	out := make([]T, 0, len(items))
+	for _, it := range items {
+		if code(it) == agent {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+// bankrollView is the GET /api/me/bot/bankroll body.
+type bankrollView struct {
+	Agents     []bankrollAgent                `json:"agents"`
+	Accounts   []bankrollAccount              `json:"accounts"`
+	Books      []bankrollBook                 `json:"books"`
+	Total      bankrollTotal                  `json:"total"`
+	Counts     bankrollCounts                 `json:"counts"`
+	Series     []bankrollPoint                `json:"series"`
+	BookSeries map[string][]bankrollBookPoint `json:"bookSeries"`
+}
+
+// handleBankroll is GET /api/me/bot/bankroll?range=7d|30d|all (default 7d)&agent=: the cards at now (each account's
+// newest balance: the stored one, or the agent's last status when that read is newer), the order counts, the curve over
+// the range (event points) and each book's balance curve; agents lists every agent with an account or an order. agent
+// (a code id) limits everything else to that agent's accounts and orders; 404 unknown_agent: not one of the user's.
 func (b *botHub) handleBankroll(w http.ResponseWriter, r *http.Request) {
 	userID := principalOf(r).UserID
 	rng := r.URL.Query().Get("range")
@@ -200,10 +292,17 @@ func (b *botHub) handleBankroll(w http.ResponseWriter, r *http.Request) {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_query")
 		return
 	}
+	agent, ok := agentQuery(r)
+	if !ok {
+		accounts.WriteError(w, http.StatusNotFound, "unknown_agent")
+		return
+	}
 	accs, err := b.acc.BotAccounts(userID)
 	var latest, hist []accounts.BotBalanceRow
 	var orders []*ledgerOrder
 	var agents []accounts.BotAgentRow
+	var names map[int64]string
+	var st accounts.BotSettings
 	if err == nil {
 		latest, err = b.acc.LatestBotBalances(userID, 0)
 	}
@@ -216,9 +315,19 @@ func (b *botHub) handleBankroll(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		agents, err = b.acc.ListBotAgents(userID)
 	}
+	if err == nil {
+		names, err = b.botCodeNames(userID)
+	}
+	if err == nil {
+		st, err = b.acc.BotSettings(userID)
+	}
 	if err != nil {
 		log.Error().Err(err).Msg("bot bankroll read failed")
 		accounts.WriteError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	if agent != 0 && !knownAgent(agent, names, accs, orders) {
+		accounts.WriteError(w, http.StatusNotFound, "unknown_agent")
 		return
 	}
 	present := map[acctKey]bool{}
@@ -231,8 +340,10 @@ func (b *botHub) handleBankroll(w http.ResponseWriter, r *http.Request) {
 	for i, row := range latest {
 		idx[acctKey{row.CodeID, row.WindowID}] = i
 	}
+	online := map[int64]bool{}
 	b.mu.Lock()
 	for codeID, p := range b.agents[userID] {
+		online[codeID] = true
 		if p.proto < balanceProto {
 			continue
 		}
@@ -253,23 +364,19 @@ func (b *botHub) handleBankroll(w http.ResponseWriter, r *http.Request) {
 	}
 	now := b.now().UnixMilli()
 	b.mu.Unlock()
-	var earliest int64
-	first := func(t int64) {
-		if t > 0 && (earliest == 0 || t < earliest) {
-			earliest = t
-		}
+	list := bankrollAgents(accs, orders, names, online)
+	accs = ofAgent(accs, agent, func(a accounts.BotAccountRow) int64 { return a.CodeID })
+	latest = ofAgent(latest, agent, func(r accounts.BotBalanceRow) int64 { return r.CodeID })
+	hist = ofAgent(hist, agent, func(r accounts.BotBalanceRow) int64 { return r.CodeID })
+	orders = ofAgent(orders, agent, func(o *ledgerOrder) int64 { return o.row.CodeID })
+	var from int64
+	if rng != "all" {
+		from = now - bankrollRanges[rng]
 	}
-	for _, a := range accs {
-		first(a.StartAt)
-	}
-	for _, o := range orders {
-		for _, l := range o.legs {
-			first(l.PlacedAt)
-		}
-	}
-	cards := bankrollFigures(accs, latest, orders, present, now)
-	accounts.WriteJSON(w, http.StatusOK, bankrollView{Accounts: cards.Accounts, Books: cards.Books, Total: cards.Total,
-		Series: bankrollSeries(accs, hist, orders, seriesPoints(rng, now, earliest))})
+	cards := bankrollFigures(accs, latest, orders, present, now, from, maxLegOf(st))
+	series, books := bankrollSeries(accs, hist, orders, seriesTimes(hist, orders, from, now))
+	accounts.WriteJSON(w, http.StatusOK, bankrollView{Agents: list, Accounts: cards.Accounts, Books: cards.Books, Total: cards.Total,
+		Counts: cards.Counts, Series: series, BookSeries: books})
 }
 
 // bankrollLegView is one leg of an order in GET /api/me/bot/bankroll/orders. A leg of an order that needs a check and
@@ -291,30 +398,37 @@ type bankrollLegView struct {
 
 // bankrollOrderView is one order in GET /api/me/bot/bankroll/orders.
 type bankrollOrderView struct {
-	OrderID    string            `json:"orderId"`
-	Source     string            `json:"source"`
-	Match      string            `json:"match"`
-	Market     string            `json:"market"`
-	MarketType string            `json:"marketType"`
-	Line       *float64          `json:"line"`
-	Sport      string            `json:"sport"`
-	Live       bool              `json:"live"`
-	CreatedAt  int64             `json:"createdAt"`
-	State      string            `json:"state"`
-	Voidable   bool              `json:"voidable"`
-	Status     string            `json:"status"`
-	Booked     *float64          `json:"booked"`
-	Profit     *float64          `json:"profit"`
-	Legs       []bankrollLegView `json:"legs"`
+	OrderID       string            `json:"orderId"`
+	AgentID       int64             `json:"agentId"`
+	AgentName     string            `json:"agentName"`
+	Day           string            `json:"day"`           // the Prague date of createdAt (YYYY-MM-DD)
+	PendingReason *string           `json:"pendingReason"` // status pending: outcome_unknown, stuck, voidable, one_sided or overdue
+	Source        string            `json:"source"`
+	Match         string            `json:"match"`
+	Market        string            `json:"market"`
+	MarketType    string            `json:"marketType"`
+	Line          *float64          `json:"line"`
+	Sport         string            `json:"sport"`
+	Live          bool              `json:"live"`
+	CreatedAt     int64             `json:"createdAt"`
+	State         string            `json:"state"`
+	Voidable      bool              `json:"voidable"`
+	Status        string            `json:"status"`
+	Booked        *float64          `json:"booked"`
+	Profit        *float64          `json:"profit"`
+	Legs          []bankrollLegView `json:"legs"`
 }
 
-// viewOf is o as the orders list shows it at now: its ledger legs and, for an order that needs a check, its other
-// stored legs (no row yet).
-func (o *ledgerOrder) viewOf(now int64) (bankrollOrderView, orderEval) {
+// viewOf is o as the orders list shows it at now (its agent's name agent): its ledger legs (not-placed ones too) and,
+// for an order that needs a check, its other stored legs (no row yet).
+func (o *ledgerOrder) viewOf(now int64, agent string) (bankrollOrderView, orderEval) {
 	e := o.eval(now)
-	v := bankrollOrderView{OrderID: o.row.ID, Source: rowSource(o.row.Source), Match: o.info.Match, Market: o.info.Market,
+	v := bankrollOrderView{OrderID: o.row.ID, AgentID: o.row.CodeID, AgentName: agent, Day: pragueDate(o.row.CreatedAt), Source: rowSource(o.row.Source), Match: o.info.Match, Market: o.info.Market,
 		MarketType: o.info.MarketType, Line: o.info.Line, Sport: o.info.Sport, Live: o.info.IsLive || o.info.Live, CreatedAt: o.row.CreatedAt,
 		State: o.row.State, Voidable: e.voidable, Status: e.status, Booked: e.booked, Profit: e.profit, Legs: []bankrollLegView{}}
+	if e.status == "pending" {
+		v.PendingReason = &e.reason
+	}
 	rows := map[int]accounts.BotLedgerLeg{}
 	for _, l := range o.legs {
 		rows[l.Leg] = l
@@ -361,10 +475,11 @@ const (
 
 var bankrollStatuses = map[string]bool{"": true, "open": true, "booked": true, "settled": true, "pending": true}
 
-// handleBankrollOrders is GET /api/me/bot/bankroll/orders?source=app|auto&bookmaker=&status=&from=&to=&limit=&before=:
+// handleBankrollOrders is GET /api/me/bot/bankroll/orders?source=app|auto&bookmaker=&status=&from=&to=&limit=&before=&agent=:
 // the ledger orders (and the live orders that need a check), newest first (created_at, then id). bookmaker: a leg at
 // that book; status: the order's status, except open = an order with a real leg still open; from/to: created_at in
-// [from, to) (Unix ms); before: the cursor "<createdAt>.<orderId>" of the last order of the previous page.
+// [from, to) (Unix ms); before: the cursor "<createdAt>.<orderId>" of the last order of the previous page; agent: the
+// orders sent to that agent (404 unknown_agent: not one of the user's).
 func (b *botHub) handleBankrollOrders(w http.ResponseWriter, r *http.Request) {
 	userID := principalOf(r).UserID
 	q := r.URL.Query()
@@ -396,23 +511,41 @@ func (b *botHub) handleBankrollOrders(w http.ResponseWriter, r *http.Request) {
 		accounts.WriteError(w, http.StatusBadRequest, "bad_query")
 		return
 	}
+	agent, ok := agentQuery(r)
+	if !ok {
+		accounts.WriteError(w, http.StatusNotFound, "unknown_agent")
+		return
+	}
 	orders, err := b.loadLedger(userID)
+	var names map[int64]string
+	var accs []accounts.BotAccountRow
+	if err == nil {
+		names, err = b.botCodeNames(userID)
+	}
+	if err == nil && agent != 0 {
+		accs, err = b.acc.BotAccounts(userID)
+	}
 	if err != nil {
 		log.Error().Err(err).Msg("bot bankroll orders read failed")
 		accounts.WriteError(w, http.StatusInternalServerError, "internal")
 		return
 	}
+	if agent != 0 && !knownAgent(agent, names, accs, orders) {
+		accounts.WriteError(w, http.StatusNotFound, "unknown_agent")
+		return
+	}
+	orders = ofAgent(orders, agent, func(o *ledgerOrder) int64 { return o.row.CodeID })
 	now := b.now().UnixMilli()
 	var views []bankrollOrderView
 	for _, o := range orders {
 		if len(o.legs) == 0 && !o.check {
 			continue
 		}
-		v, e := o.viewOf(now)
+		v, e := o.viewOf(now, agentName(names, o.row.CodeID))
 		switch {
 		case source != "" && v.Source != source,
 			book != "" && !slices.ContainsFunc(v.Legs, func(l bankrollLegView) bool { return l.Bookmaker == book }),
-			status == "open" && !slices.ContainsFunc(o.legs, func(l accounts.BotLedgerLeg) bool { return !legSettled(l) }),
+			status == "open" && !e.open,
 			status != "" && status != "open" && e.status != status,
 			v.CreatedAt < from || v.CreatedAt >= to,
 			v.CreatedAt > curAt || (v.CreatedAt == curAt && v.OrderID >= curID):
@@ -451,10 +584,12 @@ type resultIn struct {
 const settleAheadMs = 5 * 60 * 1000
 
 // handleBankrollResult is PUT /api/me/bot/bankroll/orders/{orderId}/legs/{leg}: the owner sets a leg's result (source
-// manual). payout is required (≥ 0) for cashed_out and ignored otherwise (computed from the leg's stake and odds);
-// settledAt defaults to now and may be at most 5 min ahead; open resets the leg. A leg of the user's live order that
-// needs a check and has no row yet gets one from its stored leg (placed at the order's end, else its send). 404
-// not_found: no such leg of the user's; 400 bad_result: a bad body. The user's app sockets get {"type":"bot"}.
+// manual). payout is required (≥ 0) for cashed_out and ignored otherwise (computed from the leg's stake and odds; none
+// for not_placed); settledAt defaults to now and may be at most 5 min ahead; open resets the leg. not_placed (the leg
+// never reached the bookmaker) only on a leg of an order that needs a check. A leg of the user's live order that needs
+// a check and has no row yet gets one from its stored leg (placed at the order's end, else its send). 404 not_found:
+// no such leg of the user's; 400 bad_result: a bad body, or not_placed on another order. The user's app sockets get
+// {"type":"bot"}.
 func (b *botHub) handleBankrollResult(w http.ResponseWriter, r *http.Request) {
 	userID := principalOf(r).UserID
 	orderID := r.PathValue("orderId")
@@ -475,6 +610,9 @@ func (b *botHub) handleBankrollResult(w http.ResponseWriter, r *http.Request) {
 	found, err := b.setLedgerResult(userID, orderID, leg, in, now)
 	b.dbMu.Unlock()
 	switch {
+	case errors.Is(err, errNotCheck):
+		accounts.WriteError(w, http.StatusBadRequest, "bad_result")
+		return
 	case err != nil:
 		log.Error().Err(err).Msg("bot ledger result failed")
 		accounts.WriteError(w, http.StatusInternalServerError, "internal")
@@ -488,26 +626,38 @@ func (b *botHub) handleBankrollResult(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// errNotCheck: not_placed on a leg of an order that does not need a check.
+var errNotCheck = errors.New("not_placed on an order that needs no check")
+
 // setLedgerResult stores in on userID's ledger leg (orderID, leg), creating the row first for a live order that needs
-// a check. false: no such leg. b.dbMu must be held.
+// a check. false: no such leg; errNotCheck: not_placed on an order that needs no check. b.dbMu must be held.
 func (b *botHub) setLedgerResult(userID int64, orderID string, leg int, in resultIn, now int64) (bool, error) {
 	l, found, err := b.acc.BotLedgerLegOf(userID, orderID, leg)
 	if err != nil {
 		return false, err
 	}
-	if !found {
+	if !found || in.Result == notPlaced {
 		row, ok, err := b.acc.BotOrderByID(userID, orderID)
-		if err != nil || !ok || row.DryRun || !checkableOf(row.State, row.DryRun, row.FlowJSON) {
+		if err != nil || !ok {
 			return false, err
 		}
-		info, stored := orderInfoOf(row)
-		if leg >= len(stored) {
-			return false, nil
+		check := !row.DryRun && checkableOf(row.State, row.DryRun, row.FlowJSON)
+		if !check {
+			if !found {
+				return false, nil
+			}
+			return true, errNotCheck
 		}
-		l = ledgerLeg(row.ID, userID, row.CodeID, row.Source, info, leg, stored[leg], orderPlacedAt(row))
-		l.UpdatedAt = now
-		if err := b.acc.InsertBotLedgerLegs([]accounts.BotLedgerLeg{l}); err != nil {
-			return false, err
+		if !found {
+			info, stored := orderInfoOf(row)
+			if leg >= len(stored) {
+				return false, nil
+			}
+			l = ledgerLeg(row.ID, userID, row.CodeID, row.Source, info, leg, stored[leg], orderPlacedAt(row))
+			l.UpdatedAt = now
+			if err := b.acc.InsertBotLedgerLegs([]accounts.BotLedgerLeg{l}); err != nil {
+				return false, err
+			}
 		}
 	}
 	var payout *float64

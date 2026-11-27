@@ -329,6 +329,17 @@ func TestBankroll_OrdersList(t *testing.T) {
 	if o3.Status != "pending" || len(o3.Legs) != 1 || o3.Legs[0].Leg != 1 || o3.Legs[0].Bookmaker != "betano" {
 		t.Fatalf("o3: %s", mustJSON(o3))
 	}
+	// Each order's agent, Prague day (created 11:00 UTC = 12:00 Prague) and, when pending, why.
+	for _, o := range all.Orders {
+		reason := ""
+		if o.PendingReason != nil {
+			reason = *o.PendingReason
+		}
+		want := map[string]string{"o3": "one_sided", "o4": "outcome_unknown"}[o.OrderID]
+		if o.AgentID != codeID || o.AgentName != "PC" || o.Day != "2026-11-26" || reason != want {
+			t.Errorf("%s: agent %d %q day %s reason %q, want %q", o.OrderID, o.AgentID, o.AgentName, o.Day, reason, want)
+		}
+	}
 	if o4.Status != "pending" || len(o4.Legs) != 2 || o4.Legs[0].Result == nil || *o4.Legs[0].Result != "open" || o4.Legs[0].PlacedAt != nil || o4.Legs[1].Stake != 60 {
 		t.Fatalf("o4: %s", mustJSON(o4))
 	}
@@ -441,14 +452,66 @@ func TestBankroll_PutResult(t *testing.T) {
 		*l.Payout != 0 || l.WindowID != "betano-1" || l.CodeID != codeID || l.Source != "app" {
 		t.Fatalf("o4 leg 1: %+v", l)
 	}
-	// o4 now has a real leg, settled: no longer pending (one-sided, settled); its other leg is still listed without a row.
-	if got := getBankrollOrders(t, srv, token, "?status=pending"); orderIDs(got) != "o3" {
-		t.Fatalf("pending after o4: %s", orderIDs(got))
-	}
-	got := getBankrollOrders(t, srv, token, "?status=settled")
-	if orderIDs(got) != "o4,o1" || *got.Orders[0].Profit != -60 || len(got.Orders[0].Legs) != 2 || got.Orders[0].Legs[0].PlacedAt != nil ||
+	// o4's leg 0 is still unanswered: o4 stays pending (outcome_unknown); its leg 0 is listed without a row.
+	got := getBankrollOrders(t, srv, token, "?status=pending")
+	if orderIDs(got) != "o4,o3" || *got.Orders[0].PendingReason != "outcome_unknown" || got.Orders[0].Legs[0].PlacedAt != nil ||
 		*got.Orders[0].Legs[0].Result != "open" {
-		t.Fatalf("settled after o4: %s %s", orderIDs(got), mustJSON(got.Orders))
+		t.Fatalf("pending after o4 leg 1: %s %s", orderIDs(got), mustJSON(got.Orders))
+	}
+	// Not placed: only on a leg of an order that needs a check.
+	if s, b := putResult(t, srv, token, "o2", 0, `{"result":"not_placed"}`); s != 400 || !strings.Contains(b, "bad_result") {
+		t.Fatalf("not_placed on o2: %d %s", s, b)
+	}
+	if s, b := putResult(t, srv, token, "nope", 0, `{"result":"not_placed"}`); s != 404 {
+		t.Fatalf("not_placed on an unknown order: %d %s", s, b)
+	}
+	if l := leg("o2", 0); l.Result != "open" {
+		t.Fatalf("o2 leg 0 after a refused not_placed: %+v", l)
+	}
+	if s, b := putResult(t, srv, token, "o4", 0, `{"result":"not_placed","payout":5}`); s != 204 {
+		t.Fatalf("not_placed on o4 leg 0: %d %s", s, b)
+	}
+	expectBot(t, app, "after not_placed")
+	if l := leg("o4", 0); l.Result != "not_placed" || l.Payout != nil || l.SettledAt == nil || *l.SettledAt != now || l.ResultSource != "manual" ||
+		l.Stake != 70 {
+		t.Fatalf("o4 leg 0 not placed: %+v", l)
+	}
+	// Every leg answered: o4 leaves Pending, settled at −60 (its not-placed 70 is in no figure).
+	if got := getBankrollOrders(t, srv, token, "?status=pending"); orderIDs(got) != "o3" {
+		t.Fatalf("pending after not_placed: %s", orderIDs(got))
+	}
+	got = getBankrollOrders(t, srv, token, "?status=settled")
+	if orderIDs(got) != "o4,o1" || *got.Orders[0].Profit != -60 || len(got.Orders[0].Legs) != 2 || *got.Orders[0].Legs[0].Result != "not_placed" ||
+		got.Orders[0].Legs[0].Payout != nil || got.Orders[0].PendingReason != nil {
+		t.Fatalf("settled after not_placed: %s %s", orderIDs(got), mustJSON(got.Orders))
+	}
+	if got := getBankrollOrders(t, srv, token, "?status=open"); orderIDs(got) != "o3,o2" {
+		t.Fatalf("open after not_placed: %s", orderIDs(got))
+	}
+	s, body := request(t, srv, "GET", "/api/me/bot/bankroll?range=all", token, "", nil)
+	var v bankrollView
+	if err := json.Unmarshal([]byte(body), &v); s != 200 || err != nil {
+		t.Fatalf("bankroll: %d %s", s, body)
+	}
+	// Real legs: o1 100 + 102, o3 40, o4 60 (o2's leg 0 is open again: 50 + 50); o4's 70 nowhere.
+	if v.Total.Staked != 402 || v.Total.Orders != 4 || v.Total.OpenStakes != 140 || v.Counts != (bankrollCounts{Pending: 1, Booked: 1, Settled: 2, Open: 2}) {
+		t.Fatalf("figures after not_placed: %s %s", mustJSON(v.Total), mustJSON(v.Counts))
+	}
+	for _, a := range v.Accounts {
+		if a.WindowID == "tipsport-1" && a.OpenStakes != 50 {
+			t.Fatalf("tipsport-1 holds the not-placed leg: %s", mustJSON(a))
+		}
+	}
+	// Reset to open: the leg is a real open leg again.
+	if s, _ := putResult(t, srv, token, "o4", 0, `{"result":"open"}`); s != 204 {
+		t.Fatalf("o4 leg 0 open: %d", s)
+	}
+	expectBot(t, app, "after o4 open")
+	if l := leg("o4", 0); l.Result != "open" || l.Payout != nil || l.SettledAt != nil || l.ResultSource != "" {
+		t.Fatalf("o4 leg 0 reset: %+v", l)
+	}
+	if got := getBankrollOrders(t, srv, token, "?status=open"); orderIDs(got) != "o4,o3,o2" {
+		t.Fatalf("open after the reset: %s", orderIDs(got))
 	}
 }
 
@@ -476,9 +539,10 @@ func TestBankroll_Get(t *testing.T) {
 	}
 	// Orders o1–o4 an hour ago (see ledgerFixture): tipsport-1 = 5000 + 110 − 50 + a 1000 deposit = 6060.
 	ledgerFixture(t, svc, userID, codeID, now-3*hour)
+	setSettings(t, svc, bots, userID, func(st *accounts.BotSettings) { st.MaxLeg = 2000 })
 	dialBot(t, srv, code)
 	waitBot(t, bots, userID, true)
-	for _, at := range []int64{now - hour, now - 50*60000} { // the second read: same amount, not stored
+	for _, at := range []int64{now - hour, now - 5*60000} { // the second read: same amount, not stored
 		if s, b := postStatus(t, srv, code, protoStatus(7, winBal("tipsport", 1, "idle", bal(6060, at)))); s != 204 {
 			t.Fatalf("status: %d %s", s, b)
 		}
@@ -493,12 +557,13 @@ func TestBankroll_Get(t *testing.T) {
 		accs[a.WindowID] = a
 	}
 	tip, bet, fort := accs["tipsport-1"], accs["betano-1"], accs["fortuna-1"]
-	if tip.AgentID != codeID || tip.Removed || *tip.Balance != 6060 || *tip.BalanceAt != now-50*60000 || *tip.Start != 5000 ||
-		*tip.StartAt != t0 || tip.OpenStakes != 50 || *tip.ArbFlow != 60 || *tip.Outside != 1000 {
+	if tip.AgentID != codeID || tip.Removed || *tip.Balance != 6060 || *tip.BalanceAt != now-5*60000 || *tip.Start != 5000 ||
+		*tip.StartAt != t0 || tip.OpenStakes != 50 || *tip.ArbFlow != 60 || *tip.Outside != 1000 || !tip.Fresh || *tip.BalanceAge != 5*60000 ||
+		*tip.MaxLeg != 2000 || *tip.Covers != 3 || !*tip.CanPay {
 		t.Fatalf("tipsport-1: %s", mustJSON(tip))
 	}
 	// betano-1: no longer in the agent's windows; o3's open 40 is in its flow and open stakes.
-	if !bet.Removed || *bet.ArbFlow != -142 || bet.OpenStakes != 40 || *bet.Outside != -10 {
+	if !bet.Removed || *bet.ArbFlow != -142 || bet.OpenStakes != 40 || *bet.Outside != -10 || bet.Fresh || *bet.Covers != 0 || *bet.CanPay {
 		t.Fatalf("betano-1: %s", mustJSON(bet))
 	}
 	if fort.Start != nil || fort.Balance != nil || fort.OpenStakes != 50 {
@@ -512,13 +577,44 @@ func TestBankroll_Get(t *testing.T) {
 	if len(v.Books) != 3 || v.Books[0].Bookmaker != "betano" || v.Books[1].Bookmaker != "fortuna" || v.Books[2].ArbProfit != 110 {
 		t.Fatalf("books: %s", mustJSON(v.Books))
 	}
-	if len(v.Series) != 8 || v.Series[7].At != now || *v.Series[7].Balance != 7908 || v.Series[7].ArbProfit != 8 || *v.Series[7].Outside != 990 {
+	// Staked in the range: o1 202, o2 100, o3 40; 8 of arb profit. Only the removed betano-1 is old: not stale.
+	if tot.Staked != 342 || tot.ProfitPct == nil || *tot.ProfitPct != 2.34 || tot.Stale {
+		t.Fatalf("staked / profit %% / stale: %s", mustJSON(tot))
+	}
+	if v.Counts != (bankrollCounts{Pending: 2, Booked: 1, Settled: 1, Open: 2}) {
+		t.Fatalf("counts: %s", mustJSON(v.Counts))
+	}
+	if len(v.Agents) != 1 || v.Agents[0] != (bankrollAgent{AgentID: codeID, Name: "PC", Online: true, Accounts: 2}) {
+		t.Fatalf("agents: %s", mustJSON(v.Agents))
+	}
+	// Event points: point 0 (both accounts), the three placings, o1's settling, betano's and tipsport's reads, now.
+	ats := []int64{t0, now - 3*hour + 1020, now - 3*hour + 2020, now - 3*hour + 3020, now - 3*hour + 5000, now - 2*hour, now - hour, now}
+	if len(v.Series) != len(ats) {
 		t.Fatalf("series: %s", mustJSON(v.Series))
 	}
-	if v.Series[0].Balance != nil || v.Series[0].ArbProfit != 0 {
-		t.Fatalf("series before point 0: %s", mustJSON(v.Series[0]))
+	for i, at := range ats {
+		if v.Series[i].At != at {
+			t.Fatalf("series point %d at %d, want %d", i, v.Series[i].At, at)
+		}
 	}
-	for rng, n := range map[string]int{"": 8, "30d": 31, "all": 3} {
+	if p := v.Series[0]; *p.Balance != 7000 || p.ArbProfit != 0 || *p.Outside != 0 {
+		t.Fatalf("series at point 0: %s", mustJSON(p))
+	}
+	if p := v.Series[7]; *p.Balance != 7908 || p.ArbProfit != 8 || p.Booked != 0 || *p.Outside != 990 {
+		t.Fatalf("series now: %s", mustJSON(p))
+	}
+	// o1 booked (min(210, 209.1) − 202) and o2 booked at 0 (min(100, 105) − 100) until o1 settles at 8.
+	if p := v.Series[3]; p.ArbProfit != 7.1 || p.Booked != 7.1 {
+		t.Fatalf("series before o1 settled: %s", mustJSON(p))
+	}
+	if p := v.Series[4]; p.ArbProfit != 8 || p.Booked != 0 {
+		t.Fatalf("series after o1 settled: %s", mustJSON(p))
+	}
+	if tip, bet := v.BookSeries["tipsport"], v.BookSeries["betano"]; len(v.BookSeries) != 2 || len(tip) != 8 || *tip[7].Balance != 6060 ||
+		*tip[0].Balance != 5000 || len(bet) != 8 || *bet[7].Balance != 1848 || tip[7].At != now {
+		t.Fatalf("bookSeries: %s", mustJSON(v.BookSeries))
+	}
+	for rng, n := range map[string]int{"": 8, "30d": 8, "all": 8} {
 		s, body := request(t, srv, "GET", "/api/me/bot/bankroll?range="+rng, token, "", nil)
 		var v bankrollView
 		if json.Unmarshal([]byte(body), &v); s != 200 || len(v.Series) != n {
@@ -527,6 +623,107 @@ func TestBankroll_Get(t *testing.T) {
 	}
 	if s, body := request(t, srv, "GET", "/api/me/bot/bankroll?range=1y", token, "", nil); s != 400 || !strings.Contains(body, "bad_query") {
 		t.Fatalf("bad range: %d %s", s, body)
+	}
+}
+
+// Agent scope: the agents list (agents with an account or an order, by name), ?agent= limiting every figure, count,
+// curve and order to that agent, an agent without data, and 404 unknown_agent for another user's code, an unknown id
+// and a bad value, on both GETs.
+func TestBankroll_AgentScope(t *testing.T) {
+	srv, svc, bots := newBotServer(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	userID := userIDOf(t, svc, token)
+	_, codeB := newBotCode(t, srv, token, "beta")
+	_, codeA := newBotCode(t, srv, token, "Alpha")
+	_, codeC := newBotCode(t, srv, token, "Gamma") // no data
+	other := newUser(t, svc, "o@example.com", accounts.RoleUser)
+	_, codeX := newBotCode(t, srv, other, "Other")
+	clk := &botClock{t: time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)}
+	bots.now = clk.now
+	now := clk.now().UnixMilli()
+	base := now - 3600000
+	for _, r := range []accounts.BotBalanceRow{
+		{CodeID: codeA, WindowID: "tipsport-1", Bookmaker: "tipsport", Amount: 1000, At: base},
+		{CodeID: codeB, WindowID: "betano-1", Bookmaker: "betano", Amount: 2000, At: base},
+	} {
+		r.UserID = userID
+		if err := svc.InsertBotBalance(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// b1 on agent B (booked: min(200, 199.5) − 195), then o1–o4 on agent A.
+	if err := svc.InsertBotOrder(accounts.BotOrderRow{ID: "b1", UserID: userID, CodeID: codeB, ArbKey: "k", State: "placed", Source: "app",
+		InfoJSON: `{"match":"C – D","market":"Winner","marketType":"MATCH_WINNER"}`, OddsDrop: "strict", CreatedAt: base + 500, SentAt: base + 510,
+		EndedAt: base + 520, LegsJSON: `[{"bookmaker":"tipsport","label":"C","odds":2,"stake":100,"windowId":"tipsport-1","placed":true},` +
+			`{"bookmaker":"betano","label":"D","odds":2.1,"stake":95,"windowId":"betano-1","placed":true}]`}); err != nil {
+		t.Fatal(err)
+	}
+	ledgerFixture(t, svc, userID, codeA, base)
+	get := func(query string) bankrollView {
+		t.Helper()
+		s, body := request(t, srv, "GET", "/api/me/bot/bankroll"+query, token, "", nil)
+		var v bankrollView
+		if err := json.Unmarshal([]byte(body), &v); s != 200 || err != nil {
+			t.Fatalf("bankroll%s: %d %s", query, s, body)
+		}
+		return v
+	}
+	all := get("?range=all")
+	want := []bankrollAgent{{AgentID: codeA, Name: "Alpha", Accounts: 1}, {AgentID: codeB, Name: "beta", Accounts: 1}}
+	if !slices.Equal(all.Agents, want) {
+		t.Fatalf("agents: %s", mustJSON(all.Agents))
+	}
+	if all.Total.Orders != 4 || all.Counts.Booked != 2 {
+		t.Fatalf("all agents: %s %s", mustJSON(all.Total), mustJSON(all.Counts))
+	}
+
+	a := get("?range=all&agent=" + strconv.FormatInt(codeA, 10))
+	if !slices.Equal(a.Agents, want) {
+		t.Fatalf("agents with agent=A: %s", mustJSON(a.Agents))
+	}
+	for _, acc := range a.Accounts {
+		if acc.AgentID != codeA {
+			t.Fatalf("agent A lists %s", mustJSON(acc))
+		}
+	}
+	if a.Total.Orders != 3 || *a.Total.Balance != 1000 || a.Total.Staked != 342 || a.Counts != (bankrollCounts{Pending: 2, Booked: 1, Settled: 1, Open: 2}) ||
+		len(a.BookSeries) != 1 || a.BookSeries["tipsport"] == nil || *a.Series[len(a.Series)-1].Balance != 1000 {
+		t.Fatalf("agent A: %s %s %s", mustJSON(a.Total), mustJSON(a.Counts), mustJSON(a.BookSeries))
+	}
+	b := get("?range=all&agent=" + strconv.FormatInt(codeB, 10))
+	for _, acc := range b.Accounts {
+		if acc.AgentID != codeB {
+			t.Fatalf("agent B lists %s", mustJSON(acc))
+		}
+	}
+	if b.Total.Orders != 1 || *b.Total.Balance != 2000 || b.Total.Booked != 4.5 || b.Counts != (bankrollCounts{Booked: 1, Open: 1}) ||
+		len(b.BookSeries) != 1 || b.BookSeries["betano"] == nil {
+		t.Fatalf("agent B: %s %s %s", mustJSON(b.Total), mustJSON(b.Counts), mustJSON(b.BookSeries))
+	}
+	c := get("?agent=" + strconv.FormatInt(codeC, 10))
+	if len(c.Accounts) != 0 || len(c.Books) != 0 || c.Total.Orders != 0 || c.Total.Balance != nil || len(c.Series) != 1 || len(c.Agents) != 2 {
+		t.Fatalf("agent C (no data): %s", mustJSON(c))
+	}
+
+	if got := orderIDs(getBankrollOrders(t, srv, token, "?agent="+strconv.FormatInt(codeA, 10))); got != "o4,o3,o2,o1" {
+		t.Fatalf("orders of A: %s", got)
+	}
+	ob := getBankrollOrders(t, srv, token, "?agent="+strconv.FormatInt(codeB, 10))
+	if orderIDs(ob) != "b1" || ob.Orders[0].AgentID != codeB || ob.Orders[0].AgentName != "beta" || ob.Orders[0].Day != "2026-11-26" {
+		t.Fatalf("orders of B: %s", mustJSON(ob.Orders))
+	}
+	if got := getBankrollOrders(t, srv, token, "?agent="+strconv.FormatInt(codeC, 10)); len(got.Orders) != 0 {
+		t.Fatalf("orders of C: %s", orderIDs(got))
+	}
+	if got := getBankrollOrders(t, srv, token, ""); orderIDs(got) != "o4,o3,o2,o1,b1" {
+		t.Fatalf("orders of all: %s", orderIDs(got))
+	}
+	for _, q := range []string{strconv.FormatInt(codeX, 10), "999", "abc", "0", "-1"} {
+		for _, path := range []string{"/api/me/bot/bankroll?agent=", "/api/me/bot/bankroll/orders?agent="} {
+			if s, body := request(t, srv, "GET", path+q, token, "", nil); s != 404 || !strings.Contains(body, "unknown_agent") {
+				t.Errorf("%s%s: %d %s", path, q, s, body)
+			}
+		}
 	}
 }
 
