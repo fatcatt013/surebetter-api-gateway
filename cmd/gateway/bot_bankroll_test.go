@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -99,6 +100,12 @@ func settle(l accounts.BotLedgerLeg, result string, at int64) accounts.BotLedger
 	return l
 }
 
+// np marks l not placed (the owner's answer for a leg of a check order): no payout.
+func np(l accounts.BotLedgerLeg, at int64) accounts.BotLedgerLeg {
+	l.Result, l.SettledAt, l.Payout = notPlaced, ip(at), nil
+	return l
+}
+
 func TestLedgerOrderEval(t *testing.T) {
 	const h = int64(3600000)
 	now := 100 * h
@@ -110,29 +117,62 @@ func TestLedgerOrderEval(t *testing.T) {
 		name    string
 		legs    []accounts.BotLedgerLeg
 		check   bool
+		state   string // the order's state
+		stored  int    // its stored legs
 		status  string
 		booked  *float64
 		profit  *float64
 		pending bool
+		reason  string
 	}{
-		{"two open legs: booked", []accounts.BotLedgerLeg{a, b}, false, "booked", fp(math.Min(210, 209.1) - 202), nil, false},
-		{"one settled, one open: still booked", []accounts.BotLedgerLeg{settle(a, "won", now), b}, false, "booked", fp(7.1), nil, false},
-		{"both settled", []accounts.BotLedgerLeg{settle(a, "won", now), settle(b, "lost", now)}, false, "settled", nil, fp(8), false},
-		{"half results", []accounts.BotLedgerLeg{settle(voidA, "half_won", now), settle(voidB, "half_lost", now)}, false, "settled", nil,
-			fp(155 + 51 - 202), false},
-		{"voidable open: pending", []accounts.BotLedgerLeg{voidA, voidB}, false, "pending", nil, nil, true},
-		{"one-sided open: pending", []accounts.BotLedgerLeg{a}, false, "pending", nil, nil, true},
-		{"one-sided settled", []accounts.BotLedgerLeg{settle(a, "void", now)}, false, "settled", nil, fp(0), false},
+		{"two open legs: booked", []accounts.BotLedgerLeg{a, b}, false, "placed", 2, "booked", fp(math.Min(210, 209.1) - 202), nil, false, ""},
+		{"one settled, one open: still booked", []accounts.BotLedgerLeg{settle(a, "won", now), b}, false, "placed", 2, "booked", fp(7.1), nil, false, ""},
+		{"both settled", []accounts.BotLedgerLeg{settle(a, "won", now), settle(b, "lost", now)}, false, "placed", 2, "settled", nil, fp(8), false, ""},
+		{"half results", []accounts.BotLedgerLeg{settle(voidA, "half_won", now), settle(voidB, "half_lost", now)}, false, "placed", 2, "settled", nil,
+			fp(155 + 51 - 202), false, ""},
+		{"voidable open: pending", []accounts.BotLedgerLeg{voidA, voidB}, false, "placed", 2, "pending", nil, nil, true, "voidable"},
+		{"one-sided open: pending", []accounts.BotLedgerLeg{a}, false, "stopped", 2, "pending", nil, nil, true, "one_sided"},
+		{"voidable before one-sided", []accounts.BotLedgerLeg{voidA}, false, "stopped", 2, "pending", nil, nil, true, "voidable"},
+		{"one-sided before overdue", []accounts.BotLedgerLeg{func() accounts.BotLedgerLeg { l := a; l.PlacedAt = now - 25*h; return l }()},
+			false, "stopped", 2, "pending", nil, nil, true, "one_sided"},
+		{"one-sided settled", []accounts.BotLedgerLeg{settle(a, "void", now)}, false, "stopped", 2, "settled", nil, fp(0), false, ""},
 		{"booked but open > 24 h", []accounts.BotLedgerLeg{func() accounts.BotLedgerLeg { l := a; l.PlacedAt = now - 25*h; return l }(), b},
-			false, "pending", fp(7.1), nil, true},
-		{"check order without rows", nil, true, "pending", nil, nil, true},
+			false, "placed", 2, "pending", fp(7.1), nil, true, "overdue"},
+		{"check order without rows", nil, true, "outcome_unknown", 2, "pending", nil, nil, true, "outcome_unknown"},
+		{"stuck order without rows", nil, true, "placed", 2, "pending", nil, nil, true, "stuck"},
+		{"check order, a leg without a row", []accounts.BotLedgerLeg{settle(b, "lost", now)}, true, "outcome_unknown", 2, "pending", nil, nil, true,
+			"outcome_unknown"},
+		{"stuck order, a leg without a row", []accounts.BotLedgerLeg{settle(b, "lost", now)}, true, "stopped", 2, "pending", nil, nil, true, "stuck"},
+		{"check order, the other leg not placed", []accounts.BotLedgerLeg{np(a, now), settle(b, "lost", now)}, true, "outcome_unknown", 2, "settled",
+			nil, fp(-102), false, ""},
+		{"check order, both legs not placed", []accounts.BotLedgerLeg{np(a, now), np(b, now)}, true, "outcome_unknown", 2, "settled", nil, fp(0),
+			false, ""},
+		{"check order, one not placed, one open", []accounts.BotLedgerLeg{np(a, now), b}, true, "outcome_unknown", 2, "pending", nil, nil, true,
+			"one_sided"},
+		{"check order resolved, voidable open", []accounts.BotLedgerLeg{voidA, voidB}, true, "outcome_unknown", 2, "pending", nil, nil, true,
+			"voidable"},
+		{"check order resolved, booked", []accounts.BotLedgerLeg{a, b}, true, "placed", 2, "booked", fp(7.1), nil, false, ""},
 	}
 	for _, c := range cases {
-		o := &ledgerOrder{legs: c.legs, check: c.check}
+		o := &ledgerOrder{row: accounts.BotOrderRow{State: c.state}, stored: make([]storedLeg, c.stored), legs: c.legs, check: c.check}
 		e := o.eval(now)
-		if e.status != c.status || e.pending != c.pending || !sameMoney(e.booked, c.booked) || !sameMoney(e.profit, c.profit) {
-			t.Errorf("%s: status %s pending %v booked %v profit %v, want %s %v %v %v", c.name, e.status, e.pending, deref(e.booked),
-				deref(e.profit), c.status, c.pending, deref(c.booked), deref(c.profit))
+		if e.status != c.status || e.pending != c.pending || e.reason != c.reason || !sameMoney(e.booked, c.booked) || !sameMoney(e.profit, c.profit) {
+			t.Errorf("%s: status %s pending %v reason %q booked %v profit %v, want %s %v %q %v %v", c.name, e.status, e.pending, e.reason,
+				deref(e.booked), deref(e.profit), c.status, c.pending, c.reason, deref(c.booked), deref(c.profit))
+		}
+	}
+}
+
+// An order's day is the Prague date of its creation.
+func TestPragueDate(t *testing.T) {
+	for at, want := range map[time.Time]string{
+		time.Date(2026, 11, 26, 22, 59, 59, 0, time.UTC): "2026-11-26",
+		time.Date(2026, 11, 26, 23, 0, 0, 0, time.UTC):   "2026-11-27",
+		time.Date(2026, 7, 1, 21, 59, 0, 0, time.UTC):    "2026-07-01", // summer time: UTC+2
+		time.Date(2026, 7, 1, 22, 0, 0, 0, time.UTC):     "2026-07-02",
+	} {
+		if got := pragueDate(at.UnixMilli()); got != want {
+			t.Errorf("pragueDate(%s) = %s, want %s", at, got, want)
 		}
 	}
 }
@@ -172,7 +212,7 @@ func TestBankrollFigures(t *testing.T) {
 		{CodeID: 2, WindowID: "tipsport-1", Bookmaker: "tipsport", Amount: 1000, At: 10 * h},
 	}
 	present := map[acctKey]bool{{1, "tipsport-1"}: true, {1, "betano-1"}: true}
-	f := bankrollFigures(accs, latest, []*ledgerOrder{o0, o1, o2, o3}, present, now)
+	f := bankrollFigures(accs, latest, []*ledgerOrder{o0, o1, o2, o3}, present, now, 15*h, nil)
 	byKey := map[acctKey]bankrollAccount{}
 	for _, a := range f.Accounts {
 		byKey[acctKey{a.AgentID, a.WindowID}] = a
@@ -212,50 +252,246 @@ func TestBankrollFigures(t *testing.T) {
 		tot.Settled != 8 || tot.Booked != 0 || tot.ArbProfit != 8 || tot.Orders != 4 || tot.Pending != 1 {
 		t.Fatalf("total: %+v", tot)
 	}
+	// Staked: the real legs placed from 15 h on (order 0 is older): 202 + 100 + 30; arb profit 8 of it. Every read is an
+	// hour old: the total is stale.
+	if tot.Staked != 332 || tot.ProfitPct == nil || *tot.ProfitPct != 2.41 || !tot.Stale {
+		t.Fatalf("staked / profit %% / stale: %+v %v", tot, deref(tot.ProfitPct))
+	}
+	if f.Counts != (bankrollCounts{Pending: 1, Booked: 1, Settled: 2, Open: 2}) {
+		t.Fatalf("counts: %+v", f.Counts)
+	}
+	if f := bankrollFigures(accs, latest, nil, present, now, 0, nil); f.Total.Staked != 0 || f.Total.ProfitPct != nil {
+		t.Fatalf("nothing staked: %+v", f.Total)
+	}
 }
 
-// The curve: one point at each Prague day end in the range plus now; balance and outside from the last stored read ≤ T,
-// arb profit counting a booking once both legs are placed and a settlement once its last leg settled.
+// Freshness (a read at most 12 min old), the read's age, the max leg's cover and whether the account can pay it, per
+// account and per book; a removed window never makes the total stale; a not-placed leg is in no figure.
+func TestBankrollFreshCover(t *testing.T) {
+	const h, fresh = int64(3600000), balanceFreshMs
+	now := 100 * h
+	accs := []accounts.BotAccountRow{
+		{CodeID: 1, WindowID: "tipsport-1", Bookmaker: "tipsport", StartAmount: 5000, StartAt: h},
+		{CodeID: 1, WindowID: "tipsport-2", Bookmaker: "tipsport", StartAmount: 1000, StartAt: h},
+		{CodeID: 1, WindowID: "betano-1", Bookmaker: "betano", StartAmount: 2000, StartAt: h},
+		{CodeID: 2, WindowID: "fortuna-1", Bookmaker: "fortuna", StartAmount: 500, StartAt: h},
+	}
+	latest := func(tip2At int64) []accounts.BotBalanceRow {
+		return []accounts.BotBalanceRow{
+			{CodeID: 1, WindowID: "tipsport-1", Bookmaker: "tipsport", Amount: 6060, At: now - fresh},
+			{CodeID: 1, WindowID: "tipsport-2", Bookmaker: "tipsport", Amount: 1000, At: tip2At},
+			{CodeID: 1, WindowID: "betano-1", Bookmaker: "betano", Amount: 2400, At: now - 1000},
+			{CodeID: 2, WindowID: "fortuna-1", Bookmaker: "fortuna", Amount: 300, At: now - 10*h},
+		}
+	}
+	present := map[acctKey]bool{{1, "tipsport-1"}: true, {1, "tipsport-2"}: true, {1, "betano-1"}: true} // fortuna-1 removed
+	// A check order: its tipsport-1 leg never reached the book (not placed), its betano-1 leg is open.
+	chk := &ledgerOrder{row: accounts.BotOrderRow{State: "outcome_unknown"}, check: true, stored: make([]storedLeg, 2),
+		legs: []accounts.BotLedgerLeg{np(lleg("c", 0, "tipsport", 2, 999, 50*h), 60*h), lleg("c", 1, "betano", 2, 100, 50*h)}}
+	f := bankrollFigures(accs, latest(now-fresh-1), []*ledgerOrder{chk}, present, now, 0, fp(2500))
+	by := map[string]bankrollAccount{}
+	for _, a := range f.Accounts {
+		by[a.WindowID] = a
+	}
+	type want struct {
+		fresh  bool
+		age    int64
+		covers int64
+		canPay bool
+	}
+	for w, x := range map[string]want{"tipsport-1": {true, fresh, 2, true}, "tipsport-2": {false, fresh + 1, 0, false},
+		"betano-1": {true, 1000, 0, false}, "fortuna-1": {false, 10 * h, 0, false}} {
+		a := by[w]
+		if a.Fresh != x.fresh || a.BalanceAge == nil || *a.BalanceAge != x.age || a.MaxLeg == nil || *a.MaxLeg != 2500 || a.Covers == nil ||
+			*a.Covers != x.covers || a.CanPay == nil || *a.CanPay != x.canPay {
+			t.Errorf("%s: %s, want %+v", w, mustJSON(a), x)
+		}
+	}
+	if t1 := by["tipsport-1"]; t1.OpenStakes != 0 || *t1.ArbFlow != 0 || *t1.Outside != 1060 {
+		t.Errorf("tipsport-1 with a not-placed leg: %s", mustJSON(t1))
+	}
+	if b := by["betano-1"]; b.OpenStakes != 100 || *b.ArbFlow != -100 {
+		t.Errorf("betano-1: %s", mustJSON(b))
+	}
+	tot := f.Total
+	if !tot.Stale || tot.Staked != 100 || tot.OpenStakes != 100 || tot.Orders != 1 || tot.Pending != 1 {
+		t.Fatalf("total: %s", mustJSON(tot))
+	}
+	if f.Counts != (bankrollCounts{Pending: 1, Open: 1}) {
+		t.Fatalf("counts: %+v", f.Counts)
+	}
+	books := map[string]bankrollBook{}
+	for _, b := range f.Books {
+		books[b.Bookmaker] = b
+	}
+	// tipsport: 7060 covers 2 legs but tipsport-2's read is stale; betano 2400 < 2500; fortuna: only a removed window.
+	for book, x := range map[string]want{"tipsport": {covers: 2}, "betano": {covers: 0}, "fortuna": {covers: 0}} {
+		b := books[book]
+		if b.MaxLeg == nil || *b.MaxLeg != 2500 || b.Covers == nil || *b.Covers != x.covers || b.CanPay == nil || *b.CanPay {
+			t.Errorf("book %s: %s", book, mustJSON(b))
+		}
+	}
+
+	// tipsport-2 read fresh: the total is no longer stale (the removed fortuna-1 does not count), tipsport can pay.
+	f = bankrollFigures(accs, latest(now), []*ledgerOrder{chk}, present, now, 0, fp(2500))
+	if f.Total.Stale {
+		t.Fatalf("stale with only a removed window old: %s", mustJSON(f.Total))
+	}
+	for _, b := range f.Books {
+		if b.Bookmaker == "tipsport" && (b.CanPay == nil || !*b.CanPay) {
+			t.Fatalf("tipsport fresh: %s", mustJSON(b))
+		}
+	}
+	// No max leg: no cover, no can-pay.
+	f = bankrollFigures(accs, latest(now), nil, present, now, 0, nil)
+	for _, a := range f.Accounts {
+		if a.MaxLeg != nil || a.Covers != nil || a.CanPay != nil {
+			t.Fatalf("no max leg: %s", mustJSON(a))
+		}
+	}
+	// An account without a balance: not fresh, age null, no cover, cannot pay.
+	f = bankrollFigures(accs[:1], nil, nil, present, now, 0, fp(2500))
+	if a := f.Accounts[0]; a.Fresh || a.BalanceAge != nil || a.Covers != nil || a.CanPay == nil || *a.CanPay || !f.Total.Stale {
+		t.Fatalf("no balance: %s %s", mustJSON(a), mustJSON(f.Total))
+	}
+}
+
+// The max leg: the auto bankroll's in maxleg mode, else the controller's limit, else none.
+func TestMaxLegOf(t *testing.T) {
+	auto := func(mode string, maxLeg float64) string {
+		return `{"mode":"off","bankroll":{"mode":"` + mode + `","total":10000,"max_leg":` + strconv.FormatFloat(maxLeg, 'f', -1, 64) +
+			`,"anchor_book":null,"rounding":1}}`
+	}
+	for _, c := range []struct {
+		auto   string
+		maxLeg int64
+		want   *float64
+	}{
+		{auto("maxleg", 3000), 2000, fp(3000)},
+		{auto("split", 3000), 2000, fp(2000)},
+		{"", 2000, fp(2000)},
+		{auto("maxleg", 3000), 0, fp(3000)},
+		{auto("split", 0), 0, nil},
+		{"", 0, nil},
+	} {
+		got := maxLegOf(accounts.BotSettings{AutoJSON: c.auto, MaxLeg: c.maxLeg})
+		if !sameMoney(got, c.want) {
+			t.Errorf("maxLegOf(%s, %d) = %v, want %v", c.auto, c.maxLeg, deref(got), deref(c.want))
+		}
+	}
+}
+
+// The curve's times: every balance read and every real leg's placing and settling in the range, plus now; sorted, once.
+func TestSeriesTimes(t *testing.T) {
+	day := func(d, hour int) int64 { return time.Date(2026, 11, d, hour, 0, 0, 0, prague).UnixMilli() }
+	now := day(26, 18)
+	hist := []accounts.BotBalanceRow{{At: day(24, 10)}, {At: day(24, 12)}, {At: day(25, 1)}, {At: day(25, 12)}}
+	a := lleg("o", 0, "tipsport", 2.1, 100, day(24, 11))
+	b := lleg("o", 1, "betano", 2.05, 102, day(25, 1)) // the same time as a read
+	o := &ledgerOrder{legs: []accounts.BotLedgerLeg{settle(a, "won", day(25, 11)), b}}
+	n := &ledgerOrder{check: true, legs: []accounts.BotLedgerLeg{np(lleg("n", 0, "fortuna", 2, 50, day(25, 5)), day(25, 6))}} // no event
+	got := seriesTimes(hist, []*ledgerOrder{o, n}, day(25, 0), now)
+	want := []int64{day(25, 1), day(25, 11), day(25, 12), now}
+	if !slices.Equal(got, want) {
+		t.Fatalf("from the 25th: %v, want %v", got, want)
+	}
+	got = seriesTimes(hist, []*ledgerOrder{o, n}, 0, now)
+	want = []int64{day(24, 10), day(24, 11), day(24, 12), day(25, 1), day(25, 11), day(25, 12), now}
+	if !slices.Equal(got, want) {
+		t.Fatalf("all: %v, want %v", got, want)
+	}
+	if got := seriesTimes(nil, nil, 0, now); !slices.Equal(got, []int64{now}) {
+		t.Fatalf("no data: %v", got)
+	}
+}
+
+// Downsampling keeps the first time and the last time of each of 399 equal-width buckets: at most 400, the last kept.
+func TestDownsample(t *testing.T) {
+	even := make([]int64, 1000)
+	for i := range even {
+		even[i] = int64(i) * 1000
+	}
+	got := downsample(even, seriesMax)
+	if len(got) != 400 || got[0] != 0 || got[399] != 999000 || !slices.IsSorted(got) {
+		t.Fatalf("even: %d points, first %d, last %d", len(got), got[0], got[len(got)-1])
+	}
+	// Each kept time but the first is the last of its bucket: the next time of the input falls in a later bucket.
+	width := float64(999000) / 399
+	for _, v := range got[1 : len(got)-1] {
+		i := slices.Index(even, v)
+		if int(float64(even[i+1])/width) == int(float64(v)/width) {
+			t.Fatalf("%d is not the last of its bucket", v)
+		}
+	}
+	// Skewed: 990 times in the first second, 10 spread over a day.
+	var skew []int64
+	for i := range 990 {
+		skew = append(skew, int64(i))
+	}
+	for i := 1; i <= 10; i++ {
+		skew = append(skew, int64(i)*8640000)
+	}
+	got = downsample(skew, seriesMax)
+	if len(got) > 400 || got[0] != 0 || got[len(got)-1] != 86400000 || len(got) != 12 {
+		t.Fatalf("skewed: %v", got)
+	}
+	short := []int64{1, 2, 3}
+	if got := downsample(short, seriesMax); !slices.Equal(got, short) {
+		t.Fatalf("short: %v", got)
+	}
+}
+
+// The curve at given times: balance and outside from each account's last read ≤ T, the arb profit with its booked part
+// (a booking once both legs are placed, the settlement once its last leg settled), and each book's balance.
 func TestBankrollSeries(t *testing.T) {
 	day := func(d, hour int) int64 { return time.Date(2026, 11, d, hour, 0, 0, 0, prague).UnixMilli() }
 	now := day(26, 18)
-	pts := seriesPoints("7d", now, 0)
-	if len(pts) != 8 || pts[0] != day(20, 0) || pts[6] != day(26, 0) || pts[7] != now {
-		t.Fatalf("7d points: %v", pts)
+	accs := []accounts.BotAccountRow{
+		{CodeID: 1, WindowID: "tipsport-1", Bookmaker: "tipsport", StartAmount: 1000, StartAt: day(24, 10)},
+		{CodeID: 1, WindowID: "betano-1", Bookmaker: "betano", StartAmount: 300, StartAt: day(25, 6)},
 	}
-	if pts := seriesPoints("all", now, day(25, 10)); len(pts) != 2 || pts[0] != day(26, 0) {
-		t.Fatalf("all points: %v", pts)
-	}
-	if pts := seriesPoints("all", now, 0); len(pts) != 1 || pts[0] != now {
-		t.Fatalf("all without data: %v", pts)
-	}
-	if pts := seriesPoints("30d", now, 0); len(pts) != 31 {
-		t.Fatalf("30d points: %d", len(pts))
-	}
-	accs := []accounts.BotAccountRow{{CodeID: 1, WindowID: "tipsport-1", Bookmaker: "tipsport", StartAmount: 1000, StartAt: day(24, 10)}}
 	hist := []accounts.BotBalanceRow{
 		{CodeID: 1, WindowID: "tipsport-1", Amount: 1000, At: day(24, 10)},
-		{CodeID: 1, WindowID: "tipsport-1", Amount: 900, At: day(24, 12)},  // a leg of 100 placed at 11
+		{CodeID: 1, WindowID: "tipsport-1", Amount: 900, At: day(24, 12)}, // a leg of 100 placed at 11
+		{CodeID: 1, WindowID: "betano-1", Amount: 300, At: day(25, 6)},
 		{CodeID: 1, WindowID: "tipsport-1", Amount: 1410, At: day(25, 12)}, // won 210, deposit 300
 	}
 	a := lleg("o", 0, "tipsport", 2.1, 100, day(24, 11))
-	b := lleg("o", 1, "betano", 2.05, 102, day(25, 1)) // second leg after midnight: booked only from the 25th
+	b := lleg("o", 1, "betano", 2.05, 102, day(25, 1)) // second leg after midnight (before betano's point 0): booked from the 25th
 	o := &ledgerOrder{legs: []accounts.BotLedgerLeg{settle(a, "won", day(25, 11)), settle(b, "lost", day(26, 9))}}
-	got := bankrollSeries(accs, hist, []*ledgerOrder{o}, []int64{day(24, 0), day(25, 0), day(26, 0), now})
+	got, books := bankrollSeries(accs, hist, []*ledgerOrder{o}, []int64{day(24, 0), day(25, 0), day(26, 0), now})
 	want := []struct {
 		balance, outside *float64
-		profit           float64
+		profit, booked   float64
 	}{
-		{nil, nil, 0},                  // before point 0
-		{fp(900), fp(0), 0},            // one leg placed: no booking yet
-		{fp(1410), fp(300), 7.1},       // booked (min(210, 209.1) − 202)
-		{fp(1410), fp(300), 210 - 202}, // settled
+		{nil, nil, 0, 0},                  // before point 0
+		{fp(900), fp(0), 0, 0},            // one leg placed: no booking yet
+		{fp(1710), fp(300), 7.1, 7.1},     // booked (min(210, 209.1) − 202)
+		{fp(1710), fp(300), 210 - 202, 0}, // settled
+	}
+	if len(got) != len(want) {
+		t.Fatalf("points: %d", len(got))
 	}
 	for i, w := range want {
 		p := got[i]
-		if !sameMoney(p.Balance, w.balance) || !sameMoney(p.Outside, w.outside) || math.Abs(p.ArbProfit-w.profit) > 0.005 {
-			t.Errorf("point %d: balance %v outside %v profit %v, want %v %v %v", i, deref(p.Balance), deref(p.Outside), p.ArbProfit,
-				deref(w.balance), deref(w.outside), w.profit)
+		if !sameMoney(p.Balance, w.balance) || !sameMoney(p.Outside, w.outside) || math.Abs(p.ArbProfit-w.profit) > 0.005 ||
+			math.Abs(p.Booked-w.booked) > 0.005 {
+			t.Errorf("point %d: balance %v outside %v profit %v booked %v, want %v %v %v %v", i, deref(p.Balance), deref(p.Outside),
+				p.ArbProfit, p.Booked, deref(w.balance), deref(w.outside), w.profit, w.booked)
 		}
+	}
+	for book, w := range map[string][]*float64{"tipsport": {nil, fp(900), fp(1410), fp(1410)}, "betano": {nil, nil, fp(300), fp(300)}} {
+		pts := books[book]
+		if len(pts) != len(w) {
+			t.Fatalf("book %s: %s", book, mustJSON(pts))
+		}
+		for i := range w {
+			if pts[i].At != got[i].At || !sameMoney(pts[i].Balance, w[i]) {
+				t.Errorf("book %s point %d: %s, want %v", book, i, mustJSON(pts[i]), deref(w[i]))
+			}
+		}
+	}
+	if len(books) != 2 {
+		t.Fatalf("books: %s", mustJSON(books))
 	}
 }
