@@ -212,7 +212,7 @@ func TestBankrollFigures(t *testing.T) {
 		{CodeID: 2, WindowID: "tipsport-1", Bookmaker: "tipsport", Amount: 1000, At: 10 * h},
 	}
 	present := map[acctKey]bool{{1, "tipsport-1"}: true, {1, "betano-1"}: true}
-	f := bankrollFigures(accs, latest, []*ledgerOrder{o0, o1, o2, o3}, present, now, 15*h, nil)
+	f := bankrollFigures(accs, latest, []*ledgerOrder{o0, o1, o2, o3}, present, now, nil)
 	byKey := map[acctKey]bankrollAccount{}
 	for _, a := range f.Accounts {
 		byKey[acctKey{a.AgentID, a.WindowID}] = a
@@ -252,15 +252,15 @@ func TestBankrollFigures(t *testing.T) {
 		tot.Settled != 8 || tot.Booked != 0 || tot.ArbProfit != 8 || tot.Orders != 4 || tot.Pending != 1 {
 		t.Fatalf("total: %+v", tot)
 	}
-	// Staked: the real legs placed from 15 h on (order 0 is older): 202 + 100 + 30; arb profit 8 of it. Every read is an
-	// hour old: the total is stale.
-	if tot.Staked != 332 || tot.ProfitPct == nil || *tot.ProfitPct != 2.41 || !tot.Stale {
+	// Staked: every real leg placed, order 0 (before point 0) too, the same base as arb profit: 30 + 202 + 100 + 30; arb
+	// profit 8 of it. Every read is an hour old: the total is stale.
+	if tot.Staked != 362 || tot.ProfitPct == nil || *tot.ProfitPct != 2.21 || !tot.Stale {
 		t.Fatalf("staked / profit %% / stale: %+v %v", tot, deref(tot.ProfitPct))
 	}
 	if f.Counts != (bankrollCounts{Pending: 1, Booked: 1, Settled: 2, Open: 2}) {
 		t.Fatalf("counts: %+v", f.Counts)
 	}
-	if f := bankrollFigures(accs, latest, nil, present, now, 0, nil); f.Total.Staked != 0 || f.Total.ProfitPct != nil {
+	if f := bankrollFigures(accs, latest, nil, present, now, nil); f.Total.Staked != 0 || f.Total.ProfitPct != nil {
 		t.Fatalf("nothing staked: %+v", f.Total)
 	}
 }
@@ -288,7 +288,7 @@ func TestBankrollFreshCover(t *testing.T) {
 	// A check order: its tipsport-1 leg never reached the book (not placed), its betano-1 leg is open.
 	chk := &ledgerOrder{row: accounts.BotOrderRow{State: "outcome_unknown"}, check: true, stored: make([]storedLeg, 2),
 		legs: []accounts.BotLedgerLeg{np(lleg("c", 0, "tipsport", 2, 999, 50*h), 60*h), lleg("c", 1, "betano", 2, 100, 50*h)}}
-	f := bankrollFigures(accs, latest(now-fresh-1), []*ledgerOrder{chk}, present, now, 0, fp(2500))
+	f := bankrollFigures(accs, latest(now-fresh-1), []*ledgerOrder{chk}, present, now, fp(2500))
 	by := map[string]bankrollAccount{}
 	for _, a := range f.Accounts {
 		by[a.WindowID] = a
@@ -333,7 +333,7 @@ func TestBankrollFreshCover(t *testing.T) {
 	}
 
 	// tipsport-2 read fresh: the total is no longer stale (the removed fortuna-1 does not count), tipsport can pay.
-	f = bankrollFigures(accs, latest(now), []*ledgerOrder{chk}, present, now, 0, fp(2500))
+	f = bankrollFigures(accs, latest(now), []*ledgerOrder{chk}, present, now, fp(2500))
 	if f.Total.Stale {
 		t.Fatalf("stale with only a removed window old: %s", mustJSON(f.Total))
 	}
@@ -343,14 +343,14 @@ func TestBankrollFreshCover(t *testing.T) {
 		}
 	}
 	// No max leg: no cover, no can-pay.
-	f = bankrollFigures(accs, latest(now), nil, present, now, 0, nil)
+	f = bankrollFigures(accs, latest(now), nil, present, now, nil)
 	for _, a := range f.Accounts {
 		if a.MaxLeg != nil || a.Covers != nil || a.CanPay != nil {
 			t.Fatalf("no max leg: %s", mustJSON(a))
 		}
 	}
 	// An account without a balance: not fresh, age null, no cover, cannot pay.
-	f = bankrollFigures(accs[:1], nil, nil, present, now, 0, fp(2500))
+	f = bankrollFigures(accs[:1], nil, nil, present, now, fp(2500))
 	if a := f.Accounts[0]; a.Fresh || a.BalanceAge != nil || a.Covers != nil || a.CanPay == nil || *a.CanPay || !f.Total.Stale {
 		t.Fatalf("no balance: %s %s", mustJSON(a), mustJSON(f.Total))
 	}

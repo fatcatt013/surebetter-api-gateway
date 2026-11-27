@@ -373,7 +373,7 @@ func (b *botHub) handleBankroll(w http.ResponseWriter, r *http.Request) {
 	if rng != "all" {
 		from = now - bankrollRanges[rng]
 	}
-	cards := bankrollFigures(accs, latest, orders, present, now, from, maxLegOf(st))
+	cards := bankrollFigures(accs, latest, orders, present, now, maxLegOf(st))
 	series, books := bankrollSeries(accs, hist, orders, seriesTimes(hist, orders, from, now))
 	accounts.WriteJSON(w, http.StatusOK, bankrollView{Agents: list, Accounts: cards.Accounts, Books: cards.Books, Total: cards.Total,
 		Counts: cards.Counts, Series: series, BookSeries: books})

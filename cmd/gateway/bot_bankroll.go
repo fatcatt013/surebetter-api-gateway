@@ -323,7 +323,7 @@ type bankrollTotal struct {
 	ArbProfit  float64  `json:"arbProfit"`
 	Booked     float64  `json:"booked"`
 	Settled    float64  `json:"settled"`
-	Staked     float64  `json:"staked"`    // Σ stake of the real legs placed in the range
+	Staked     float64  `json:"staked"`    // Σ stake of the real legs placed (all time, as arbProfit)
 	ProfitPct  *float64 `json:"profitPct"` // arbProfit / staked × 100; null when nothing was staked
 	Stale      bool     `json:"stale"`     // a window (not removed) with point 0 has no balance or an old one
 	Orders     int      `json:"orders"`
@@ -397,12 +397,12 @@ func arbFlowOf(k acctKey, start int64, orders []*ledgerOrder, t int64) float64 {
 
 // bankrollFigures are the cards at now: every account (point 0, a stored or live balance, or a real ledger leg) with
 // its figures, summed per bookmaker and in total, and the order counts. latest is each account's newest balance;
-// present the accounts the agents still have (the others are listed as removed); from the range's start (staked counts
-// the real legs placed from it on; 0 = all); maxLeg the max leg of maxLegOf (nil: no cover figures). Accounts without
+// present the accounts the agents still have (the others are listed as removed); staked counts every real leg placed
+// by now, whatever the range (the same base as arb profit); maxLeg the max leg of maxLegOf (nil: no cover figures). Accounts without
 // point 0 have null balance figures and stay out of the balance sums; their open stakes and arb profit count. A
 // not-placed leg is in no figure.
 func bankrollFigures(accs []accounts.BotAccountRow, latest []accounts.BotBalanceRow, orders []*ledgerOrder, present map[acctKey]bool,
-	now, from int64, maxLeg *float64) bankrollCards {
+	now int64, maxLeg *float64) bankrollCards {
 	list := map[acctKey]*bankrollAccount{}
 	get := func(k acctKey, book string) *bankrollAccount {
 		a := list[k]
@@ -452,7 +452,7 @@ func bankrollFigures(accs []accounts.BotAccountRow, latest []accounts.BotBalance
 			total.Booked += *e.booked
 		}
 		for _, l := range real {
-			if l.PlacedAt >= from && l.PlacedAt <= now {
+			if l.PlacedAt <= now {
 				total.Staked += l.Stake
 			}
 			a := get(acctKey{l.CodeID, l.WindowID}, l.Bookmaker)

@@ -577,7 +577,7 @@ func TestBankroll_Get(t *testing.T) {
 	if len(v.Books) != 3 || v.Books[0].Bookmaker != "betano" || v.Books[1].Bookmaker != "fortuna" || v.Books[2].ArbProfit != 110 {
 		t.Fatalf("books: %s", mustJSON(v.Books))
 	}
-	// Staked in the range: o1 202, o2 100, o3 40; 8 of arb profit. Only the removed betano-1 is old: not stale.
+	// Staked, all time whatever the range: o1 202, o2 100, o3 40; 8 of arb profit. Only the removed betano-1 is old: not stale.
 	if tot.Staked != 342 || tot.ProfitPct == nil || *tot.ProfitPct != 2.34 || tot.Stale {
 		t.Fatalf("staked / profit %% / stale: %s", mustJSON(tot))
 	}
@@ -619,6 +619,9 @@ func TestBankroll_Get(t *testing.T) {
 		var v bankrollView
 		if json.Unmarshal([]byte(body), &v); s != 200 || len(v.Series) != n {
 			t.Errorf("range %q: %d points (%d), want %d", rng, len(v.Series), s, n)
+		}
+		if v.Total.Staked != 342 || v.Total.ProfitPct == nil || *v.Total.ProfitPct != 2.34 {
+			t.Errorf("range %q: staked / profit %%: %s", rng, mustJSON(v.Total))
 		}
 	}
 	if s, body := request(t, srv, "GET", "/api/me/bot/bankroll?range=1y", token, "", nil); s != 400 || !strings.Contains(body, "bad_query") {
