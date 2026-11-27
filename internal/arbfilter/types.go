@@ -23,6 +23,12 @@ type Arb struct {
 	League          string  `json:"league"`
 	MarketName      string  `json:"market_name"`
 	StartTime       int64   `json:"start_time"`
+	// MatchState, MatchStateText, MatchStateSince: the match's state ("running", "break", "interrupted",
+	// "unknown"; "" = unknown), the book's own text and since when (ms) — the arb's (the engine's pick among the
+	// stakes; Repick picks again among the re-picked stakes). Information only: no filter step reads them.
+	MatchState      string `json:"match_state,omitempty"`
+	MatchStateText  string `json:"match_state_text,omitempty"`
+	MatchStateSince int64  `json:"match_state_since,omitempty"`
 }
 
 // Stake is one leg of an arb.
@@ -43,6 +49,10 @@ type Stake struct {
 	// Alternatives: the other bookmakers' prices for this outcome, best first (the engine's
 	// stakes[].alternatives). Read only by Repick; a re-picked arb carries none.
 	Alternatives []Quote `json:"alternatives,omitempty"`
+	// MatchState, MatchStateText, MatchStateSince: the match's state at this leg's bookmaker (see Arb).
+	MatchState      string `json:"match_state,omitempty"`
+	MatchStateText  string `json:"match_state_text,omitempty"`
+	MatchStateSince int64  `json:"match_state_since,omitempty"`
 }
 
 // Quote is another bookmaker's price for a stake's outcome; the fields mean what Stake's do.
@@ -55,6 +65,9 @@ type Quote struct {
 	SourceID        string   `json:"source_id,omitempty"`
 	SourceMarketRef string   `json:"source_market_ref,omitempty"`
 	FairOdds        *float64 `json:"fair_odds,omitempty"`
+	MatchState      string   `json:"match_state,omitempty"`
+	MatchStateText  string   `json:"match_state_text,omitempty"`
+	MatchStateSince int64    `json:"match_state_since,omitempty"`
 }
 
 // FirstSeen is the ms epoch the arb was first detected (first_detected_at, else detected_at, else 0).

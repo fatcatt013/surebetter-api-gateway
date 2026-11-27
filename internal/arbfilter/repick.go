@@ -9,7 +9,8 @@ import "slices"
 // price at any of the books. nil books = every book: the arb is returned unchanged. The result may
 // have profit ≤ 0 (no longer an arb for these books); the caller decides. A re-picked arb's stakes
 // carry no Alternatives; a stake taken from an alternative keeps that quote's every field (source ids,
-// fair odds). The frontend's repickArb (util/repick.ts) is the same rule.
+// fair odds, match state), and the arb's match state is picked again among the new stakes (MatchStateOf).
+// The frontend's repickArb (util/repick.ts) is the same rule.
 func Repick(a Arb, books []string) (Arb, bool) {
 	if books == nil {
 		return a, true
@@ -26,7 +27,8 @@ func Repick(a Arb, books []string) (Arb, bool) {
 				continue
 			}
 			best = Stake{Bookmaker: q.Bookmaker, OutcomeID: s.OutcomeID, Label: q.Label, DecimalOdds: q.DecimalOdds,
-				MatchURL: q.MatchURL, MarketName: q.MarketName, SourceID: q.SourceID, SourceMarketRef: q.SourceMarketRef, FairOdds: q.FairOdds}
+				MatchURL: q.MatchURL, MarketName: q.MarketName, SourceID: q.SourceID, SourceMarketRef: q.SourceMarketRef, FairOdds: q.FairOdds,
+				MatchState: q.MatchState, MatchStateText: q.MatchStateText, MatchStateSince: q.MatchStateSince}
 			found = true
 		}
 		if !found {
@@ -38,6 +40,7 @@ func Repick(a Arb, books []string) (Arb, bool) {
 	if !changed {
 		return out, true
 	}
+	out.MatchState, out.MatchStateText, out.MatchStateSince = MatchStateOf(out.Stakes)
 	index := 0.0
 	for _, s := range out.Stakes {
 		index += 1 / s.DecimalOdds
@@ -47,4 +50,18 @@ func Repick(a Arb, books []string) (Arb, bool) {
 		out.Stakes[i].StakePct = (1 / out.Stakes[i].DecimalOdds) / index * 100
 	}
 	return out, true
+}
+
+// MatchStateOf is an arb's match state from its stakes, the arb engine's rule: the stake whose state is known (not
+// "" or "unknown") with the latest match_state_since (the first one on a tie), its text and since; all unknown →
+// "", "", 0 (omitted).
+func MatchStateOf(stakes []Stake) (state, text string, since int64) {
+	found := false
+	for _, s := range stakes {
+		if s.MatchState == "" || s.MatchState == "unknown" || (found && s.MatchStateSince <= since) {
+			continue
+		}
+		state, text, since, found = s.MatchState, s.MatchStateText, s.MatchStateSince, true
+	}
+	return state, text, since
 }

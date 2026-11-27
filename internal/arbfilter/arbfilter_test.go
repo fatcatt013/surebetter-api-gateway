@@ -78,6 +78,51 @@ func TestRepick_KeepsTheQuotesSourceIDsAndFairOdds(t *testing.T) {
 	}
 }
 
+// A leg taken from an alternative carries that quote's match state, a kept leg its own; the re-picked arb's state is
+// picked again among its stakes (MatchStateOf), an arb nothing re-picked keeps the engine's.
+func TestRepick_KeepsEachQuotesMatchState(t *testing.T) {
+	a := Arb{ProfitPct: 1, MatchState: "break", MatchStateText: "Přestávka", MatchStateSince: 300, Stakes: []Stake{
+		{Bookmaker: "tipsport", OutcomeID: "OVER", DecimalOdds: 2.1, MatchState: "running", MatchStateText: "2. poločas", MatchStateSince: 200},
+		{Bookmaker: "kingsbet", OutcomeID: "UNDER", DecimalOdds: 2.2, MatchState: "break", MatchStateText: "Přestávka", MatchStateSince: 300,
+			Alternatives: []Quote{{Bookmaker: "fortuna", DecimalOdds: 2.05, MatchState: "interrupted", MatchStateText: "Přerušeno", MatchStateSince: 100}}},
+	}}
+	r, ok := ForBookList(a, []string{"tipsport", "fortuna"})
+	if !ok {
+		t.Fatal("tipsport + fortuna price both outcomes at a profit")
+	}
+	if u := r.Stakes[1]; u.Bookmaker != "fortuna" || u.MatchState != "interrupted" || u.MatchStateText != "Přerušeno" || u.MatchStateSince != 100 {
+		t.Fatalf("re-picked leg = %+v", u)
+	}
+	if o := r.Stakes[0]; o.MatchState != "running" || o.MatchStateText != "2. poločas" || o.MatchStateSince != 200 {
+		t.Fatalf("kept leg = %+v", o)
+	}
+	if r.MatchState != "running" || r.MatchStateText != "2. poločas" || r.MatchStateSince != 200 {
+		t.Fatalf("re-picked arb state = %q %q %d, want tipsport's (the latest known)", r.MatchState, r.MatchStateText, r.MatchStateSince)
+	}
+	if same, _ := Repick(a, []string{"tipsport", "kingsbet"}); same.MatchState != "break" || same.MatchStateSince != 300 {
+		t.Fatalf("nothing re-picked: the arb keeps its state, got %q %d", same.MatchState, same.MatchStateSince)
+	}
+}
+
+func TestMatchStateOf_TheEnginesRule(t *testing.T) {
+	cases := []struct {
+		name   string
+		stakes []Stake
+		want   string
+		since  int64
+	}{
+		{"all unknown", []Stake{{MatchState: "unknown", MatchStateSince: 9}, {}}, "", 0},
+		{"latest known", []Stake{{MatchState: "running", MatchStateSince: 5}, {MatchState: "unknown", MatchStateSince: 9}, {MatchState: "break", MatchStateSince: 7}}, "break", 7},
+		{"tie: the first", []Stake{{MatchState: "running", MatchStateSince: 7}, {MatchState: "break", MatchStateSince: 7}}, "running", 7},
+		{"known without since", []Stake{{}, {MatchState: "interrupted"}}, "interrupted", 0},
+	}
+	for _, c := range cases {
+		if got, _, since := MatchStateOf(c.stakes); got != c.want || since != c.since {
+			t.Errorf("%s: %q %d, want %q %d", c.name, got, since, c.want, c.since)
+		}
+	}
+}
+
 // ComputeStakes gives the app's stakes for the shared vectors (surebetter-common
 // docs/superpowers/plans/2026-11-14-stake-vectors.json, made by the app's computeStakes; copied byte for byte).
 func TestComputeStakes_SharedVectors(t *testing.T) {

@@ -46,6 +46,26 @@ type botLeg struct {
 	// 1 Some limits, 2 Strict. The gateway sets it when the order is sent (an order body's is ignored;
 	// a Try body's is used as given). nil: not sent yet, or an order older than Phase 3b.
 	LimitLevel *int `json:"limit_level,omitempty"`
+	// MatchState is the match's state at this leg's bookmaker as the app or auto mode sent it ("running", "break",
+	// "interrupted", "unknown"; "" = not sent = unknown), MatchStateText that book's own text (at most 120
+	// characters), MatchStateSince since when (Unix ms, 0 = unknown). Information for the agent; kept with the order.
+	MatchState      string `json:"match_state,omitempty"`
+	MatchStateText  string `json:"match_state_text,omitempty"`
+	MatchStateSince int64  `json:"match_state_since,omitempty"`
+}
+
+// maxMatchStateText is the longest match_state_text an order leg may carry (characters).
+const maxMatchStateText = 120
+
+// matchStates are the match_state values an order and its legs may carry ("" = not sent = unknown).
+var matchStates = map[string]bool{"": true, "running": true, "break": true, "interrupted": true, "unknown": true}
+
+// orderMatchState is s when an order may carry it, else "" (auto mode passes the engine's value through it).
+func orderMatchState(s string) string {
+	if matchStates[s] {
+		return s
+	}
+	return ""
 }
 
 // botBankroll is the app's bankroll settings when the owner sent the order (odds drop), passed to the
@@ -80,6 +100,8 @@ type botOrderIn struct {
 	// EventID is the arb's match (auto-mode contract §4.2, at most 128 characters); "" = read it from the arb key
 	// (orderEventID).
 	EventID string `json:"event_id"`
+	// MatchState is the arb's match state (its match_state, see botLeg.MatchState); "" = not sent = unknown.
+	MatchState string `json:"match_state"`
 }
 
 // agentLeg is a leg as the agent receives it: the app's leg plus the window the gateway reserved.
@@ -111,6 +133,8 @@ type botOrderMsg struct {
 	Bankroll     *botBankroll `json:"bankroll,omitempty"`
 	MaxOrder     int64        `json:"max_order"`
 	Source       string       `json:"source"` // "app" or "auto" (the automatic mode); agents that do not know it ignore it
+	// MatchState is the arb's match state as the order was posted with it; omitted when it was not sent (unknown).
+	MatchState string `json:"match_state,omitempty"`
 }
 
 // orderInfo is an order's display fields and the arb's fields the agent gets (bot_orders.info_json).
@@ -131,6 +155,8 @@ type orderInfo struct {
 	// FirstDetectedAt is the arb's first_detected_at when an auto order was made of it (auto mode's "same prices"
 	// rule reads it back after a restart); 0 for app orders.
 	FirstDetectedAt int64 `json:"firstDetectedAt,omitempty"`
+	// MatchState is the arb's match state the order was posted with ("" = not sent = unknown).
+	MatchState string `json:"matchState,omitempty"`
 }
 
 // infoOf is in's display and arb fields as info_json keeps them (rounding 1 when absent), with its
@@ -141,7 +167,7 @@ func infoOf(in botOrderIn) orderInfo {
 		rounding = *in.Rounding
 	}
 	info := orderInfo{Match: in.Match, Market: in.Market, Live: in.Live, ProfitPct: in.ProfitPct, MarketType: in.MarketType, Line: in.Line,
-		IsLive: in.IsLive, Sport: in.Sport, Rounding: rounding, Bankroll: in.Bankroll}
+		IsLive: in.IsLive, Sport: in.Sport, Rounding: rounding, Bankroll: in.Bankroll, MatchState: in.MatchState}
 	if in.MinProfitPct != nil {
 		info.MinProfitPct = *in.MinProfitPct
 	}
@@ -218,7 +244,8 @@ func (o *botOrder) message(st accounts.BotSettings, windows [2]string, levels [2
 	}
 	msg := botOrderMsg{OrderID: o.id, ArbKey: o.arbKey, DryRun: st.DryRun || o.forceDry, MarketType: o.info.MarketType, Line: o.info.Line,
 		IsLive: o.info.IsLive, Sport: o.info.Sport, Match: o.info.Match, Rounding: o.info.Rounding, MaxLeg: st.MaxLeg,
-		RulesOn: rules, OddsDrop: oddsDropOf(st, o.info), Bankroll: o.info.Bankroll, MaxOrder: st.MaxOrder, Source: o.sourceOrApp()}
+		RulesOn: rules, OddsDrop: oddsDropOf(st, o.info), Bankroll: o.info.Bankroll, MaxOrder: st.MaxOrder, Source: o.sourceOrApp(),
+		MatchState: o.info.MatchState}
 	if o.info.MinProfitPct > 0 {
 		min := o.info.MinProfitPct
 		msg.MinProfitPct = &min
@@ -427,14 +454,17 @@ func validTry(o botOrderIn) bool {
 }
 
 // validArbFields checks the fields the agent's rules read: market_type at most 64 and sport at most
-// 40 characters, event_id at most 128, rounding absent or 1, 10 or 100, each leg's outcome_id at most 120 characters and
-// its fair_odds absent, null or above 1.
+// 40 characters, event_id at most 128, rounding absent or 1, 10 or 100, match_state absent or one of matchStates,
+// each leg's outcome_id at most 120 characters, its fair_odds absent, null or above 1, its match_state absent or
+// one of matchStates, its match_state_text at most 120 characters and its match_state_since not negative.
 func validArbFields(o botOrderIn) bool {
-	if runeLen(o.MarketType) > 64 || runeLen(o.Sport) > 40 || runeLen(o.EventID) > 128 || (o.Rounding != nil && *o.Rounding != 1 && *o.Rounding != 10 && *o.Rounding != 100) {
+	if runeLen(o.MarketType) > 64 || runeLen(o.Sport) > 40 || runeLen(o.EventID) > 128 || (o.Rounding != nil && *o.Rounding != 1 && *o.Rounding != 10 && *o.Rounding != 100) ||
+		!matchStates[o.MatchState] {
 		return false
 	}
 	for _, l := range o.Legs {
-		if runeLen(l.OutcomeID) > 120 || (l.FairOdds != nil && !(*l.FairOdds > 1)) {
+		if runeLen(l.OutcomeID) > 120 || (l.FairOdds != nil && !(*l.FairOdds > 1)) || !matchStates[l.MatchState] ||
+			runeLen(l.MatchStateText) > maxMatchStateText || l.MatchStateSince < 0 {
 			return false
 		}
 	}

@@ -151,6 +151,12 @@ type ArbOpportunity struct {
 	// longer holds). The gateway drops it from client state immediately instead of
 	// waiting out the eviction TTL. Omitted (false) for normal opportunities.
 	Removed bool `json:"removed"`
+	// MatchState is the match's state at the bookmakers ("running", "break", "interrupted", "unknown"; omitted =
+	// unknown): the engine's pick among the stakes (the latest non-unknown one), with that book's own text and since
+	// when (ms). Relayed verbatim; information only, nothing in the gateway decides on it.
+	MatchState      string `json:"match_state,omitempty"`
+	MatchStateText  string `json:"match_state_text,omitempty"`
+	MatchStateSince int64  `json:"match_state_since,omitempty"`
 }
 
 // oppStateKey returns the composite state key, mirroring the arb-engine's storage
@@ -193,6 +199,11 @@ type StakeAllocation struct {
 	// empty, as the engine sends it — so the app can re-pick each outcome among the books its
 	// filter shows; the Telegram bot re-picks among its preset's books (telegram.Repick).
 	Alternatives []AltQuote `json:"alternatives,omitempty"`
+	// MatchState, MatchStateText, MatchStateSince: the match's state at this leg's bookmaker (see
+	// ArbOpportunity.MatchState). Relayed verbatim, omitted when the engine omits them.
+	MatchState      string `json:"match_state,omitempty"`
+	MatchStateText  string `json:"match_state_text,omitempty"`
+	MatchStateSince int64  `json:"match_state_since,omitempty"`
 }
 
 // AltQuote mirrors the arb-engine's AltQuote: another bookmaker's price for a stake's outcome.
@@ -207,6 +218,9 @@ type AltQuote struct {
 	SourceID        string   `json:"source_id,omitempty"`
 	SourceMarketRef string   `json:"source_market_ref,omitempty"`
 	FairOdds        *float64 `json:"fair_odds"`
+	MatchState      string   `json:"match_state,omitempty"`
+	MatchStateText  string   `json:"match_state_text,omitempty"`
+	MatchStateSince int64    `json:"match_state_since,omitempty"`
 }
 
 // ── ValueBet (mirrors the arb-engine's value.rs ValueBet) ──────────────────

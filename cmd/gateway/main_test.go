@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/surebetter/api-gateway/internal/arbfilter"
 )
 
 // ── ArbOpportunity deserialization ────────────────────────────────────────────
@@ -92,6 +94,62 @@ func TestStakeAllocation_FairOddsRelayed(t *testing.T) {
 		got, present := back["fair_odds"]
 		if !present || got != want {
 			t.Errorf("%s → fair_odds = %v (present %v), want %v (re-marshalled: %s)", in, got, present, want, out)
+		}
+	}
+}
+
+// The match state (arb, every stake, every alternative) survives the unmarshal → re-marshal, stays absent when the
+// engine leaves it out, and reaches the Telegram notifier and auto mode (toFilterArb).
+func TestArbOpportunity_MatchStateRelayed(t *testing.T) {
+	alt := `{"bookmaker":"betano","decimal_odds":4,"label":"Away","market_name":"Zápas","match_url":"","odds_updated_at":5,"fair_odds":null,` +
+		`"match_state":"interrupted","match_state_text":"Přerušeno","match_state_since":1795775570000}`
+	stake := `{"bookmaker":"kingsbet","outcome_id":"AWAY","decimal_odds":4.1,"stake_pct":24.8,"fair_odds":null,"match_state":"break",` +
+		`"match_state_text":"Přestávka (1:2)","match_state_since":1795775570466,"alternatives":[` + alt + `]}`
+	in := `{"event_id":"e","sport":"football-live","stakes":[` + stake + `],"match_state":"break","match_state_text":"Přestávka (1:2)",` +
+		`"match_state_since":1795775570466}`
+	var opp ArbOpportunity
+	if err := json.Unmarshal([]byte(in), &opp); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := json.Marshal(opp)
+	var back struct {
+		MatchState      string `json:"match_state"`
+		MatchStateText  string `json:"match_state_text"`
+		MatchStateSince int64  `json:"match_state_since"`
+		Stakes          []struct {
+			MatchState      string `json:"match_state"`
+			MatchStateText  string `json:"match_state_text"`
+			MatchStateSince int64  `json:"match_state_since"`
+			Alternatives    []struct {
+				MatchState      string `json:"match_state"`
+				MatchStateText  string `json:"match_state_text"`
+				MatchStateSince int64  `json:"match_state_since"`
+			} `json:"alternatives"`
+		} `json:"stakes"`
+	}
+	_ = json.Unmarshal(out, &back)
+	if back.MatchState != "break" || back.MatchStateText != "Přestávka (1:2)" || back.MatchStateSince != 1795775570466 || len(back.Stakes) != 1 {
+		t.Fatalf("arb match state lost: %s", out)
+	}
+	if s := back.Stakes[0]; s.MatchState != "break" || s.MatchStateText != "Přestávka (1:2)" || s.MatchStateSince != 1795775570466 ||
+		len(s.Alternatives) != 1 || s.Alternatives[0].MatchState != "interrupted" || s.Alternatives[0].MatchStateText != "Přerušeno" ||
+		s.Alternatives[0].MatchStateSince != 1795775570000 {
+		t.Fatalf("stake match state lost: %s", out)
+	}
+
+	var bare ArbOpportunity
+	_ = json.Unmarshal([]byte(`{"event_id":"e","stakes":[{"bookmaker":"kingsbet","alternatives":[{"bookmaker":"betano"}]}]}`), &bare)
+	if out, _ := json.Marshal(bare); strings.Contains(string(out), "match_state") {
+		t.Errorf("an absent match state must stay absent: %s", out)
+	}
+
+	ta := toTelegramArb(opp)
+	fa := toFilterArb(opp)
+	for name, a := range map[string]arbfilter.Arb{"telegram": ta, "filter": fa} {
+		if a.MatchState != "break" || a.MatchStateText != "Přestávka (1:2)" || a.MatchStateSince != 1795775570466 ||
+			a.Stakes[0].MatchState != "break" || a.Stakes[0].MatchStateSince != 1795775570466 ||
+			a.Stakes[0].Alternatives[0].MatchState != "interrupted" || a.Stakes[0].Alternatives[0].MatchStateText != "Přerušeno" {
+			t.Errorf("%s arb = %+v", name, a)
 		}
 	}
 }

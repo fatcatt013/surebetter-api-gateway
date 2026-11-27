@@ -24,6 +24,11 @@ type orderLegView struct {
 	// LimitLevel is the leg's level in the agent's limit index when the order was sent (0–2); null =
 	// not sent yet (waiting) or an order older than Phase 3b.
 	LimitLevel *int `json:"limitLevel"`
+	// MatchState, MatchStateText, MatchStateSince: the match's state at the leg's bookmaker as the order was posted
+	// with it (omitted when not sent = unknown).
+	MatchState      string `json:"matchState,omitempty"`
+	MatchStateText  string `json:"matchStateText,omitempty"`
+	MatchStateSince int64  `json:"matchStateSince,omitempty"`
 }
 
 // orderView is one order in GET /api/me/bot/orders.
@@ -63,6 +68,8 @@ type orderView struct {
 	// Source: "app" or "auto" (the automatic mode); EventID: the order's match ("" for orders older than migration 13).
 	Source  string `json:"source"`
 	EventID string `json:"eventId"`
+	// MatchState: the arb's match state the order was posted with (omitted when not sent = unknown).
+	MatchState string `json:"matchState,omitempty"`
 }
 
 // checkableOf: an ended (final state), real order that ended outcome_unknown or whose last flow has
@@ -85,7 +92,7 @@ func legViews(legs []storedLeg) []orderLegView {
 	for _, l := range legs {
 		out = append(out, orderLegView{Bookmaker: l.Bookmaker, WindowID: l.WindowID, Label: l.Label, Odds: l.Odds, Stake: l.Stake,
 			Step: l.Step, StepAt: l.StepAt, OutcomeID: l.OutcomeID, Placed: l.Placed, FairOdds: l.FairOdds,
-			LimitLevel: l.LimitLevel})
+			LimitLevel: l.LimitLevel, MatchState: l.MatchState, MatchStateText: l.MatchStateText, MatchStateSince: l.MatchStateSince})
 	}
 	return out
 }
@@ -94,6 +101,7 @@ func legViews(legs []storedLeg) []orderLegView {
 // flow, rule and playbook from the stored flow ("" = none).
 func (v orderView) withDetails(info orderInfo, flow string) orderView {
 	v.MarketType, v.Line, v.IsLive, v.Sport, v.Rounding = info.MarketType, info.Line, info.IsLive, info.Sport, info.Rounding
+	v.MatchState = info.MatchState
 	if v.Rounding == 0 {
 		v.Rounding = 1
 	}

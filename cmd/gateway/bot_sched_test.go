@@ -1038,6 +1038,13 @@ func TestBotSched_OrderFieldsValidation(t *testing.T) {
 		"fair_odds 0.5":       `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":0.5}]}`,
 		"fair_odds negative":  `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":-2}]}`,
 		"fair_odds a string":  `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":"1.9"}]}`,
+		"match_state other":   with(`"match_state":"paused"`),
+		"match_state case":    with(`"match_state":"Break"`),
+		"match_state number":  with(`"match_state":1`),
+		"leg match_state":     `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"match_state":"halftime"}]}`,
+		"leg text over 120":   `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"match_state_text":"` + strings.Repeat("ř", 121) + `"}]}`,
+		"leg since negative":  `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"match_state_since":-1}]}`,
+		"leg since a string":  `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"match_state_since":"5"}]}`,
 	}
 	for name, body := range bad {
 		if s, b := postOrder(t, srv, token, body); s != 400 || !strings.Contains(b, `"bad_order"`) {
@@ -1046,17 +1053,64 @@ func TestBotSched_OrderFieldsValidation(t *testing.T) {
 	}
 	// At the limits, and null line / rounding: valid (no agent online, so the next check answers).
 	for name, body := range map[string]string{
-		"limits":         with(`"market_type":"` + strings.Repeat("M", 64) + `","sport":"` + strings.Repeat("s", 40) + `","rounding":100`),
-		"nulls":          with(`"line":null,"rounding":null`),
-		"rounding 1":     with(`"rounding":1`),
-		"outcome_id 120": `{"arb_key":"k","legs":[` + tip + `,` + rulesLeg("betano", "s2", strings.Repeat("o", 120), 2.05, 102) + `]}`,
-		"fair_odds":      `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":1.01}]}`,
-		"fair_odds null": `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":null}]}`,
+		"limits":            with(`"market_type":"` + strings.Repeat("M", 64) + `","sport":"` + strings.Repeat("s", 40) + `","rounding":100`),
+		"nulls":             with(`"line":null,"rounding":null`),
+		"rounding 1":        with(`"rounding":1`),
+		"outcome_id 120":    `{"arb_key":"k","legs":[` + tip + `,` + rulesLeg("betano", "s2", strings.Repeat("o", 120), 2.05, 102) + `]}`,
+		"fair_odds":         `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":1.01}]}`,
+		"fair_odds null":    `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"fair_odds":null}]}`,
+		"match_state empty": with(`"match_state":""`),
+		"leg text 120": `{"arb_key":"k","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"match_state":"interrupted","match_state_text":"` +
+			strings.Repeat("ř", 120) + `","match_state_since":0}]}`,
 	} {
 		if s, b := postOrder(t, srv, token, body); s != 409 || !strings.Contains(b, `"bot_offline"`) {
 			t.Errorf("%s: %d %s, want 409 bot_offline", name, s, b)
 		}
 	}
+	for _, st := range []string{"running", "break", "interrupted", "unknown"} {
+		body := `{"arb_key":"k","match_state":"` + st + `","legs":[` + tip + `,` + strings.TrimSuffix(bet, "}") + `,"match_state":"` + st + `"}]}`
+		if s, b := postOrder(t, srv, token, body); s != 409 || !strings.Contains(b, `"bot_offline"`) {
+			t.Errorf("match_state %s: %d %s, want 409 bot_offline", st, s, b)
+		}
+	}
+}
+
+// The order's match state (the arb's) and each leg's reach the agent, are kept in info_json / legs_json and shown
+// by GET /api/me/bot/orders (an order without them carries none: TestBotSched_OrderWithoutTheNewFields).
+func TestBotSched_MatchStateReachesTheAgent(t *testing.T) {
+	srv, svc, _, db := newBotServerDB(t)
+	token := newUser(t, svc, "u@example.com", accounts.RoleUser)
+	app := appSocket(t, srv, token)
+	bot := startBot(t, srv, newCode(t, srv, token, "bot"), app)
+	over := strings.TrimSuffix(legJSON("tipsport", "s1", 2.1, 100), "}") + `,"match_state":"running","match_state_text":"2. poločas","match_state_since":1795775500000}`
+	under := strings.TrimSuffix(legJSON("betano", "s2", 2.05, 102), "}") + `,"match_state":"break","match_state_text":"Přestávka (1:2)","match_state_since":1795775570466}`
+	a := postOrderOK(t, srv, token, `{"arb_key":"arb-1","match_state":"break","legs":[`+over+`,`+under+`]}`)
+	o := readOrderJSON(t, bot)
+	if o["match_state"] != "break" {
+		t.Fatalf("order match_state = %v", o["match_state"])
+	}
+	legs := o["legs"].([]any)
+	l0, l1 := legs[0].(map[string]any), legs[1].(map[string]any)
+	if l0["match_state"] != "running" || l0["match_state_text"] != "2. poločas" || l0["match_state_since"] != 1795775500000.0 ||
+		l1["match_state"] != "break" || l1["match_state_text"] != "Přestávka (1:2)" || l1["match_state_since"] != 1795775570466.0 {
+		t.Fatalf("legs: %v", legs)
+	}
+	expectEvent(t, app, a.OrderID, "sent", "")
+	var info string
+	db.QueryRow(`SELECT info_json FROM bot_orders WHERE id = ?`, a.OrderID).Scan(&info)
+	if !strings.Contains(info, `"matchState":"break"`) {
+		t.Fatalf("info_json: %s", info)
+	}
+	if _, _, _, _, rowLegs := orderRow(t, db, a.OrderID); len(rowLegs) != 2 || rowLegs[0].MatchState != "running" ||
+		rowLegs[1].MatchStateText != "Přestávka (1:2)" || rowLegs[1].MatchStateSince != 1795775570466 {
+		t.Fatalf("legs_json: %+v", rowLegs)
+	}
+	s, b := request(t, srv, "GET", "/api/me/bot/orders", token, "", nil)
+	if s != 200 || !strings.Contains(b, `"matchState":"break"`) ||
+		!strings.Contains(b, `"matchState":"running","matchStateText":"2. poločas","matchStateSince":1795775500000`) {
+		t.Fatalf("orders %d %s", s, b)
+	}
+
 }
 
 // The order message carries the arb's fields, each leg's side and, from the settings at send time,
@@ -1132,6 +1186,9 @@ func TestBotSched_OrderWithoutTheNewFields(t *testing.T) {
 	}
 	if leg := o["legs"].([]any)[0].(map[string]any); leg["outcome_id"] != "" || leg["fair_odds"] != nil {
 		t.Fatalf("leg: %v", leg)
+	}
+	if js, _ := json.Marshal(o); strings.Contains(string(js), "match_state") {
+		t.Fatalf("an order without a match state carries none: %s", js)
 	}
 	// Odds drop: strict, max_order always sent, no minimum or bankroll.
 	_, hasMin := o["min_profit_pct"]

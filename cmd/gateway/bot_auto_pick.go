@@ -247,15 +247,18 @@ func toFilterArb(o ArbOpportunity) arbfilter.Arb {
 	stakes := make([]arbfilter.Stake, len(o.Stakes))
 	for i, s := range o.Stakes {
 		stakes[i] = arbfilter.Stake{Bookmaker: s.Bookmaker, OutcomeID: s.OutcomeID, Label: s.Label, DecimalOdds: s.DecimalOdds, StakePct: s.StakePct,
-			MatchURL: s.MatchURL, MarketName: s.MarketName, SourceID: s.SourceID, SourceMarketRef: s.SourceMarketRef, FairOdds: s.FairOdds}
+			MatchURL: s.MatchURL, MarketName: s.MarketName, SourceID: s.SourceID, SourceMarketRef: s.SourceMarketRef, FairOdds: s.FairOdds,
+			MatchState: s.MatchState, MatchStateText: s.MatchStateText, MatchStateSince: s.MatchStateSince}
 		for _, q := range s.Alternatives {
 			stakes[i].Alternatives = append(stakes[i].Alternatives, arbfilter.Quote{Bookmaker: q.Bookmaker, Label: q.Label, DecimalOdds: q.DecimalOdds,
-				MatchURL: q.MatchURL, MarketName: q.MarketName, SourceID: q.SourceID, SourceMarketRef: q.SourceMarketRef, FairOdds: q.FairOdds})
+				MatchURL: q.MatchURL, MarketName: q.MarketName, SourceID: q.SourceID, SourceMarketRef: q.SourceMarketRef, FairOdds: q.FairOdds,
+				MatchState: q.MatchState, MatchStateText: q.MatchStateText, MatchStateSince: q.MatchStateSince})
 		}
 	}
 	return arbfilter.Arb{EventID: o.EventID, Sport: o.Sport, MarketType: o.MarketType, Line: o.Line, ProfitPct: o.ProfitPct, Stakes: stakes,
 		DetectedAt: o.DetectedAt, FirstDetectedAt: o.FirstDetectedAt, LastChangedAt: o.LastChangedAt, NameHome: o.NameHome, NameAway: o.NameAway,
-		League: o.League, MarketName: o.MarketName, StartTime: o.StartTime}
+		League: o.League, MarketName: o.MarketName, StartTime: o.StartTime,
+		MatchState: o.MatchState, MatchStateText: o.MatchStateText, MatchStateSince: o.MatchStateSince}
 }
 
 // orderArbKey is the app's arbKey: "<event_id>:<market_type>:<line>", the line written as JavaScript writes a number.
@@ -373,7 +376,8 @@ func truncRunes(s string, n int) string {
 }
 
 // autoOrderIn is the order the app's row would send for the re-picked arb r with stakes (botOrderLegs /
-// botOrderInfo), with the auto bankroll and minimum profit.
+// botOrderInfo), with the auto bankroll and minimum profit; the order's match state is r's, each leg's its stake's
+// (a state the order body would refuse goes as "", like the app's absent one).
 func autoOrderIn(opp ArbOpportunity, r arbfilter.Arb, stakes []float64, cfg autoSettings) botOrderIn {
 	live := arbfilter.IsLive(opp.Sport)
 	line := opp.Line
@@ -383,7 +387,7 @@ func autoOrderIn(opp ArbOpportunity, r arbfilter.Arb, stakes []float64, cfg auto
 	in := botOrderIn{ArbKey: orderArbKey(opp), Match: truncRunes(opp.NameHome+" – "+opp.NameAway, 200), Market: truncRunes(opp.MarketName, 200),
 		Live: live, ProfitPct: r.ProfitPct, MarketType: truncRunes(opp.MarketType, 64), Line: &line, IsLive: live,
 		Sport: truncRunes(arbfilter.BaseSport(opp.Sport), 40), Rounding: &rounding, MinProfitPct: &minProfit, Bankroll: &br,
-		EventID: truncRunes(opp.EventID, 128)}
+		EventID: truncRunes(opp.EventID, 128), MatchState: orderMatchState(r.MatchState)}
 	for i, s := range r.Stakes {
 		market := s.MarketName
 		if market == "" {
@@ -399,7 +403,8 @@ func autoOrderIn(opp ArbOpportunity, r arbfilter.Arb, stakes []float64, cfg auto
 			fair = &v
 		}
 		in.Legs = append(in.Legs, botLeg{Bookmaker: s.Bookmaker, MatchURL: s.MatchURL, SourceID: s.SourceID, SourceMarketRef: s.SourceMarketRef,
-			MarketName: market, Label: label, Odds: s.DecimalOdds, Stake: stakes[i], OutcomeID: truncRunes(s.OutcomeID, 120), FairOdds: fair})
+			MarketName: market, Label: label, Odds: s.DecimalOdds, Stake: stakes[i], OutcomeID: truncRunes(s.OutcomeID, 120), FairOdds: fair,
+			MatchState: orderMatchState(s.MatchState), MatchStateText: truncRunes(s.MatchStateText, maxMatchStateText), MatchStateSince: max(s.MatchStateSince, 0)})
 	}
 	return in
 }

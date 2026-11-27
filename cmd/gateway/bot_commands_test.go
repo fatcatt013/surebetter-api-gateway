@@ -264,8 +264,8 @@ func TestBotCommands_PendingCommandMakesAnOrderWait(t *testing.T) {
 var tipBetIdleP3 = strings.Replace(tipBetIdle, `"proto":2`, `"proto":3`, 1)
 
 // tryBody is a Try body as the app prefills it from a recent order: no arb key, no selection ids.
-const tryBody = `{"legs":[{"bookmaker":"tipsport","odds":2.05,"stake":1000,"outcome_id":"OVER"},{"bookmaker":"betano","odds":2,"stake":1025,"outcome_id":"UNDER"}],` +
-	`"market_type":"TOTAL_CORNERS","line":9.5,"is_live":true,"sport":"football","rounding":10}`
+const tryBody = `{"legs":[{"bookmaker":"tipsport","odds":2.05,"stake":1000,"outcome_id":"OVER"},{"bookmaker":"betano","odds":2,"stake":1025,"outcome_id":"UNDER",` +
+	`"match_state":"break","match_state_text":"Přestávka"}],"market_type":"TOTAL_CORNERS","line":9.5,"is_live":true,"sport":"football","rounding":10,"match_state":"break"}`
 
 // tryResult is an agent's answer to a Try.
 const tryResult = `{"rule":"totals-over-first","ruleOn":true,"playbook":"overFirst","wouldMatch":"totals-over-first",` +
@@ -317,6 +317,9 @@ func TestBotTry_RoundTrip(t *testing.T) {
 	if len(legs) != 2 || legs[0].(map[string]any)["outcome_id"] != "OVER" || legs[1].(map[string]any)["window_id"] != "" ||
 		legs[1].(map[string]any)["stake"] != float64(1025) {
 		t.Fatalf("try legs: %v", legs)
+	}
+	if o["match_state"] != "break" || legs[1].(map[string]any)["match_state"] != "break" || legs[1].(map[string]any)["match_state_text"] != "Přestávka" {
+		t.Fatalf("try match state: %v", o)
 	}
 	// ok without a result is refused (the app keeps waiting); then the result is the app's answer.
 	if s, b := postAck(t, srv, code, `{"id":"`+cmdID+`","ok":true}`); s != 400 || !strings.Contains(b, `"bad_command"`) {

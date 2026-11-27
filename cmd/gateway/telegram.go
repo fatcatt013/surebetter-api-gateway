@@ -50,19 +50,22 @@ func setupTelegram(ctx context.Context, cfg Config, hub *Hub, rdb *redis.Client,
 	return n
 }
 
-// toTelegramArb copies the fields the notifier reads.
+// toTelegramArb copies the fields the notifier reads, and the match state (arb, stakes, alternatives: not shown yet).
 func toTelegramArb(o ArbOpportunity) telegram.Arb {
 	stakes := make([]telegram.Stake, len(o.Stakes))
 	for i, s := range o.Stakes {
-		stakes[i] = telegram.Stake{Bookmaker: s.Bookmaker, OutcomeID: s.OutcomeID, Label: s.Label, DecimalOdds: s.DecimalOdds, StakePct: s.StakePct, MatchURL: s.MatchURL, MarketName: s.MarketName}
+		stakes[i] = telegram.Stake{Bookmaker: s.Bookmaker, OutcomeID: s.OutcomeID, Label: s.Label, DecimalOdds: s.DecimalOdds, StakePct: s.StakePct, MatchURL: s.MatchURL, MarketName: s.MarketName,
+			MatchState: s.MatchState, MatchStateText: s.MatchStateText, MatchStateSince: s.MatchStateSince}
 		for _, q := range s.Alternatives {
-			stakes[i].Alternatives = append(stakes[i].Alternatives, telegram.Quote{Bookmaker: q.Bookmaker, Label: q.Label, DecimalOdds: q.DecimalOdds, MatchURL: q.MatchURL, MarketName: q.MarketName})
+			stakes[i].Alternatives = append(stakes[i].Alternatives, telegram.Quote{Bookmaker: q.Bookmaker, Label: q.Label, DecimalOdds: q.DecimalOdds, MatchURL: q.MatchURL, MarketName: q.MarketName,
+				MatchState: q.MatchState, MatchStateText: q.MatchStateText, MatchStateSince: q.MatchStateSince})
 		}
 	}
 	return telegram.Arb{
 		EventID: o.EventID, Sport: o.Sport, MarketType: o.MarketType, Line: o.Line, ProfitPct: o.ProfitPct, Stakes: stakes,
 		DetectedAt: o.DetectedAt, FirstDetectedAt: o.FirstDetectedAt, LastChangedAt: o.LastChangedAt,
 		NameHome: o.NameHome, NameAway: o.NameAway, League: o.League, MarketName: o.MarketName, StartTime: o.StartTime,
+		MatchState: o.MatchState, MatchStateText: o.MatchStateText, MatchStateSince: o.MatchStateSince,
 	}
 }
 

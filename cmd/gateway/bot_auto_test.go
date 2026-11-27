@@ -296,9 +296,13 @@ func TestAuto_DryRunOrderFields(t *testing.T) {
 	})
 	e.setAuto("dry", "", "", "")
 	fair := 1.99
-	a := e.arbOf("tennis-live:aa", "TOTAL_GAMES", 22.5, sl("tipsport", "OVER", 2.1),
+	tip := sl("tipsport", "OVER", 2.1)
+	tip.MatchState, tip.MatchStateText, tip.MatchStateSince = "running", "3. set", 1795775500000
+	a := e.arbOf("tennis-live:aa", "TOTAL_GAMES", 22.5, tip,
 		sl("kingsbet", "UNDER", 2.2, AltQuote{Bookmaker: "fortuna", DecimalOdds: 2.1, Label: "Méně 22.5", MarketName: "Počet gamů", MatchURL: "https://f/m",
-			SourceID: "f-77", SourceMarketRef: "fm-1", FairOdds: &fair}))
+			SourceID: "f-77", SourceMarketRef: "fm-1", FairOdds: &fair, MatchState: "interrupted", MatchStateText: "Přerušeno", MatchStateSince: 1795775570000}))
+	a.Stakes[1].MatchState = "break" // kingsbet's, not re-picked: neither the order's nor a leg's
+	a.MatchState, a.MatchStateText, a.MatchStateSince = "break", "Přestávka", 1795775600000
 	o := e.sendNext(a)
 	if o["source"] != "auto" || o["dry_run"] != true || o["arb_key"] != "tennis-live:aa:TOTAL_GAMES:22.5" || o["min_profit_pct"] != 2.0 ||
 		o["sport"] != "tennis" || o["is_live"] != true || o["match"] != "Sinner – Alcaraz" || o["rounding"] != 1.0 {
@@ -313,8 +317,15 @@ func TestAuto_DryRunOrderFields(t *testing.T) {
 	legs := o["legs"].([]any)
 	f := legs[1].(map[string]any)
 	if f["bookmaker"] != "fortuna" || f["source_id"] != "f-77" || f["source_market_ref"] != "fm-1" || f["match_url"] != "https://f/m" ||
-		f["label"] != "Méně 22.5" || f["market_name"] != "Počet gamů" || f["fair_odds"] != 1.99 || f["outcome_id"] != "UNDER" || f["stake"] != 500.0 {
+		f["label"] != "Méně 22.5" || f["market_name"] != "Počet gamů" || f["fair_odds"] != 1.99 || f["outcome_id"] != "UNDER" || f["stake"] != 500.0 ||
+		f["match_state"] != "interrupted" || f["match_state_text"] != "Přerušeno" || f["match_state_since"] != 1795775570000.0 {
 		t.Fatalf("re-picked leg %v", f)
+	}
+	if tl := legs[0].(map[string]any); tl["match_state"] != "running" || tl["match_state_text"] != "3. set" || tl["match_state_since"] != 1795775500000.0 {
+		t.Fatalf("kept leg %v", tl)
+	}
+	if o["match_state"] != "interrupted" { // the re-picked arb's: fortuna's is the latest known
+		t.Fatalf("order match_state %v", o["match_state"])
 	}
 	var src, ev, info string
 	var dry bool
