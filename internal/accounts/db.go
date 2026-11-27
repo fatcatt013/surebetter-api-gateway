@@ -340,6 +340,44 @@ var migrations = []string{
 		PRIMARY KEY (order_id, leg)
 	);
 	CREATE INDEX bot_ledger_legs_user_placed ON bot_ledger_legs (user_id, placed_at);`,
+	// 16: bot bankroll v2: the leg result not_placed (a leg of an outcome_unknown or stuck order that the owner confirms
+	// never reached the bookmaker; payout NULL). SQLite cannot change a CHECK in place, so bot_ledger_legs is rebuilt like
+	// bot_orders in migration 6: a copy with the new CHECK, every row copied, the old table dropped, the copy renamed and
+	// its index created again (nothing references bot_ledger_legs). It runs in migrate's transaction: all or nothing.
+	// Back up accounts.db before deploying it.
+	`CREATE TABLE bot_ledger_legs_v16 (
+		order_id      TEXT    NOT NULL,
+		leg           INTEGER NOT NULL,
+		user_id       INTEGER NOT NULL REFERENCES users (id),
+		code_id       INTEGER NOT NULL,
+		window_id     TEXT    NOT NULL,
+		bookmaker     TEXT    NOT NULL,
+		source        TEXT    NOT NULL,
+		match         TEXT    NOT NULL,
+		market        TEXT    NOT NULL,
+		market_type   TEXT    NOT NULL,
+		line          REAL,
+		label         TEXT    NOT NULL,
+		odds          REAL    NOT NULL,
+		stake         REAL    NOT NULL,
+		placed_at     INTEGER NOT NULL,
+		voidable      INTEGER NOT NULL,
+		ticket_id     TEXT,
+		result        TEXT    NOT NULL DEFAULT 'open' CHECK (result IN ('open', 'won', 'lost', 'void', 'half_won', 'half_lost', 'cashed_out',
+			'not_placed')),
+		payout        REAL,
+		settled_at    INTEGER,
+		result_source TEXT    NOT NULL DEFAULT '' CHECK (result_source IN ('', 'manual', 'bot')),
+		updated_at    INTEGER NOT NULL,
+		PRIMARY KEY (order_id, leg)
+	);
+	INSERT INTO bot_ledger_legs_v16 (order_id, leg, user_id, code_id, window_id, bookmaker, source, match, market, market_type, line, label,
+			odds, stake, placed_at, voidable, ticket_id, result, payout, settled_at, result_source, updated_at)
+		SELECT order_id, leg, user_id, code_id, window_id, bookmaker, source, match, market, market_type, line, label,
+			odds, stake, placed_at, voidable, ticket_id, result, payout, settled_at, result_source, updated_at FROM bot_ledger_legs;
+	DROP TABLE bot_ledger_legs;
+	ALTER TABLE bot_ledger_legs_v16 RENAME TO bot_ledger_legs;
+	CREATE INDEX bot_ledger_legs_user_placed ON bot_ledger_legs (user_id, placed_at);`,
 }
 
 // OpenDB opens the accounts database at path (creating the file and its directory if needed)

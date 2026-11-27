@@ -622,3 +622,64 @@ func TestMigrate_ExtensionCodesViewDelete(t *testing.T) {
 		t.Fatal("a second floor row was accepted")
 	}
 }
+
+// Migration 16 rebuilds bot_ledger_legs for the not_placed result: every row and column copied as it was, the index made
+// again, not_placed accepted and an unknown result still refused.
+func TestMigrate_LedgerNotPlaced(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const cols = `order_id, leg, user_id, code_id, window_id, bookmaker, source, match, market, market_type, line, label, odds, stake,
+		placed_at, voidable, ticket_id, result, payout, settled_at, result_source, updated_at`
+	steps := append(append([]string{}, migrations[:15]...), `PRAGMA user_version = 15`,
+		`INSERT INTO users (id, email, password_hash, role, created_at) VALUES (1, 'u@example.com', 'x', 'user', 0)`,
+		`INSERT INTO bot_ledger_legs (`+cols+`) VALUES ('o1', 0, 1, 7, 'tipsport-1', 'tipsport', 'auto', 'A – B', 'AH -1', 'ASIAN_HANDICAP',
+			-1, 'A -1', 2.05, 1000, 11, 1, 'T9', 'half_won', 1525, 12, 'manual', 13)`,
+		`INSERT INTO bot_ledger_legs (`+cols+`) VALUES ('o1', 1, 1, 7, 'betano-1', 'betano', 'auto', 'A – B', 'AH -1', 'ASIAN_HANDICAP',
+			NULL, 'B +1', 2, 1025, 11, 0, NULL, 'open', NULL, NULL, '', 14)`)
+	for _, q := range steps {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%.60s: %v", q, err)
+		}
+	}
+	db.Close()
+
+	db, err = OpenDB(path)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version < 16 || version != len(migrations) {
+		t.Fatalf("user_version = %d (err %v), want %d", version, err, len(migrations))
+	}
+	var rows string
+	if err := db.QueryRow(`SELECT group_concat(r, ' | ') FROM (SELECT order_id || '/' || leg || '/' || user_id || '/' || code_id || '/' ||
+			window_id || '/' || bookmaker || '/' || source || '/' || match || '/' || market || '/' || market_type || '/' ||
+			COALESCE(line, '-') || '/' || label || '/' || odds || '/' || stake || '/' || placed_at || '/' || voidable || '/' ||
+			COALESCE(ticket_id, '-') || '/' || result || '/' || COALESCE(payout, '-') || '/' || COALESCE(settled_at, '-') || '/' ||
+			result_source || '/' || updated_at AS r FROM bot_ledger_legs ORDER BY order_id, leg)`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	want := "o1/0/1/7/tipsport-1/tipsport/auto/A – B/AH -1/ASIAN_HANDICAP/-1.0/A -1/2.05/1000.0/11/1/T9/half_won/1525.0/12/manual/13 | " +
+		"o1/1/1/7/betano-1/betano/auto/A – B/AH -1/ASIAN_HANDICAP/-/B +1/2.0/1025.0/11/0/-/open/-/-//14"
+	if rows != want {
+		t.Fatalf("rows after the migration:\n%s\nwant\n%s", rows, want)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'bot_ledger_legs_user_placed'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("index bot_ledger_legs_user_placed: %d (err %v)", n, err)
+	}
+	if _, err := db.Exec(`UPDATE bot_ledger_legs SET result = 'not_placed', payout = NULL WHERE leg = 1`); err != nil {
+		t.Fatalf("not_placed refused: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE bot_ledger_legs SET result = 'x' WHERE leg = 1`); err == nil {
+		t.Fatal("an unknown result was accepted")
+	}
+	if _, err := db.Exec(`INSERT INTO bot_ledger_legs (` + cols + `) VALUES ('o1', 1, 1, 7, 'b', 'b', 'app', '', '', '', NULL, '', 2, 1, 1, 0,
+		NULL, 'open', NULL, NULL, '', 1)`); err == nil {
+		t.Fatal("the primary key was lost")
+	}
+}

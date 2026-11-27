@@ -45,7 +45,7 @@ type BotLedgerLeg struct {
 	PlacedAt     int64
 	Voidable     bool
 	TicketID     string
-	Result       string // open, won, lost, void, half_won, half_lost or cashed_out
+	Result       string // open, won, lost, void, half_won, half_lost, cashed_out or not_placed (migration 16)
 	Payout       *float64
 	SettledAt    *int64
 	ResultSource string // "", manual or bot
