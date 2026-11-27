@@ -113,7 +113,8 @@ func TestMatchStateOf_TheEnginesRule(t *testing.T) {
 	}{
 		{"all unknown", []Stake{{MatchState: "unknown", MatchStateSince: 9}, {}}, "", 0},
 		{"latest known", []Stake{{MatchState: "running", MatchStateSince: 5}, {MatchState: "unknown", MatchStateSince: 9}, {MatchState: "break", MatchStateSince: 7}}, "break", 7},
-		{"tie: the first", []Stake{{MatchState: "running", MatchStateSince: 7}, {MatchState: "break", MatchStateSince: 7}}, "running", 7},
+		{"tie: the bookmaker first by name, whatever the order", []Stake{{Bookmaker: "tipsport", MatchState: "running", MatchStateSince: 7}, {Bookmaker: "betano", MatchState: "break", MatchStateSince: 7}}, "break", 7},
+		{"tie, other order", []Stake{{Bookmaker: "betano", MatchState: "break", MatchStateSince: 7}, {Bookmaker: "tipsport", MatchState: "running", MatchStateSince: 7}}, "break", 7},
 		{"known without since", []Stake{{}, {MatchState: "interrupted"}}, "interrupted", 0},
 	}
 	for _, c := range cases {

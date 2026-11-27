@@ -53,15 +53,19 @@ func Repick(a Arb, books []string) (Arb, bool) {
 }
 
 // MatchStateOf is an arb's match state from its stakes, the arb engine's rule: the stake whose state is known (not
-// "" or "unknown") with the latest match_state_since (the first one on a tie), its text and since; all unknown →
-// "", "", 0 (omitted).
+// "" or "unknown") with the latest match_state_since (on a tie, the bookmaker that sorts first by name, as the
+// engine's arb_match_state), its text and since; all unknown → "", "", 0 (omitted).
 func MatchStateOf(stakes []Stake) (state, text string, since int64) {
 	found := false
+	book := ""
 	for _, s := range stakes {
-		if s.MatchState == "" || s.MatchState == "unknown" || (found && s.MatchStateSince <= since) {
+		if s.MatchState == "" || s.MatchState == "unknown" {
 			continue
 		}
-		state, text, since, found = s.MatchState, s.MatchStateText, s.MatchStateSince, true
+		if found && (s.MatchStateSince < since || (s.MatchStateSince == since && s.Bookmaker >= book)) {
+			continue
+		}
+		state, text, since, book, found = s.MatchState, s.MatchStateText, s.MatchStateSince, s.Bookmaker, true
 	}
 	return state, text, since
 }
