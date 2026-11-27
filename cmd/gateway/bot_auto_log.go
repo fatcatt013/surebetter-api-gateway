@@ -131,6 +131,13 @@ func (p *autoPicker) countsOf(userID, day int64) map[string]int {
 	return out
 }
 
+// clear empties userID's skip log and today's counts (display only: no rule reads them).
+func (p *autoPicker) clear(userID int64) {
+	p.logMu.Lock()
+	defer p.logMu.Unlock()
+	delete(p.logs, userID)
+}
+
 // read is userID's lines with reason and kind ("" = any), newest lastAt first, at most limit, and the counts of day.
 func (p *autoPicker) read(userID, day int64, reason, kind string, limit int) ([]autoLogLine, map[string]int) {
 	counts := p.countsOf(userID, day)

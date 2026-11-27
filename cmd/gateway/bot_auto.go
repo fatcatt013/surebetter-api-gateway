@@ -521,6 +521,14 @@ func (b *botHub) handleResumeAuto(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ── DELETE /api/me/bot/auto/log ──────────────────────────────────────────────
+
+// handleClearAutoLog empties the user's skip log and today's counts (204).
+func (b *botHub) handleClearAutoLog(w http.ResponseWriter, r *http.Request) {
+	b.auto.clear(principalOf(r).UserID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ── GET /api/me/bot/auto/log ──────────────────────────────────────────────────
 
 // autoLogKinds are the kinds of skip-log line.

@@ -1084,3 +1084,28 @@ func TestAuto_DryClassPlacedBlocks(t *testing.T) {
 	e.injectRec(autoRec{id: "dryauto0", source: "auto", eventID: "tennis-live:aa", arbKey: "tennis-live:aa:T:1", dry: true, state: "placed"})
 	e.expect(e.arb2("tennis-live:aa", "GAME_HANDICAP", 1.5), "match_placed", "")
 }
+
+// DELETE /api/me/bot/auto/log empties the user's skip log and today's counts (display only); later evaluations log again.
+func TestAuto_ClearLog(t *testing.T) {
+	e := newAutoEnv(t, "A")
+	e.agent(tipFortIdle...)
+	e.setAuto("log", "", "", "")
+	e.eval(e.arb2("tennis-live:aa", "T", 1))
+	e.controller(func(st *accounts.BotSettings) { st.Paused = true })
+	e.eval(e.arb2("tennis-live:bb", "T", 1))
+	if len(e.lines()) == 0 || len(e.counts()) == 0 {
+		t.Fatalf("nothing logged before the clear: %+v %v", e.lines(), e.counts())
+	}
+	if s, b := request(t, e.srv, "DELETE", "/api/me/bot/auto/log", e.token, "", nil); s != 204 {
+		t.Fatalf("clear: %d %s", s, b)
+	}
+	s, b := request(t, e.srv, "GET", "/api/me/bot/auto/log", e.token, "", nil)
+	if s != 200 || !strings.Contains(b, `"lines":[]`) || !strings.Contains(b, `"counts":{}`) {
+		t.Fatalf("after clear: %d %s", s, b)
+	}
+	// The same arb life logs again after a clear (its line is not remembered).
+	e.eval(e.arb2("tennis-live:bb", "T", 1))
+	if len(e.lines()) != 1 {
+		t.Fatalf("after clear and a new evaluation: %+v", e.lines())
+	}
+}

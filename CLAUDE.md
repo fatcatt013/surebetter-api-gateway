@@ -50,7 +50,7 @@ Hot-reload in Docker dev mode uses `air` (configured in `.air.toml`): rebuild tr
 | `/api/me/bot`, `/api/me/bot/{status,orders,events,agents,logs,logs.txt,screenshots,flows,recordings,settings,commands,alerts,alert-settings}`, `/api/me/bot/agents/{id}/{recordings,windows,try,limit-index}` | Bot orders, the Bots controller and bot alerts — see `../surebetter-common/docs/api-reference.md` → Bot orders, Bots controller, Bot alerts |
 | `/api/me/bot/logins`, `/api/me/bot/logins/mine`, `/api/me/bot/logins/{windowId}/{reveal,result,code,code-prompt,code-prompt/wrong}`, `/api/me/bot/login-codes`, `/api/me/bot/agents/{id}/windows/{windowId}/{login,login-code}` | Bot auto-login (HTTPS only, 503 without `BOT_LOGINS_KEY`) — see `../surebetter-common/docs/api-reference.md` → Bot logins |
 | `/api/me/bot/bankroll`, `/api/me/bot/bankroll/orders`, `/api/me/bot/bankroll/orders/{orderId}/legs/{leg}` | The bot bankroll: cards, curve, the ledger orders and manual results — see `../surebetter-common/docs/api-reference.md` → Bot bankroll |
-| `/api/me/bot/auto`, `/api/me/bot/auto/{resume,log}` | The bots' automatic mode — see `../surebetter-common/docs/api-reference.md` → Automatic mode |
+| `/api/me/bot/auto`, `/api/me/bot/auto/{resume,log}` (`DELETE …/auto/log` clears the skip log) | The bots' automatic mode — see `../surebetter-common/docs/api-reference.md` → Automatic mode |
 | `/api/me/telegram`, `/api/me/telegram/{link,test}` | The user's private Telegram chat for bot alerts — see `../surebetter-common/docs/api-reference.md` → Bot alerts |
 | `GET /health` | `{"status":"ok","service":"api-gateway","version":"dev"}` |
 | `GET /metrics` | Prometheus counters: `gateway_ws_clients_connected`, `gateway_messages_sent_total` |
